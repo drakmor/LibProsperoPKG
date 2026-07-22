@@ -5,6 +5,7 @@ using LibProsperoPkg.PKG;
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Security.Cryptography;
 
 namespace LibProsperoPkg.PFS.Compression;
 
@@ -40,11 +41,210 @@ public sealed class ProsperoNapsPlan
     public required long UncompressedSize { get; init; }
 }
 
+/// <summary>Options for producing a self-contained NAPS packed image and type-13 layout.</summary>
+public sealed class ProsperoNapsBuildOptions
+{
+    /// <summary>Kraken compression level, in the range -4..9.</summary>
+    public int CompressionLevel { get; init; } = 7;
+
+    /// <summary>Try Kraken before falling back to a stored 256-KiB span.</summary>
+    public bool Compress { get; init; } = true;
+
+    /// <summary>Decode the finished artifacts and compare them with the input before returning.</summary>
+    public bool VerifyRoundTrip { get; init; } = true;
+
+    /// <summary>
+    /// Optional 16-byte AES-CMAC key used to convert each reversed SHA3-256 outer-block digest to
+    /// the truncated eight-byte <c>OuterBlockDigest</c>. When absent those policy-gated slots are zero.
+    /// </summary>
+    public byte[]? OuterBlockCmacKey { get; init; }
+
+    /// <summary>
+    /// Optional logical-file boundaries. The first value must be zero and the final value must equal
+    /// the input length. If omitted, NAPS describes one logical file covering the complete image.
+    /// </summary>
+    public IReadOnlyList<long>? FileBoundaries { get; init; }
+}
+
+/// <summary>Artifacts emitted by <see cref="ProsperoNapsImage.Pack"/>.</summary>
+public sealed class ProsperoNapsBuildResult
+{
+    public required byte[] PackedImage { get; init; }
+    public required byte[] LayoutBytes { get; init; }
+    public required NapsLayoutDocument Layout { get; init; }
+    public required int CompressedSpanCount { get; init; }
+    public required int StoredSpanCount { get; init; }
+    public long LogicalSize { get; init; }
+}
+
 /// <summary>Resolves and decodes <c>pfs_image.dat</c> using <c>naps_pkg_layout.dat</c>.</summary>
 public static class ProsperoNapsImage
 {
     public const int UBlockSize = 0x40000;
     public const int OuterBlockSize = 0x10000;
+
+    /// <summary>
+    /// Packs a logical PPR-PFS stream into the NAPS physical representation and generates all
+    /// structural type-13 tables. This baseline producer deliberately emits no deduplication,
+    /// predictor, or shuffle records; every physical run is monotonic and uses key-table index zero.
+    /// </summary>
+    public static ProsperoNapsBuildResult Pack(
+        ReadOnlySpan<byte> logicalImage, ProsperoNapsBuildOptions? options = null)
+    {
+        options ??= new ProsperoNapsBuildOptions();
+        if (logicalImage.Length == 0)
+            throw new ArgumentException("NAPS input cannot be empty.", nameof(logicalImage));
+        if (options.CompressionLevel is < -4 or > 9)
+            throw new ArgumentOutOfRangeException(nameof(options), "Kraken level must be in -4..9.");
+        if (options.OuterBlockCmacKey is { Length: not 16 })
+            throw new ArgumentException("NAPS outer-block CMAC key must be exactly 16 bytes.", nameof(options));
+
+        long[] boundaries = ValidateBoundaries(logicalImage.Length, options.FileBoundaries);
+        var cblockInfos = new List<NapsCblockInfoEntry>();
+        var spanIndexesByUblock = new List<uint>();
+        using var packed = new MemoryStream();
+        int compressedCount = 0;
+        int storedCount = 0;
+
+        // A monotonic producer needs one run base. Physical and compressed offsets are identical.
+        cblockInfos.Add(new NapsCblockInfoEntry
+        {
+            IsRunBase = true,
+            CoffsetEndMod256K = 0,
+            TweakIdxStart = 0,
+            KeyTableIdx = 0,
+            CoffsetStart256K = 0,
+        });
+
+        int logicalOffset = 0;
+        int nextBoundaryIndex = 1;
+        while (logicalOffset < logicalImage.Length)
+        {
+            while (nextBoundaryIndex < boundaries.Length && boundaries[nextBoundaryIndex] <= logicalOffset)
+                nextBoundaryIndex++;
+            int ublockRemaining = UBlockSize - (logicalOffset & (UBlockSize - 1));
+            int fileRemaining = nextBoundaryIndex < boundaries.Length
+                ? checked((int)(boundaries[nextBoundaryIndex] - logicalOffset))
+                : logicalImage.Length - logicalOffset;
+            int uncompressedLength = Math.Min(ublockRemaining, fileRemaining);
+            ReadOnlySpan<byte> source = logicalImage.Slice(logicalOffset, uncompressedLength);
+            EncodedBlock? encoded = options.Compress
+                ? OodleKrakenEncoder.EncodeBlock(source, useHuffmanArrays: true, options.CompressionLevel)
+                : null;
+            bool compressed = encoded is EncodedBlock block && block.Payload.Length < source.Length;
+            byte[] payload = compressed ? encoded!.Value.Payload : source.ToArray();
+            int firstChunkLength = compressed
+                ? encoded!.Value.FirstChunkCompSize
+                : Math.Min(0x20000, uncompressedLength);
+            if (firstChunkLength is < 1 or > 0x20000)
+                throw new InvalidDataException("NAPS first-chunk length exceeds the 17-bit minus-one field.");
+
+            long compressedOffset = packed.Position;
+            if ((logicalOffset & (UBlockSize - 1)) == 0)
+                spanIndexesByUblock.Add(checked((uint)cblockInfos.Count));
+            packed.Write(payload);
+            cblockInfos.Add(new NapsCblockInfoEntry
+            {
+                CoffsetStartMod256K = checked((uint)(compressedOffset & (UBlockSize - 1))),
+                UoffsetStart = checked((uint)(logicalOffset & (UBlockSize - 1))),
+                ClenEvenMinus1 = checked((uint)(firstChunkLength - 1)),
+                Even = compressed ? (byte)5 : (byte)1,
+                Odd = compressed && uncompressedLength > 0x20000 ? (byte)4
+                    : !compressed && uncompressedLength > 0x20000 ? (byte)1 : (byte)0,
+                KdePredictor = 0,
+                ShuffleIdx = 0,
+            });
+
+            if (compressed) compressedCount++; else storedCount++;
+            logicalOffset += uncompressedLength;
+        }
+
+        long compressedEnd = packed.Position;
+        cblockInfos.Add(new NapsCblockInfoEntry
+        {
+            ReservedBit19 = true,
+            CoffsetStartMod256K = checked((uint)(compressedEnd & (UBlockSize - 1))),
+            UoffsetStart = checked((uint)(logicalImage.Length & (UBlockSize - 1))),
+            ClenEvenMinus1 = 0,
+        });
+
+        int outerBlockCount = checked((int)((compressedEnd + OuterBlockSize - 1) / OuterBlockSize));
+        packed.SetLength(checked((long)outerBlockCount * OuterBlockSize));
+        byte[] packedBytes = packed.ToArray();
+        var outerDigests = new List<byte[]>(outerBlockCount);
+        for (int i = 0; i < outerBlockCount; i++)
+        {
+            ReadOnlySpan<byte> outerBlock = packedBytes.AsSpan(i * OuterBlockSize, OuterBlockSize);
+            outerDigests.Add(options.OuterBlockCmacKey is null
+                ? new byte[8]
+                : ComputeOuterBlockDigest(outerBlock, options.OuterBlockCmacKey));
+        }
+
+        var fileOffsets = new List<NapsFileOffsetEntry>(boundaries.Length);
+        for (int i = 0; i < boundaries.Length; i++)
+            fileOffsets.Add(new NapsFileOffsetEntry(
+                i == boundaries.Length - 1 ? (byte)0x40 : (byte)0,
+                checked((ulong)boundaries[i])));
+
+        int ublockCount = checked((logicalImage.Length + UBlockSize - 1) / UBlockSize);
+        List<NapsU2cEntry> u2c = BuildU2c(spanIndexesByUblock, ublockCount);
+        var counts = new NapsLayoutCounts(
+            NumFiles: fileOffsets.Count,
+            CompressionType: 2,
+            NumKeys: 1,
+            NumShufflePatterns: 0,
+            NumUBlocks: ublockCount - 1,
+            NumOuterBlocks: outerBlockCount,
+            NumCblockInfo: cblockInfos.Count);
+        var document = new NapsLayoutDocument
+        {
+            Counts = counts,
+            Map = ProsperoNapsLayout.SectionMap(counts),
+            OuterBlockDigests = outerDigests,
+            ShufflePatterns = Array.Empty<byte[]>(),
+            FileOffsets = fileOffsets,
+            CblockInfoOffsetByUblock = u2c,
+            CblockInfos = cblockInfos,
+            TrailingZeroBytes = 0,
+        };
+        byte[] layoutBytes = ProsperoNapsLayout.BuildLayout(document);
+        document = ProsperoNapsLayout.Parse(layoutBytes);
+
+        if (options.VerifyRoundTrip)
+        {
+            using var packedInput = new MemoryStream(packedBytes, writable: false);
+            using var restored = new MemoryStream(logicalImage.Length);
+            Decompress(packedInput, document, restored);
+            if (!restored.GetBuffer().AsSpan(0, checked((int)restored.Length)).SequenceEqual(logicalImage))
+                throw new InvalidDataException("Generated NAPS image failed its decode round-trip.");
+        }
+
+        return new ProsperoNapsBuildResult
+        {
+            PackedImage = packedBytes,
+            LayoutBytes = layoutBytes,
+            Layout = document,
+            CompressedSpanCount = compressedCount,
+            StoredSpanCount = storedCount,
+            LogicalSize = logicalImage.Length,
+        };
+    }
+
+    /// <summary>
+    /// Computes the publisher type-13 eight-byte outer-block tag:
+    /// <c>CMAC-AES128(key, reverse(SHA3-256(block)))[8..16]</c>.
+    /// </summary>
+    public static byte[] ComputeOuterBlockDigest(ReadOnlySpan<byte> outerBlock, ReadOnlySpan<byte> cmacKey)
+    {
+        if (outerBlock.Length != OuterBlockSize)
+            throw new ArgumentException($"NAPS outer block must be {OuterBlockSize} bytes.", nameof(outerBlock));
+        if (cmacKey.Length != 16)
+            throw new ArgumentException("AES-CMAC key must be 16 bytes.", nameof(cmacKey));
+        byte[] digest = ProsperoImageDigests.Sha3_256(outerBlock);
+        Array.Reverse(digest);
+        byte[] cmac = AesCmac(cmacKey, digest);
+        return cmac.AsSpan(8, 8).ToArray();
+    }
 
     /// <summary>Builds and strictly validates the compressed-span graph.</summary>
     public static ProsperoNapsPlan BuildPlan(NapsLayoutDocument layout)
@@ -225,7 +425,9 @@ public static class ProsperoNapsImage
             throw new ArgumentOutOfRangeException(nameof(uncompressedOffset));
         int ublock = checked((int)(uncompressedOffset >> 18));
         uint start = ResolveU2c(layout, ublock);
-        uint end = ResolveU2c(layout, checked(ublock + 1));
+        uint end = ublock + 1 < layout.Counts.UBlockCount
+            ? ResolveU2c(layout, checked(ublock + 1))
+            : checked((uint)layout.CblockInfos.Count);
         long blockBase = (long)ublock << 18;
         for (uint index = start; index < end; index++)
         {
@@ -247,6 +449,108 @@ public static class ProsperoNapsImage
         return (ublock & 7) == 0
             ? group.InfoOffset9BBase
             : checked(group.InfoOffset9BBase + group.DeltaFromBase[(ublock & 7) - 1]);
+    }
+
+    private static long[] ValidateBoundaries(int logicalLength, IReadOnlyList<long>? requested)
+    {
+        if (requested is null)
+            return [0, logicalLength];
+        if (requested.Count < 2 || requested[0] != 0 || requested[^1] != logicalLength)
+            throw new ArgumentException("NAPS boundaries must start at zero and end at the logical length.", nameof(requested));
+        var result = new long[requested.Count];
+        long previous = -1;
+        for (int i = 0; i < requested.Count; i++)
+        {
+            long current = requested[i];
+            if (current <= previous || current < 0 || current > logicalLength)
+                throw new ArgumentException($"NAPS boundary {i} is not strictly increasing.", nameof(requested));
+            result[i] = current;
+            previous = current;
+        }
+        return result;
+    }
+
+    private static List<NapsU2cEntry> BuildU2c(IReadOnlyList<uint> indexes, int ublockCount)
+    {
+        if (indexes.Count != ublockCount)
+            throw new InvalidDataException("NAPS writer did not record one CblockInfo start per ublock.");
+        int groupCount = (ublockCount + 7) / 8;
+        var result = new List<NapsU2cEntry>(groupCount);
+        for (int group = 0; group < groupCount; group++)
+        {
+            int startBlock = group * 8;
+            uint baseIndex = indexes[startBlock];
+            var deltas = new byte[7];
+            for (int delta = 1; delta < 8; delta++)
+            {
+                int block = startBlock + delta;
+                uint value = block < ublockCount ? indexes[block] : indexes[^1];
+                uint difference = checked(value - baseIndex);
+                if (difference > byte.MaxValue)
+                    throw new InvalidDataException("NAPS u2c group delta exceeds eight bits.");
+                deltas[delta - 1] = (byte)difference;
+            }
+            result.Add(new NapsU2cEntry(baseIndex, deltas));
+        }
+        return result;
+    }
+
+    private static byte[] AesCmac(ReadOnlySpan<byte> key, ReadOnlySpan<byte> message)
+    {
+        using Aes aes = Aes.Create();
+        aes.Key = key.ToArray();
+        Span<byte> zero = stackalloc byte[16];
+        Span<byte> l = stackalloc byte[16];
+        aes.EncryptEcb(zero, l, PaddingMode.None);
+        Span<byte> k1 = stackalloc byte[16];
+        Span<byte> k2 = stackalloc byte[16];
+        DoubleCmacBlock(l, k1);
+        DoubleCmacBlock(k1, k2);
+
+        int blockCount = Math.Max(1, (message.Length + 15) / 16);
+        bool complete = message.Length != 0 && (message.Length & 15) == 0;
+        Span<byte> state = stackalloc byte[16];
+        Span<byte> input = stackalloc byte[16];
+        for (int block = 0; block < blockCount; block++)
+        {
+            input.Clear();
+            int offset = block * 16;
+            int count = Math.Min(16, message.Length - offset);
+            if (count > 0)
+                message.Slice(offset, count).CopyTo(input);
+            if (block == blockCount - 1)
+            {
+                if (complete)
+                    XorInPlace(input, k1);
+                else
+                {
+                    input[count] = 0x80;
+                    XorInPlace(input, k2);
+                }
+            }
+            XorInPlace(input, state);
+            aes.EncryptEcb(input, state, PaddingMode.None);
+        }
+        return state.ToArray();
+    }
+
+    private static void DoubleCmacBlock(ReadOnlySpan<byte> input, Span<byte> output)
+    {
+        int carry = 0;
+        for (int i = 15; i >= 0; i--)
+        {
+            int value = input[i];
+            output[i] = (byte)((value << 1) | carry);
+            carry = value >> 7;
+        }
+        if (carry != 0)
+            output[15] ^= 0x87;
+    }
+
+    private static void XorInPlace(Span<byte> target, ReadOnlySpan<byte> value)
+    {
+        for (int i = 0; i < target.Length; i++)
+            target[i] ^= value[i];
     }
 
     private static int Delta18(uint next, uint previous)

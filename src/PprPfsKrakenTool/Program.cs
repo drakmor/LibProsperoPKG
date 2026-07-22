@@ -40,6 +40,7 @@ internal static class Program
             {
                 "build" => BuildPfs(args),
                 "build-phuc" => BuildPhuc(args),
+                "build-publisher-artifacts" => BuildPublisherArtifacts(args),
                 "pack" => PackFile(args),
                 "unpack" => UnpackFile(args),
                 "list" => ListPfs(args),
@@ -50,6 +51,7 @@ internal static class Program
                 "dump-naps" => DumpNaps(args),
                 "plan-naps" => PlanNaps(args),
                 "decompress-naps" => DecompressNaps(args),
+                "pack-naps" => PackNaps(args),
                 "roundtrip-naps" => RoundTripNaps(args),
                 "inspect-pkg" => InspectPackage(args),
                 "extract-pkg-outer" => ExtractPackageOuter(args),
@@ -120,6 +122,22 @@ internal static class Program
         using var output = File.Create(args[3]);
         ProsperoNapsImage.Decompress(source, document, output);
         Console.WriteLine($"decompressed 0x{output.Length:x} bytes");
+        return 0;
+    }
+
+    private static int PackNaps(string[] args)
+    {
+        if (args.Length is < 4 or > 5)
+            throw new ArgumentException("pack-naps requires <logical-pfs> <pfs_image.dat> <naps_pkg_layout.dat> [cmac-key-hex].");
+        byte[]? cmacKey = args.Length == 5 ? Convert.FromHexString(args[4]) : null;
+        ProsperoNapsBuildResult result = ProsperoNapsImage.Pack(
+            File.ReadAllBytes(args[1]),
+            new ProsperoNapsBuildOptions { OuterBlockCmacKey = cmacKey });
+        File.WriteAllBytes(args[2], result.PackedImage);
+        File.WriteAllBytes(args[3], result.LayoutBytes);
+        Console.WriteLine(
+            $"packed logical=0x{result.LogicalSize:x} physical=0x{result.PackedImage.Length:x} "
+            + $"compressed-spans={result.CompressedSpanCount} stored-spans={result.StoredSpanCount}");
         return 0;
     }
 
@@ -197,6 +215,33 @@ internal static class Program
         ProsperoPfsLayoutResult result = ProsperoPfsLayout.BuildFromFolder(
             args[1], args[2], layoutOptions, Console.WriteLine);
         Console.WriteLine($"{(publisherLayout ? "PPR" : "classic")}-PFS written: {result.OutputPath} ({result.ImageSize:N0} bytes)");
+        return 0;
+    }
+
+    private static int BuildPublisherArtifacts(string[] args)
+    {
+        if (args.Length is < 5 or > 6)
+            throw new ArgumentException(
+                "build-publisher-artifacts requires <source-folder> <output-dir> <content-id> <passcode> [cmac-key-hex].");
+        byte[]? cmac = args.Length == 6 ? Convert.FromHexString(args[5]) : null;
+        ProsperoPublisherPprBuildResult result = ProsperoPublisherPprBuilder.Build(
+            new ProsperoPublisherPprBuildOptions
+            {
+                SourceFolder = args[1],
+                OutputDirectory = args[2],
+                ContentId = args[3],
+                Passcode = args[4],
+                PfsOptions = new ProsperoPfsLayoutOptions
+                {
+                    FileCompression = PfsFileCompressionMethod.Kraken,
+                    CompressionLevel = PprPfsKraken.DefaultLevel,
+                },
+                NapsOptions = new ProsperoNapsBuildOptions { OuterBlockCmacKey = cmac },
+            },
+            Console.WriteLine);
+        Console.WriteLine(
+            $"publisher artifacts: inner-files={result.InnerFileCount} "
+            + $"naps=0x{result.Naps.PackedImage.Length:x} outer-superblock={result.OuterSuperblockIndex}");
         return 0;
     }
 
@@ -1070,6 +1115,7 @@ internal static class Program
         Console.WriteLine("        [--compression none|zlib|kraken] [--level N] [--min-size 0]");
         Console.WriteLine("        [--exclude \"sce_sys/**;movies/*.mp4\"] [--only-if-smaller false]");
         Console.WriteLine("        [--classic true]   (alias for --layout classic)");
+        Console.WriteLine("  build-publisher-artifacts <source-folder> <output-dir> <content-id> <passcode> [cmac-key-hex]");
         Console.WriteLine("  pack  <input-file> <output.pfsc> [--compression zlib|kraken|none] [--level N]");
         Console.WriteLine("        [--min-savings-percent 0]");
         Console.WriteLine("  unpack <input-or-image> <output-file> [--offset 0x0]");
@@ -1081,6 +1127,7 @@ internal static class Program
         Console.WriteLine("  dump-naps <naps_pkg_layout.dat>");
         Console.WriteLine("  plan-naps <naps_pkg_layout.dat>");
         Console.WriteLine("  decompress-naps <pfs_image.dat> <naps_pkg_layout.dat> <output>");
+        Console.WriteLine("  pack-naps <logical-pfs> <pfs_image.dat> <naps_pkg_layout.dat> [cmac-key-hex]");
         Console.WriteLine("  roundtrip-naps <input> <output>");
         Console.WriteLine("  inspect-pkg <package.pkg>");
         Console.WriteLine("  extract-pkg-outer <package.pkg> <output-dir> [passcode]");

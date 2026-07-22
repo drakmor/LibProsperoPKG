@@ -98,6 +98,8 @@ This document describes the current LibProsperoPkg package-building and reading 
 - Implements `ProsperoNapsLayout` as a parser and byte-exact serializer for `naps_pkg_layout.dat`.
 - Implements `ProsperoNapsImage.BuildPlan` as the managed equivalent of the span/ublock/file-view construction used by `ric.exe`: fidx terminal boundaries, U2C base-plus-delta lookup, run-base records, terminal records, 18-bit wrapped compressed and uncompressed lengths, tweak/key propagation, and physical `pfs_image.dat` offsets.
 - Implements `ProsperoNapsImage.Decompress`, including raw spans, two-chunk Kraken spans, newLZ/bare-entropy mode selection, strict coverage checks, and the publisher singleton-Huffman representation used for constant blocks.
+- Implements `ProsperoNapsImage.Pack`, the inverse baseline writer: arbitrary fidx boundaries, 256-KiB span splitting, Kraken/stored selection, monotonic run construction, U2C generation, terminal records, 64-KiB physical padding, optional publisher outer-block CMAC tags, and mandatory decode/compare verification.
+- Implements `ProsperoPublisherPprBuilder.Build`: source folder to direct-offset PPR-PFS, relocation below the publisher 4-MiB logical prefix, NAPS packing, data-first outer PFS generation, AES-XTS encryption, and reverse validation of every layer.
 - Implements the high-level `ProsperoPackageArchive` read path for finalized debug images: decrypt and verify the outer PFS, extract `naps_pkg_layout.dat` and `pfs_image.dat`, reconstruct the logical inner image, and extract its files.
 - Reads the publisher PPR direct-offset inode profile (`superblock.mode & 0x10`, 0xA8-byte inode). In this profile the value at inode `+0x60` is an absolute logical byte offset rather than the classic block-pointer array.
 - The complete PKG -> outer PFS -> NAPS -> inner PPR-PFS -> files path has been exercised successfully on publisher-produced `dlc_baseline.pkg`, `dlc.pkg`, `sftest.pkg`, `PPSX40000.pkg`, `forza_premium_1.0.pkg`, and `horizon_west.pkg`. The baseline also passes `prospero-pub-cmd img_verify --format_check on --integrity_check on`.
@@ -131,7 +133,8 @@ This document describes the current LibProsperoPkg package-building and reading 
 - Retail finalized images with signed byte `0x80` are not implemented. They require console-side finalization material that the library does not have.
 - Retail install-metadata archives are not implemented. The retail variant is encrypted and is not produced by the library.
 - On-console installation acceptance is not guaranteed. Library code verifies structure and round-tripping; acceptance depends on console mode and firmware.
-- The full NAPS streaming outer producer is not complete. The inverse writer still needs to generate span/run/U2C/fidx records and physical outer blocks from arbitrary inner PPR-PFS input, then integrate those bytes into package finalization.
+- The baseline NAPS streaming outer producer is implemented. Reference-equivalent deduplication runs, predictor/shuffle selection, update/base reuse, and direct CNT/FIH package-finalization wiring remain.
+- Strict publisher `OuterBlockDigest` generation requires the separate 16-byte NAPS CMAC key supplied to the reference packager. It is not derived from EKPFS, the outer XTS pair, or the PFS sign key; callers can provide it through `OuterBlockCmacKey`.
 - The current NAPS decoder intentionally rejects non-zero `KdePredictor` and non-zero shuffle profiles. The tested publisher packages use predictor/shuffle zero; other publisher modes still require reference vectors and inverse transforms.
 - The high-level read path currently materializes complete outer and logical images in memory. A stream/file-backed path is still needed for multi-gigabyte packages.
 - PPR direct-offset inodes are decoded as a single contiguous extent. Additional tail fields or fragmented/extents profiles, if emitted for large/base/patch packages, still require corpus coverage.
@@ -177,7 +180,7 @@ This document describes the current LibProsperoPkg package-building and reading 
 | GP5 project model | Implemented |
 | NAPS layout parser and serializer | Implemented; confirmed field semantics and strict validation |
 | NAPS image planner and decoder | Implemented for raw/Kraken publisher profiles with predictor/shuffle zero; tested end to end on six publisher packages |
-| NAPS streaming outer producer | Not implemented |
+| NAPS streaming outer producer | Baseline monotonic Kraken/stored writer implemented and round-trip checked; dedup/shuffle/update profiles and final package wiring remain |
 | Retail install-metadata archive | Not implemented |
 | Retail finalized image (`0x80`) | Not implemented |
 | On-console acceptance guarantee | Not implemented; depends on console mode and firmware |
