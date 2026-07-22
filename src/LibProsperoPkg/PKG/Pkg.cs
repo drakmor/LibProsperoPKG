@@ -91,8 +91,9 @@ public class Pkg
     public bool CheckPasscode(string passcode)
     {
         if (passcode == null || passcode.Length != 32) return false;
-        var dk0 = Crypto.ComputeKeys(Header.content_id, passcode, 0);
-        var digest0 = Crypto.Sha256(dk0).Xor(dk0);
+        bool publisherProfile = EntryKeys.Keys.Length > 0 && EntryKeys.Keys[0].key.Length == 384;
+        var dk0 = Crypto.ComputeKeys(Header.content_id, passcode, 0, useSha3: publisherProfile);
+        var digest0 = (publisherProfile ? Crypto.Sha3_256(dk0) : Crypto.Sha256(dk0)).Xor(dk0);
         return digest0.SequenceEqual(EntryKeys.Keys[0].digest);
     }
 
@@ -104,7 +105,8 @@ public class Pkg
         }
         if (dk == null || dk.Length != 32)
             return false;
-        var digest = Crypto.Sha256(dk).Xor(dk);
+        bool publisherProfile = EntryKeys.Keys.Length > 0 && EntryKeys.Keys[0].key.Length == 384;
+        var digest = (publisherProfile ? Crypto.Sha3_256(dk) : Crypto.Sha256(dk)).Xor(dk);
         return digest.SequenceEqual(EntryKeys.Keys[index].digest);
 
     }
@@ -127,6 +129,7 @@ public struct Header
     public uint main_ent_data_size;
     public ulong body_offset;
     public ulong body_size;
+    public ulong mandatory_size;
     public string content_id; // Length = PKG_CONTENT_ID_SIZE
     public uint drm_type;
     public uint content_type;
@@ -160,4 +163,16 @@ public struct Header
     public byte[] pfs_signed_digest;
     public ulong pfs_split_size_nth_0;
     public ulong pfs_split_size_nth_1;
+    /// <summary>Outer-PFS AES-XTS seed, mirrored from superblock+0x370.</summary>
+    public byte[] image_seed;
+    /// <summary>FIH-relative offset and size of the embedded CNT region.</summary>
+    public ulong cnt_region_offset;
+    public ulong cnt_region_size;
+    /// <summary>IMAGE_KEY and mandatory/imagedigs CNT region descriptors.</summary>
+    public uint desc_image_key_offset;
+    public uint desc_image_key_size;
+    public uint desc_mandatory_offset;
+    public uint desc_mandatory_size;
+    /// <summary>SHA3-256 of each region described at CNT+0x510.</summary>
+    public byte[] desc_digest;
 }

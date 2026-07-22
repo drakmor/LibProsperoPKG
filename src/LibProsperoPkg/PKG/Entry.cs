@@ -214,18 +214,37 @@ public class KeysEntry : Entry
         this.publisherProfile = publisherProfile;
         const int keyCount = 7;
         Keys = new PkgEntryKey[keyCount];
-        seedDigest = Crypto.Sha256(Encoding.ASCII.GetBytes(contentId.PadRight(48, '\0')));
+        seedDigest = publisherProfile
+            ? Crypto.Sha3_256(Encoding.ASCII.GetBytes(contentId.PadRight(48, '\0')))
+            : Crypto.Sha256(Encoding.ASCII.GetBytes(contentId.PadRight(48, '\0')));
         for (uint i = 0; i < keyCount; i++)
         {
-            var passcodeKey = Crypto.ComputeKeys(contentId, passcode, i);
-            int publicKeyIndex = Math.Min((int)i, Util.CryptoKeys.PkgPublicKeys.Length - 1);
-            Keys[i] = new PkgEntryKey
+            var passcodeKey = Crypto.ComputeKeys(contentId, passcode, i, useSha3: publisherProfile);
+            if (publisherProfile)
             {
-                digest = Crypto.Sha256(passcodeKey).Xor(passcodeKey),
-                key = Crypto.RSA2048EncryptKey(Util.CryptoKeys.PkgPublicKeys[publicKeyIndex], passcodeKey)
-            };
+                ReadOnlySpan<byte> moduli = LibProsperoPkg.Keys.ProsperoKeys.PasscodeKey;
+                byte[] modulus = moduli.Slice((int)i * 384, 384).ToArray();
+                Keys[i] = new PkgEntryKey
+                {
+                    digest = Crypto.Sha3_256(passcodeKey).Xor(passcodeKey),
+                    key = Crypto.RsaPkcs1EncryptKey(modulus, passcodeKey),
+                };
+            }
+            else
+            {
+                int publicKeyIndex = Math.Min((int)i, Util.CryptoKeys.PkgPublicKeys.Length - 1);
+                Keys[i] = new PkgEntryKey
+                {
+                    digest = Crypto.Sha256(passcodeKey).Xor(passcodeKey),
+                    key = Crypto.RSA2048EncryptKey(Util.CryptoKeys.PkgPublicKeys[publicKeyIndex], passcodeKey),
+                };
+            }
         }
-        Keys[0].key = Crypto.RSA2048EncryptKey(Util.CryptoKeys.PkgPublicKeys[0], Encoding.ASCII.GetBytes(passcode));
+        Keys[0].key = publisherProfile
+            ? Crypto.RsaPkcs1EncryptKey(
+                LibProsperoPkg.Keys.ProsperoKeys.PasscodeKey.Slice(0, 384).ToArray(),
+                Encoding.ASCII.GetBytes(passcode))
+            : Crypto.RSA2048EncryptKey(Util.CryptoKeys.PkgPublicKeys[0], Encoding.ASCII.GetBytes(passcode));
     }
     public byte[] seedDigest;
     public PkgEntryKey[] Keys;
@@ -242,8 +261,6 @@ public class KeysEntry : Entry
         foreach (var key in Keys)
         {
             s.Write(key.key, 0, key.key.Length);
-            if (publisherProfile && key.key.Length < 384)
-                s.Write(new byte[384 - key.key.Length], 0, 384 - key.key.Length);
         }
     }
     public static KeysEntry Read(MetaEntry e, Stream pkg)

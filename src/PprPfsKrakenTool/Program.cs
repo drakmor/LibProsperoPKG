@@ -75,10 +75,12 @@ internal static class Program
     private static int InspectNaps(string[] args)
     {
         if (args.Length != 2) throw new ArgumentException("inspect-naps requires <naps_pkg_layout.dat>.");
-        NapsLayoutDocument document = ProsperoNapsLayout.Parse(File.ReadAllBytes(args[1]));
+        byte[] layout = File.ReadAllBytes(args[1]);
+        NapsLayoutDocument document = ProsperoNapsLayout.Parse(layout);
         Console.WriteLine($"files={document.Counts.NumFiles} compression={document.Counts.CompressionType} keys={document.Counts.NumKeys}");
         Console.WriteLine($"ublocks={document.Counts.UBlockCount} outer={document.Counts.NumOuterBlocks} cblockInfo={document.Counts.NumCblockInfo}");
         Console.WriteLine($"layout-size=0x{document.Map.TotalSize:x} footer={document.TrailingZeroBytes}");
+        Console.WriteLine($"sha3-256={Convert.ToHexString(ProsperoImageDigests.Sha3_256(layout)).ToLowerInvariant()}");
         return 0;
     }
 

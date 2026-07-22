@@ -52,6 +52,8 @@ public class PkgWriter : Util.WriterBase
         Write(hdr.body_offset);
         s.Position = 0x28;
         Write(hdr.body_size);
+        s.Position = 0x30;
+        Write(hdr.mandatory_size);
         s.Position = 0x40;
         Write(Encoding.ASCII.GetBytes(hdr.content_id)); // Length = PKG_CONTENT_ID_SIZE
         s.Position = 0x70;
@@ -86,6 +88,9 @@ public class PkgWriter : Util.WriterBase
         Write(hdr.digest_table_hash);
         s.Position = 0x160;
         Write(hdr.body_digest);
+        // Publisher CNT headers repeat the content id in the content-info area.
+        s.Position = 0x200;
+        Write(Encoding.ASCII.GetBytes(hdr.content_id));
 
         // TODO: i think these fields are actually members of element of container array
         s.Position = 0x400;
@@ -116,5 +121,18 @@ public class PkgWriter : Util.WriterBase
         Write(hdr.pfs_split_size_nth_0);
         s.Position = 0x488;
         Write(hdr.pfs_split_size_nth_1);
+        s.Position = 0x4A0;
+        Write(hdr.image_seed);
+        s.Position = 0x4B0;
+        Write(hdr.cnt_region_offset);
+        s.Position = 0x4B8;
+        Write(hdr.cnt_region_size);
+        s.Position = 0x510;
+        Write(hdr.desc_image_key_offset);
+        Write(hdr.desc_image_key_size);
+        Write(hdr.desc_mandatory_offset);
+        Write(hdr.desc_mandatory_size);
+        s.Position = 0x520;
+        Write(hdr.desc_digest);
     }
 }

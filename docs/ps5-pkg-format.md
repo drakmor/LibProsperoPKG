@@ -199,10 +199,9 @@ The remainder of the FIH region holds the finalized digests. The `game-digest` (
 is `SHA3-256` of the plaintext outer superblock, and the embedded CNT carries the package-digest
 self-seal, the CNT-header rollup, the per-entry digest table and the GeneralDigests block
 (content/header/system/param/playgo/target). LibProsperoPkg reproduces **all of these byte-exact**
-(verified against four real debug packages). The FIH `0xB0` slot — `SHA3-256` of the **uncompressed
-inner PFS image** at its plain size — is implemented and threaded through
-the build path; like every digest its value bit-matches a specific reference package only once the inner
-Kraken encoder is byte-identical, but the formula is exact and gated self-consistent.
+(verified against real debug packages). In publisher PPR/NAPS images, FIH `0xA8` is the exact byte
+length of `naps_pkg_layout.dat` and FIH `0xB0` is `SHA3-256` of that same blob. Both fields were
+verified byte-for-byte against `dlc_baseline.pkg` and are threaded through the build path.
 See [implementation-status.md](implementation-status.md).
 
 ### 5.4 The SI segment

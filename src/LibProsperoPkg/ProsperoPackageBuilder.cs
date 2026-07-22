@@ -449,7 +449,8 @@ public static class ProsperoPackageBuilder
                 cntPath, finalPath, LibProsperoPkg.PKG.ProsperoFihVariant.Debug, log,
                 siArchiveFactory: siFactory,
                 nestedImageDigest: nestedImageDigest,
-                napsLayoutSize: siInputs?.NapsLayoutSize ?? 0);
+                napsLayoutSize: siInputs?.NapsLayoutSize ?? 0,
+                innerInodeCount: siInputs?.FihInnerInodeCount ?? 0);
             warnings.AddRange(fihWarnings);
 
             var fihType = ProsperoPkgReader.DetectType(finalPath);

@@ -16,6 +16,25 @@ namespace LibProsperoPkg.Util;
 public static class Crypto
 {
     /// <summary>
+    /// Wraps data with an RSA public modulus (public exponent 65537) using
+    /// EME-PKCS#1-v1_5. Prospero publisher key slots use 384-byte RSA-3072
+    /// moduli, so the returned ciphertext has the same length as
+    /// <paramref name="modulus"/>.
+    /// </summary>
+    public static byte[] RsaPkcs1EncryptKey(byte[] modulus, byte[] data)
+    {
+        ArgumentNullException.ThrowIfNull(modulus);
+        ArgumentNullException.ThrowIfNull(data);
+        using var rsa = RSA.Create();
+        rsa.ImportParameters(new RSAParameters
+        {
+            Modulus = modulus,
+            Exponent = new byte[] { 0x01, 0x00, 0x01 },
+        });
+        return rsa.Encrypt(data, RSAEncryptionPadding.Pkcs1);
+    }
+
+    /// <summary>
     /// Key-derivation step:
     /// a common function to generate a final key for PFS
     /// </summary>

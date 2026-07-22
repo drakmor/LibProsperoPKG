@@ -53,6 +53,9 @@ internal sealed class ProsperoSiBuildInputs
 
     /// <summary>Unpadded byte size of <c>naps_pkg_layout.dat</c>, written to FIH offset 0xA8.</summary>
     public ulong NapsLayoutSize { get; init; }
+
+    /// <summary>FIH +0x94/+0x98 inner inode count for the publisher PPR profile.</summary>
+    public uint FihInnerInodeCount { get; init; }
 }
 
 /// <summary>The PS5 volume kind, which selects the content-type code stamped into the header.</summary>
@@ -350,7 +353,12 @@ public static class ProsperoPkgBuilder
                 int imagedigsSize = checked((int)(pfsSize / BlockSize) * 32);
 
                 // --- Outer container (header + entries). ---
-                var pkg = BuildContainer(props, ekpfs, sourceFolder, (ulong)pfsSize, imagedigsSize, playgoFileCount, chunkDataSize);
+                ulong mchunkTotal = checked((ulong)ProsperoImageDigests.FihRelativeImageOffset + (ulong)pfsSize);
+                ulong mchunk0Size = Math.Min((ulong)innerImageAlignedSize, mchunkTotal);
+                ulong mchunk1Size = mchunkTotal - mchunk0Size;
+                var pkg = BuildContainer(
+                    props, ekpfs, sourceFolder, (ulong)pfsSize, imagedigsSize,
+                    playgoFileCount, mchunk0Size, mchunk1Size);
                 var imagedigsEntry = (GenericEntry)pkg.Entries.First(e => (uint)e.Id == ImagedigsEntryId);
 
                 long totalSize = (long)(pkg.Header.body_offset + pkg.Header.body_size + pkg.Header.pfs_image_size);
@@ -431,14 +439,21 @@ public static class ProsperoPkgBuilder
                 s => log($" [publisher] {s}"));
 
             byte[] outerImage = File.ReadAllBytes(publisher.OuterPfsPath);
-            nestedImageDigest = publisher.LogicalImageDigest;
+            // FIH+0xA8 is the NAPS layout length and FIH+0xB0 is SHA3-256 of
+            // that exact naps_pkg_layout.dat blob. The reference DLC confirms
+            // both fields byte-for-byte; the logical PPR stream is not this preimage.
+            nestedImageDigest = ProsperoImageDigests.Sha3_256(publisher.Naps.LayoutBytes);
             int imagedigsSize = publisher.ImageDigests.Length;
             if (imagedigsSize != checked(outerImage.Length / BlockSize * 32))
                 throw new InvalidDataException("Publisher imagedigs table does not match the outer-PFS block count.");
 
+            ulong packedAlignedSize = Align((ulong)publisher.Naps.PackedImage.Length, BlockSize);
+            ulong mchunkTotal = checked((ulong)ProsperoImageDigests.FihRelativeImageOffset + (ulong)outerImage.Length);
+            ulong mchunk0Size = Math.Min(packedAlignedSize, mchunkTotal);
+            ulong mchunk1Size = mchunkTotal - mchunk0Size;
             var pkg = BuildContainer(
-                props, Crypto.ComputeKeys(props.ContentId, props.Passcode, 1), sourceFolder,
-                (ulong)outerImage.Length, imagedigsSize, playgoFileCount, chunkDataSize);
+                props, ProsperoPfsKeys.DeriveEkpfs(props.ContentId, props.Passcode), sourceFolder,
+                (ulong)outerImage.Length, imagedigsSize, playgoFileCount, mchunk0Size, mchunk1Size);
             var imagedigsEntry = (GenericEntry)pkg.Entries.First(e => (uint)e.Id == ImagedigsEntryId);
             imagedigsEntry.FileData = publisher.ImageDigests;
 
@@ -450,7 +465,8 @@ public static class ProsperoPkgBuilder
             log($"Writing publisher outer PFS at 0x{pkg.Header.pfs_image_offset:X} ({outerImage.Length:N0} bytes)...");
 
             ProsperoPfsImageXmlOptions siXml = FinishContainer(
-                pkg, fs, props, nestedImageDigest, log, (ulong)publisher.Naps.LayoutBytes.Length);
+                pkg, fs, props, nestedImageDigest, log,
+                (ulong)publisher.Naps.LayoutBytes.Length, (uint)publisher.InnerInodeCount);
             byte[]? playGoChunkDat =
                 (pkg.Entries.FirstOrDefault(e => (uint)e.Id == PlayGoChunkDatEntryId) as GenericEntry)?.FileData;
             long packedSize = publisher.Naps.PackedImage.Length;
@@ -468,6 +484,7 @@ public static class ProsperoPkgBuilder
                 PlayGoChunkDat = playGoChunkDat,
                 InnerImageSize = packedSize,
                 NapsLayoutSize = (ulong)publisher.Naps.LayoutBytes.Length,
+                FihInnerInodeCount = (uint)publisher.InnerInodeCount,
             };
         }
         finally
@@ -734,7 +751,8 @@ public static class ProsperoPkgBuilder
 
     private static Pkg BuildContainer(
         ProsperoPkgBuildProperties props, byte[] ekpfs, string sourceFolder,
-        ulong pfsSize, int imagedigsSize, uint playgoFileCount, ulong chunkDataSize)
+        ulong pfsSize, int imagedigsSize, uint playgoFileCount,
+        ulong mchunk0Size, ulong mchunk1Size)
     {
         uint contentType = ContentTypeFor(props.VolumeType);
         var pkg = new Pkg
@@ -781,6 +799,10 @@ public static class ProsperoPkgBuilder
                 pfs_signed_digest = new byte[32],
                 pfs_split_size_nth_0 = 0,
                 pfs_split_size_nth_1 = 0,
+                image_seed = new byte[16],
+                cnt_region_offset = 0,
+                cnt_region_size = 0,
+                desc_digest = new byte[64],
             },
             HeaderDigest = new byte[32],
             HeaderSignature = new byte[ProsperoPkgSigner.SignatureSize],
@@ -788,18 +810,15 @@ public static class ProsperoPkgBuilder
 
         // System-container entries (the 6 SC entries), ids 0x1/0x10/0x20/0x80/0x100/0x200.
         pkg.EntryKeys = new KeysEntry(props.ContentId, props.Passcode, props.UsePublisherPprNaps);
-        byte[] encryptedImageKey = Crypto.RSA2048EncryptKey(
-            LibProsperoPkg.Util.RSAKeyset.FakeKeyset.Modulus, ekpfs);
         byte[] imageKeyBody;
         if (props.UsePublisherPprNaps)
         {
-            imageKeyBody = new byte[0x800];
-            for (int offset = 0; offset < imageKeyBody.Length; offset += encryptedImageKey.Length)
-                encryptedImageKey.CopyTo(imageKeyBody, offset);
+            imageKeyBody = BuildPublisherImageKeyEntry(ekpfs);
         }
         else
         {
-            imageKeyBody = encryptedImageKey;
+            imageKeyBody = Crypto.RSA2048EncryptKey(
+                LibProsperoPkg.Util.RSAKeyset.FakeKeyset.Modulus, ekpfs);
         }
         pkg.ImageKey = new GenericEntry(EntryId.IMAGE_KEY)
         {
@@ -840,7 +859,7 @@ public static class ProsperoPkgBuilder
         foreach (var (id, name, data) in new (uint Id, string? Name, byte[] Data)[]
         {
             (ImagedigsEntryId, null, new byte[imagedigsSize]),
-            (0x1001u, "playgo-chunk.dat", LibProsperoPkg.PlayGo.ProsperoPlayGo.BuildChunkDat(props.ContentId, chunkDataSize)),
+            (0x1001u, "playgo-chunk.dat", LibProsperoPkg.PlayGo.ProsperoPlayGo.BuildChunkDat(props.ContentId, mchunk0Size, mchunk1Size)),
             (0x2010u, "playgo-hash-table.dat", LibProsperoPkg.PlayGo.ProsperoPlayGo.BuildHashTable(playgoFileCount / 2)),
             (0x2011u, "playgo-ficm.dat", LibProsperoPkg.PlayGo.ProsperoPlayGo.BuildFicm(playgoFileCount)),
         })
@@ -873,6 +892,29 @@ public static class ProsperoPkgBuilder
         if (id is 0x2010 or 0x2011) return 4;          // PlayGo tails
         if (id is >= 0x1200 and < 0x2000 || id is 0x1006 or 0x100D) return 3; // media
         return 1;                                      // backend-authored sce_sys blobs
+    }
+
+    /// <summary>
+    /// Builds the publisher IMAGE_KEY payload. The 0x800-byte field consists of
+    /// repeated RSA-3072 PKCS#1-v1_5 wraps of EKPFS under mount_image.bin; the
+    /// final ciphertext is truncated at the fixed field boundary.
+    /// </summary>
+    private static byte[] BuildPublisherImageKeyEntry(byte[] ekpfs)
+    {
+        const int imageKeySize = 0x800;
+        const int rsa3072Size = 384;
+        byte[] modulus = LibProsperoPkg.Keys.ProsperoKeys.MountImageKey.ToArray();
+        if (modulus.Length != rsa3072Size)
+            throw new InvalidDataException("The publisher mount-image modulus must be 384 bytes.");
+
+        byte[] result = new byte[imageKeySize];
+        for (int offset = 0; offset < result.Length; offset += rsa3072Size)
+        {
+            byte[] wrapped = Crypto.RsaPkcs1EncryptKey(modulus, ekpfs);
+            wrapped.AsSpan(0, Math.Min(wrapped.Length, result.Length - offset))
+                .CopyTo(result.AsSpan(offset));
+        }
+        return result;
     }
 
     // The PS5 Flags1 word for each entry id.
@@ -923,20 +965,40 @@ public static class ProsperoPkgBuilder
         pkg.Header.entry_count = (uint)pkg.Entries.Count;
         pkg.Header.entry_count_2 = (ushort)pkg.Entries.Count;
         pkg.Header.entry_table_offset = pkg.Metas.meta.DataOffset;
-        pkg.Header.body_size = Align(pkg.Header.body_offset + bodySize, 0x80000) - pkg.Header.body_offset;
+        // Publisher CNT bodies are rounded to a 64-KiB boundary. The former
+        // 0x80000 alignment inflated a reference-sized AC container from
+        // 0xC0000 to 0x100000 and changed every finalized-image locator.
+        ulong bodyAlignment = pkg.EntryKeys.Length == 0xB80 ? 0x10000UL : 0x80000UL;
+        pkg.Header.body_size = Align(pkg.Header.body_offset + bodySize, bodyAlignment) - pkg.Header.body_offset;
         pkg.Header.main_ent_data_size = (uint)(new Entry[]
         {
             pkg.EntryKeys, pkg.ImageKey, pkg.GeneralDigests, pkg.Metas, pkg.Digests,
         }).Sum(x => x.Length);
 
         pkg.Header.pfs_image_offset = pkg.Header.body_offset + pkg.Header.body_size;
+        ulong containerSize = pkg.Header.pfs_image_offset;
+        bool publisherProfile = pkg.EntryKeys.Length == 0xB80;
+        ulong leadingFihSize = publisherProfile ? ProsperoImageDigests.FihRelativeImageOffset : 0;
         pkg.Header.package_size = pkg.Header.mount_image_size =
-            pkg.Header.body_offset + pkg.Header.body_size + pkg.Header.pfs_image_size;
+            leadingFihSize + pkg.Header.pfs_image_size + containerSize;
+
+        if (publisherProfile)
+        {
+            MetaEntry mandatory = pkg.Metas.Metas.First(m => (uint)m.id == ImagedigsEntryId);
+            pkg.Header.mandatory_size = mandatory.DataOffset;
+            pkg.Header.cnt_region_offset =
+                ProsperoImageDigests.FihRelativeImageOffset + pkg.Header.pfs_image_size;
+            pkg.Header.cnt_region_size = containerSize;
+            pkg.Header.desc_image_key_offset = pkg.ImageKey.meta.DataOffset;
+            pkg.Header.desc_image_key_size = pkg.ImageKey.meta.DataSize;
+            pkg.Header.desc_mandatory_offset = mandatory.DataOffset;
+            pkg.Header.desc_mandatory_size = mandatory.DataSize;
+        }
     }
 
     private static ProsperoPfsImageXmlOptions FinishContainer(
         Pkg pkg, Stream s, ProsperoPkgBuildProperties props, byte[]? nestedImageDigest,
-        Action<string> log, ulong napsLayoutSize = 0)
+        Action<string> log, ulong napsLayoutSize = 0, uint innerInodeCount = 0)
     {
         // Read the outer PFS image (encrypted blocks + plaintext superblock) so the PS5 mount digests can be
         // computed for the mount image — both are SHA3-256, NOT SHA-256:
@@ -951,10 +1013,13 @@ public static class ProsperoPkgBuilder
 
         var (sbOffset, sblockDigest) = ProsperoImageDigests.ComputeSblockDigestFromImage(image);
         pkg.Header.pfs_image_digest = sblockDigest ?? ProsperoImageDigests.Sha3_256(image);
+        if (sbOffset >= 0 && sbOffset + PfsSeedOffset + 16 <= image.Length)
+            pkg.Header.image_seed = image.AsSpan(sbOffset + PfsSeedOffset, 16).ToArray();
         byte[] fihBlock = ProsperoFihBuilder.BuildFihHeaderBlock(
             ProsperoFihVariant.Debug, pkg.Header.pfs_image_size,
             ProsperoImageDigests.FihRelativeImageOffset + pkg.Header.pfs_image_size, image,
-            warnings: null, nestedImageDigest: nestedImageDigest, napsLayoutSize: napsLayoutSize);
+            warnings: null, nestedImageDigest: nestedImageDigest, napsLayoutSize: napsLayoutSize,
+            innerInodeCount: innerInodeCount);
         pkg.Header.pfs_signed_digest = ProsperoImageDigests.ComputeFixedInfoDigest(fihBlock);
 
         // General digests (PS5 nwonly scheme: type 0x102 [set at creation so the layout reserves 0x1E0],
@@ -967,6 +1032,9 @@ public static class ProsperoPkgBuilder
         var writer = new PkgWriter(s);
         writer.WriteBody(pkg, props.ContentId, props.Passcode);
         CalcBodyDigests(pkg, s);
+
+        if (pkg.Header.desc_image_key_size != 0 && pkg.Header.desc_mandatory_size != 0)
+            pkg.Header.desc_digest = ComputeDescriptorDigest(s, pkg.Header);
 
         // Header, header digest and the PS5 RSA-3072 metadata signature.
         s.Position = 0;
@@ -993,6 +1061,22 @@ public static class ProsperoPkgBuilder
         // SI pfsimage.xml options can be assembled from the builder's own output. The inner-PFS seed is read
         // from the plaintext outer superblock at sbOffset+0x370.
         return BuildSiXmlOptions(pkg, image, sbOffset, Path.GetFullPath(props.SourceFolder!));
+    }
+
+    private static byte[] ComputeDescriptorDigest(Stream stream, in Header header)
+    {
+        byte[] imageKey = new byte[header.desc_image_key_size];
+        stream.Position = header.desc_image_key_offset;
+        stream.ReadExactly(imageKey);
+
+        byte[] mandatory = new byte[header.desc_mandatory_size];
+        stream.Position = header.desc_mandatory_offset;
+        stream.ReadExactly(mandatory);
+
+        byte[] result = new byte[64];
+        ProsperoImageDigests.Sha3_256(imageKey).CopyTo(result, 0);
+        ProsperoImageDigests.Sha3_256(mandatory).CopyTo(result, 32);
+        return result;
     }
 
     // ---- SI (sce_suppl) pfsimage.xml option assembly ----------------------------------------------
