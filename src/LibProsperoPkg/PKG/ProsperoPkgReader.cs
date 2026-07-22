@@ -105,6 +105,9 @@ public static class ProsperoPkgReader
             PfsImageOffset = BinaryPrimitives.ReadUInt64LittleEndian(span[ProsperoPkgLayout.FihPfsImageOffsetField..]),
             PfsImageSize = BinaryPrimitives.ReadUInt64LittleEndian(span[ProsperoPkgLayout.FihPfsImageSizeField..]),
             EmbeddedCntOffset = BinaryPrimitives.ReadUInt64LittleEndian(span[ProsperoPkgLayout.FihEmbeddedCntOffsetField..]),
+            InnerImageBlockCount = BinaryPrimitives.ReadUInt32LittleEndian(span[ProsperoPkgLayout.FihInnerImageBlockCountField..]),
+            MetadataBlockCount = BinaryPrimitives.ReadUInt32LittleEndian(span[ProsperoPkgLayout.FihMetaBlockCountField..]),
+            NapsLayoutSize = BinaryPrimitives.ReadUInt64LittleEndian(span[0xA8..]),
         };
     }
 

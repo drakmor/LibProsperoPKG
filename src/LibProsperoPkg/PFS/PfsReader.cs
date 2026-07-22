@@ -86,15 +86,16 @@ public class PfsReader
             var buf = new byte[blockSize];
             using (var file = System.IO.File.OpenWrite(path))
             {
+                bool isCompressed = flags.HasFlag(InodeFlags.compressed);
                 var sz = size;
-                file.SetLength(sz);
                 long pos = 0;
                 var reader = GetView();
-                if (decompress && flags.HasFlag(InodeFlags.compressed))
+                if (decompress && isCompressed)
                 {
                     sz = compressed_size;
                     reader = new PFSCReader(reader);
                 }
+                file.SetLength(sz);
                 while (sz > 0)
                 {
                     var toRead = (int)Math.Min(sz, buf.Length);
@@ -117,13 +118,14 @@ public class PfsReader
     private Stream sectorStream;
 
     public PfsReader(MemoryMappedViewAccessor r, ulong pfs_flags = 0, byte[] ekpfs = null, byte[] tweak = null, byte[] data = null)
-    : this(new MemoryMappedViewAccessor_(r), pfs_flags, ekpfs, tweak, data)
+    : this(new MemoryMappedViewAccessor_(r), pfs_flags, ekpfs, tweak, data, 0)
     { }
-    public PfsReader(IMemoryReader r, ulong pfs_flags = 0, byte[] ekpfs = null, byte[] tweak = null, byte[] data = null)
+    public PfsReader(IMemoryReader r, ulong pfs_flags = 0, byte[] ekpfs = null, byte[] tweak = null, byte[] data = null, long superblockOffset = 0, bool encryptedDataAlreadyDecrypted = false)
     {
+        if (superblockOffset < 0) throw new ArgumentOutOfRangeException(nameof(superblockOffset));
         reader = r;
         var buf = new byte[0x400];
-        reader.Read(0, buf, 0, 0x400);
+        reader.Read(superblockOffset, buf, 0, 0x400);
 
         using (var ms = new MemoryStream(buf))
         {
@@ -154,7 +156,7 @@ public class PfsReader
             dinodeReader = DinodeD32.ReadFromStream;
             dinodeSize = (int)DinodeD32.SizeOf; // 0xA8
         }
-        if (hdr.Mode.HasFlag(PfsMode.Encrypted))
+        if (hdr.Mode.HasFlag(PfsMode.Encrypted) && !encryptedDataAlreadyDecrypted)
         {
             const int XtsSectorSize = 0x1000;
             uint XtsStartSector = hdr.BlockSize / XtsSectorSize;

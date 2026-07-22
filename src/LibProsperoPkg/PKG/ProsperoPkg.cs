@@ -102,6 +102,15 @@ public sealed class ProsperoFihHeader
 
     /// <summary>Offset of the embedded CNT metadata container (FIH offset 0x58).</summary>
     public ulong EmbeddedCntOffset { get; init; }
+
+    /// <summary>Number of complete 64 KiB blocks occupied by <c>pfs_image.dat</c> (FIH +0x90).</summary>
+    public uint InnerImageBlockCount { get; init; }
+
+    /// <summary>Publisher metadata-block count (FIH +0x94).</summary>
+    public uint MetadataBlockCount { get; init; }
+
+    /// <summary>Serialized <c>naps_pkg_layout.dat</c> size (FIH +0xA8).</summary>
+    public ulong NapsLayoutSize { get; init; }
 }
 
 /// <summary>The fully parsed outer container: header plus the resolved entry list.</summary>

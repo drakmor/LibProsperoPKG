@@ -1,5 +1,7 @@
 using LibProsperoPkg.PFS;
 using LibProsperoPkg.PFS.Compression;
+using LibProsperoPkg.PKG;
+using LibProsperoPkg.Util;
 using System;
 using System.Buffers.Binary;
 using System.Collections.Generic;
@@ -44,6 +46,12 @@ internal static class Program
                 "inspect-file" => InspectPfsFile(args),
                 "verify-phuc" => VerifyPhuc(args),
                 "verify" => VerifyFolder(args),
+                "inspect-naps" => InspectNaps(args),
+                "roundtrip-naps" => RoundTripNaps(args),
+                "inspect-pkg" => InspectPackage(args),
+                "extract-pkg-outer" => ExtractPackageOuter(args),
+                "extract-pkg-cnt" => ExtractPackageCnt(args),
+                "selftest" => SelfTest(args),
                 _ => throw new ArgumentException($"Unknown command: {args[0]}")
             };
         }
@@ -52,6 +60,68 @@ internal static class Program
             Console.Error.WriteLine("error: " + exception.Message);
             return 1;
         }
+    }
+
+    private static int InspectNaps(string[] args)
+    {
+        if (args.Length != 2) throw new ArgumentException("inspect-naps requires <naps_pkg_layout.dat>.");
+        NapsLayoutDocument document = ProsperoNapsLayout.Parse(File.ReadAllBytes(args[1]));
+        Console.WriteLine($"files={document.Counts.NumFiles} compression={document.Counts.CompressionType} keys={document.Counts.NumKeys}");
+        Console.WriteLine($"ublocks={document.Counts.UBlockCount} outer={document.Counts.NumOuterBlocks} cblockInfo={document.Counts.NumCblockInfo}");
+        Console.WriteLine($"layout-size=0x{document.Map.TotalSize:x} footer={document.TrailingZeroBytes}");
+        return 0;
+    }
+
+    private static int RoundTripNaps(string[] args)
+    {
+        if (args.Length != 3) throw new ArgumentException("roundtrip-naps requires <input> <output>.");
+        byte[] original = File.ReadAllBytes(args[1]);
+        NapsLayoutDocument document = ProsperoNapsLayout.Parse(original);
+        byte[] rebuilt = ProsperoNapsLayout.BuildLayout(document);
+        File.WriteAllBytes(args[2], rebuilt);
+        if (!original.AsSpan().SequenceEqual(rebuilt))
+            throw new InvalidDataException("NAPS parse/build result is not byte-exact.");
+        Console.WriteLine($"byte-exact: {rebuilt.Length} bytes");
+        return 0;
+    }
+
+    private static int InspectPackage(string[] args)
+    {
+        if (args.Length != 2) throw new ArgumentException("inspect-pkg requires <package.pkg>.");
+        ProsperoPkg package = ProsperoPkgReader.Read(args[1]);
+        ProsperoPackageMap map = ProsperoPackageArchive.Inspect(args[1]);
+        Console.WriteLine($"type={package.Type} content-id={package.Header?.ContentId}");
+        Console.WriteLine($"outer=0x{map.OuterPfsOffset:x}+0x{map.OuterPfsSize:x} superblock={map.OuterSuperblockIndex}");
+        Console.WriteLine($"cnt=0x{map.CntOffset:x}+0x{map.CntSize:x} supplement=0x{map.SupplementSize:x} entries={package.Entries.Count}");
+        return 0;
+    }
+
+    private static int ExtractPackageOuter(string[] args)
+    {
+        if (args.Length is < 3 or > 4) throw new ArgumentException("extract-pkg-outer requires <package.pkg> <output-dir> [passcode].");
+        string passcode = args.Length == 4 ? args[3] : new string('0', 32);
+        IReadOnlyList<string> files = ProsperoPackageArchive.ExtractOuterFiles(args[1], args[2], passcode);
+        Console.WriteLine($"extracted {files.Count} outer-PFS files");
+        return 0;
+    }
+
+    private static int ExtractPackageCnt(string[] args)
+    {
+        if (args.Length != 3) throw new ArgumentException("extract-pkg-cnt requires <package.pkg> <output-dir>.");
+        IReadOnlyList<string> files = ProsperoPackageArchive.ExtractCntEntries(args[1], args[2]);
+        Console.WriteLine($"extracted {files.Count} CNT entries (encrypted entries remain raw)");
+        return 0;
+    }
+
+    private static int SelfTest(string[] args)
+    {
+        if (args.Length != 1) throw new ArgumentException("selftest takes no arguments.");
+        const string emptySha3 = "A7FFC6F8BF1ED76651C14756A061D662F580FF4DE43B49FA82D80A4B80F8434A";
+        string actual = Convert.ToHexString(ProsperoSha3.HashData(ReadOnlySpan<byte>.Empty));
+        if (!string.Equals(actual, emptySha3, StringComparison.Ordinal))
+            throw new InvalidDataException($"Managed SHA3-256 KAT failed: {actual}");
+        Console.WriteLine("selftest: SHA3-256 known-answer test passed");
+        return 0;
     }
 
     private static int BuildPfs(string[] args)
@@ -947,6 +1017,12 @@ internal static class Program
         Console.WriteLine("  inspect-file <image.pfs> <path>");
         Console.WriteLine("  verify-phuc <image.phuc>");
         Console.WriteLine("  verify <source-folder> [the same build options]");
+        Console.WriteLine("  inspect-naps <naps_pkg_layout.dat>");
+        Console.WriteLine("  roundtrip-naps <input> <output>");
+        Console.WriteLine("  inspect-pkg <package.pkg>");
+        Console.WriteLine("  extract-pkg-outer <package.pkg> <output-dir> [passcode]");
+        Console.WriteLine("  extract-pkg-cnt <package.pkg> <output-dir>");
+        Console.WriteLine("  selftest");
         Console.WriteLine("  Levels: Kraken -4..9 (default 8), zlib 0..9 (default 9).");
         Console.WriteLine("  Valid builds: ppr+kraken/none; classic+zlib/kraken/none.");
     }

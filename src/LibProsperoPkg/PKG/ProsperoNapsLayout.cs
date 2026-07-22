@@ -64,6 +64,7 @@
 using System;
 using System.Buffers.Binary;
 using System.Collections.Generic;
+using System.IO;
 
 namespace LibProsperoPkg.PKG;
 
@@ -75,7 +76,7 @@ namespace LibProsperoPkg.PKG;
 /// <param name="CompressionType">Oodle codec selector (<c>m_compressionType</c>).</param>
 /// <param name="NumKeys">Encryption keys (<c>m_numKeysMinus1 + 1</c>).</param>
 /// <param name="NumShufflePatterns">Shuffle-pattern entries (0 = no shuffling).</param>
-/// <param name="NumUBlocks">Uncompressed blocks (<c>m_numUBlocks</c>).</param>
+/// <param name="NumUBlocks">Maximum uncompressed-block index (<c>m_numUBlocks</c>); the actual count is this value plus one.</param>
 /// <param name="NumOuterBlocks">Outer-block entries (<c>m_numOuterBlocks</c>).</param>
 /// <param name="NumCblockInfo">CblockInfo entries (<c>m_numCblockInfoMinus2 + 2</c>).</param>
 public readonly record struct NapsLayoutCounts(
@@ -87,11 +88,14 @@ public readonly record struct NapsLayoutCounts(
     int NumOuterBlocks,
     int NumCblockInfo)
 {
+    /// <summary>Actual number of uncompressed blocks represented by the inclusive maximum index.</summary>
+    public int UBlockCount => checked(NumUBlocks + 1);
+
     /// <summary>
     /// Number of 10-byte <c>CblockInfoOffsetByUblockIdxCompressed</c> (u2c) entries: one per group of
     /// 8 uncompressed blocks (each entry carries a uint24 base plus 7 per-ublock deltas).
     /// </summary>
-    public int NumU2cEntries => (((NumUBlocks + 7) & ~7) >> 3);
+    public int NumU2cEntries => checked((NumUBlocks + 8) >> 3);
 }
 
 /// <summary>Byte offset and size of one NAPS section inside the layout blob.</summary>
@@ -120,11 +124,16 @@ public readonly record struct NapsSectionMap(
 
 /// <summary>
 /// A 6-byte <c>UncompressedOffsetStartByFileIdx</c> (fidx) entry. Layout fully validated against the
-/// dump format <c>fidx[..] : type=%02x, m_uoffsetStart=%010llx</c> (1 type byte + 40-bit offset).
+/// dump format <c>fidx[..] : type=%02x, m_uoffsetStart=%010llx</c>. On disk this is one LE48 word:
+/// offset in bits 0..39 and type/flags in bits 40..47.
 /// </summary>
 /// <param name="Type">The per-file <c>type</c> byte.</param>
 /// <param name="UncompressedOffsetStart">40-bit little-endian uncompressed start offset.</param>
-public readonly record struct NapsFileOffsetEntry(byte Type, ulong UncompressedOffsetStart);
+public readonly record struct NapsFileOffsetEntry(byte Type, ulong UncompressedOffsetStart)
+{
+    /// <summary>Continuation marker (raw bit 46, or bit 6 of <see cref="Type"/>).</summary>
+    public bool Continuation => (Type & 0x40) != 0;
+}
 
 /// <summary>
 /// A 10-byte <c>CblockInfoOffsetByUblockIdxCompressed</c> (u2c) entry. Layout fully validated against the
@@ -170,20 +179,26 @@ public readonly record struct NapsCblockInfoEntry
     /// <summary><c>m_coffsetStartMod256K</c> (18 bits). Model bit-offset.</summary>
     public uint CoffsetStartMod256K { get; init; }
 
-    /// <summary><c>m_uoffsetStart</c> (18 bits). Model bit-offset.</summary>
+    /// <summary>Raw bit 19 between the discriminator and length field; preserved for lossless tooling.</summary>
+    public bool ReservedBit19 { get; init; }
+
+    /// <summary><c>m_uoffsetStart</c> (17 bits, bits 38..54).</summary>
     public uint UoffsetStart { get; init; }
 
-    /// <summary><c>m_clenEvenMinus1</c> (17 bits). Model bit-offset.</summary>
+    /// <summary><c>m_clenEvenMinus1</c> (18 bits, bits 20..37).</summary>
     public uint ClenEvenMinus1 { get; init; }
 
-    /// <summary><c>m_even</c> flag. Model bit-offset.</summary>
+    /// <summary><c>m_even</c> (3 bits, bits 55..57).</summary>
     public byte Even { get; init; }
 
-    /// <summary><c>m_odd</c> flag. Model bit-offset.</summary>
+    /// <summary><c>m_odd</c> (3 bits, bits 58..60).</summary>
     public byte Odd { get; init; }
 
-    /// <summary><c>m_KdePredictor</c> (3 bits). Model bit-offset.</summary>
+    /// <summary><c>m_KdePredictor</c> (6 bits, bits 61..66).</summary>
     public byte KdePredictor { get; init; }
+
+    /// <summary>Raw bit 67. Strict kernel-produced layouts normally clear it; preserved for lossless tooling.</summary>
+    public bool ReservedBit67 { get; init; }
 
     /// <summary><c>m_shuffleIdx</c> (4 bits). Model bit-offset.</summary>
     public byte ShuffleIdx { get; init; }
@@ -199,7 +214,7 @@ public readonly record struct NapsCblockInfoEntry
     /// <summary><c>m_keyTableIdx</c>. Model bit-offset.</summary>
     public byte KeyTableIdx { get; init; }
 
-    /// <summary><c>m_coffsetStart256K</c> (24 bits). Model bit-offset.</summary>
+    /// <summary><c>m_coffsetStart256K</c> / compressed-window base (22 bits, bits 50..71).</summary>
     public uint CoffsetStart256K { get; init; }
 }
 
@@ -226,6 +241,9 @@ public sealed class NapsLayoutDocument
 
     /// <summary>Decoded 9-byte CblockInfo entries.</summary>
     public required IReadOnlyList<NapsCblockInfoEntry> CblockInfos { get; init; }
+
+    /// <summary>All-zero bytes after the aligned structural layout. Publisher samples use eight.</summary>
+    public int TrailingZeroBytes { get; init; }
 }
 
 /// <summary>
@@ -278,7 +296,10 @@ public static class ProsperoNapsLayout
         byte compressionType = (byte)((word0 >> 24) & 0x3);
         int numKeysMinus1 = (int)((word0 >> 26) & 0x3);
         int numShufflePatterns = (int)((word0 >> 28) & 0xF);
-        int numUBlocks = (int)((word0 >> 32) & 0xFFFFFF);
+        if ((word0 >> 55) != 0 || (word1 >> 48) != 0)
+            throw new InvalidDataException("NAPS header reserved bits are non-zero.");
+
+        int numUBlocks = (int)((word0 >> 32) & 0x7FFFFF);
 
         int numOuterBlocks = (int)(word1 & 0xFFFFFF);
         int numCblockInfoMinus2 = (int)((word1 >> 24) & 0xFFFFFF);
@@ -296,12 +317,13 @@ public static class ProsperoNapsLayout
     /// <summary>Encode section counts back into a 16-byte header (inverse of <see cref="DecodeHeader"/>).</summary>
     public static byte[] EncodeHeader(NapsLayoutCounts counts)
     {
+        ValidateCounts(counts);
         ulong word0 =
               ((ulong)(uint)(counts.NumFiles - 1) & 0xFFFFFF)
             | ((ulong)(counts.CompressionType & 0x3) << 24)
             | ((ulong)(uint)((counts.NumKeys - 1) & 0x3) << 26)
             | ((ulong)(uint)(counts.NumShufflePatterns & 0xF) << 28)
-            | ((ulong)(uint)(counts.NumUBlocks & 0xFFFFFF) << 32);
+            | ((ulong)(uint)(counts.NumUBlocks & 0x7FFFFF) << 32);
 
         ulong word1 =
               ((ulong)(uint)(counts.NumOuterBlocks & 0xFFFFFF))
@@ -338,24 +360,28 @@ public static class ProsperoNapsLayout
         var u2c = new NapsSection(pos, (long)u2cCount * U2cStride, U2cStride, u2cCount);
         pos += u2c.Size;
 
+        pos = AlignUp(pos, 8);
+
         var cbi = new NapsSection(pos, (long)counts.NumCblockInfo * CblockInfoStride, CblockInfoStride, counts.NumCblockInfo);
         pos += cbi.Size;
+
+        pos = AlignUp(pos, 8);
 
         return new NapsSectionMap(header, ob, sp, fidx, u2c, cbi, pos);
     }
 
     // ---- Entry decoders ---------------------------------------------------------------------------
 
-    /// <summary>Decode a 6-byte fidx entry (validated layout: 1 type byte + 40-bit LE offset).</summary>
+    /// <summary>Decode a 6-byte LE48 fidx entry: low 40 bits offset, high 8 bits type/flags.</summary>
     public static NapsFileOffsetEntry DecodeFileOffsetEntry(ReadOnlySpan<byte> entry)
     {
         if (entry.Length < FileOffsetStride)
             throw new ArgumentException($"fidx entry needs {FileOffsetStride} bytes.", nameof(entry));
 
-        byte type = entry[0];
         ulong offset = 0;
         for (int i = 0; i < 5; i++)
-            offset |= (ulong)entry[1 + i] << (8 * i);
+            offset |= (ulong)entry[i] << (8 * i);
+        byte type = entry[5];
         return new NapsFileOffsetEntry(type, offset);
     }
 
@@ -363,10 +389,12 @@ public static class ProsperoNapsLayout
     public static byte[] EncodeFileOffsetEntry(NapsFileOffsetEntry entry)
     {
         var buffer = new byte[FileOffsetStride];
-        buffer[0] = entry.Type;
+        if (entry.UncompressedOffsetStart > 0xFFFF_FFFFFFUL)
+            throw new ArgumentOutOfRangeException(nameof(entry), "NAPS file offset exceeds 40 bits.");
         ulong offset = entry.UncompressedOffsetStart;
         for (int i = 0; i < 5; i++)
-            buffer[1 + i] = (byte)(offset >> (8 * i));
+            buffer[i] = (byte)(offset >> (8 * i));
+        buffer[5] = entry.Type;
         return buffer;
     }
 
@@ -413,7 +441,7 @@ public static class ProsperoNapsLayout
         ulong lo = 0;
         for (int i = 0; i < 8; i++)
             lo |= (ulong)raw[i] << (8 * i);
-        ulong hi = raw[8];
+        UInt128 bits = lo | ((UInt128)raw[8] << 64);
 
         bool isRunBase = ((lo >> 18) & 1) != 0;
         uint coffsetMod256K = (uint)(lo & 0x3FFFF);
@@ -425,12 +453,14 @@ public static class ProsperoNapsLayout
                 Raw = raw,
                 IsRunBase = false,
                 CoffsetStartMod256K = coffsetMod256K,
-                UoffsetStart = (uint)((lo >> 19) & 0x3FFFF),
-                ClenEvenMinus1 = (uint)((lo >> 37) & 0x1FFFF),
-                Even = (byte)((lo >> 54) & 0x1),
-                Odd = (byte)((lo >> 55) & 0x1),
-                KdePredictor = (byte)((lo >> 56) & 0x7),
-                ShuffleIdx = (byte)((lo >> 59) & 0xF),
+                ReservedBit19 = ((bits >> 19) & 1) != 0,
+                ClenEvenMinus1 = (uint)((bits >> 20) & 0x3FFFF),
+                UoffsetStart = (uint)((bits >> 38) & 0x1FFFF),
+                Even = (byte)((bits >> 55) & 0x7),
+                Odd = (byte)((bits >> 58) & 0x7),
+                KdePredictor = (byte)((bits >> 61) & 0x3F),
+                ReservedBit67 = ((bits >> 67) & 1) != 0,
+                ShuffleIdx = (byte)((bits >> 68) & 0xF),
             };
         }
 
@@ -439,9 +469,9 @@ public static class ProsperoNapsLayout
             Raw = raw,
             IsRunBase = true,
             CoffsetEndMod256K = coffsetMod256K,
-            TweakIdxStart = (uint)((lo >> 19) & 0xFFFFFFF),
-            KeyTableIdx = (byte)((lo >> 47) & 0x3),
-            CoffsetStart256K = (uint)(((lo >> 49) & 0x7FFF) | ((hi & 0x1FF) << 15)),
+            TweakIdxStart = (uint)((bits >> 20) & 0xFFFFFFF),
+            KeyTableIdx = (byte)((bits >> 48) & 0x3),
+            CoffsetStart256K = (uint)((bits >> 50) & 0x3FFFFF),
         };
     }
 
@@ -465,6 +495,10 @@ public static class ProsperoNapsLayout
         if (blob.Length < map.TotalSize)
             throw new ArgumentException(
                 $"NAPS blob is {blob.Length} bytes but the counts require {map.TotalSize}.", nameof(blob));
+
+        int trailing = checked(blob.Length - (int)map.TotalSize);
+        for (int i = (int)map.TotalSize; i < blob.Length; i++)
+            if (blob[i] != 0) throw new InvalidDataException("NAPS trailing footer contains non-zero bytes.");
 
         var outerBlocks = SliceRaw(blob, map.OuterBlockDigest);
         var shuffles = SliceRaw(blob, map.ShufflePattern);
@@ -490,18 +524,16 @@ public static class ProsperoNapsLayout
             FileOffsets = fileOffsets,
             CblockInfoOffsetByUblock = u2c,
             CblockInfos = cblockInfos,
+            TrailingZeroBytes = trailing,
         };
     }
 
     // ---- Top-level serializer ---------------------------------------------------------------------
 
     /// <summary>
-    /// Default zero-pad alignment of the serialized blob. The reference <c>Downloads.pkg</c>
-    /// <c>naps_pkg_layout.dat</c> has 533 bytes of section content padded up to 544 (a multiple of
-    /// both 16 and 32); 16 is used as the default and is exact for that sample. Pass <c>1</c> to emit
-    /// the unpadded section content only.
+    /// Default all-zero footer written after the separately aligned structural layout.
     /// </summary>
-    public const int DefaultAlignment = 16;
+    public const int DefaultFooterSize = 8;
 
     /// <summary>
     /// Serialize a <see cref="NapsLayoutDocument"/> back into a <c>naps_pkg_layout.dat</c> blob, byte-exact.
@@ -510,14 +542,14 @@ public static class ProsperoNapsLayout
     /// <c>BuildLayout(Parse(reference)) == reference</c> for every byte, including the trailing zero pad.
     /// The section content is emitted in the validated on-disk order
     /// (header, outer-block digests, shuffle patterns, fidx, u2c, CblockInfo) using the validated
-    /// per-field encoders, then zero-padded to <paramref name="alignment"/>.
+    /// per-field encoders, then writes the requested all-zero footer.
     /// </summary>
     /// <param name="document">The layout to serialize. Its <see cref="NapsLayoutDocument.Counts"/> must
     /// agree with the lengths of its section lists.</param>
-    /// <param name="alignment">Byte alignment for the trailing zero pad (default <see cref="DefaultAlignment"/>).
-    /// Values &lt;= 1 emit the unpadded content.</param>
+    /// <param name="trailingZeroBytes">Footer size. A negative value preserves the parsed footer or uses
+    /// <see cref="DefaultFooterSize"/> for a newly constructed document; zero emits no footer.</param>
     /// <returns>The serialized blob.</returns>
-    public static byte[] BuildLayout(NapsLayoutDocument document, int alignment = DefaultAlignment)
+    public static byte[] BuildLayout(NapsLayoutDocument document, int trailingZeroBytes = -1)
     {
         ArgumentNullException.ThrowIfNull(document);
         NapsLayoutCounts counts = document.Counts;
@@ -533,9 +565,13 @@ public static class ProsperoNapsLayout
         if (document.CblockInfos.Count != counts.NumCblockInfo)
             throw new ArgumentException($"CblockInfos count {document.CblockInfos.Count} != NumCblockInfo {counts.NumCblockInfo}.", nameof(document));
 
+        ValidateDocument(document);
         NapsSectionMap map = SectionMap(counts);
         long content = map.TotalSize;
-        long total = alignment > 1 ? (content + alignment - 1) / alignment * alignment : content;
+        int footer = trailingZeroBytes >= 0
+            ? trailingZeroBytes
+            : (document.TrailingZeroBytes != 0 ? document.TrailingZeroBytes : DefaultFooterSize);
+        long total = checked(content + footer);
 
         var blob = new byte[total];
         var span = blob.AsSpan();
@@ -571,6 +607,8 @@ public static class ProsperoNapsLayout
             pos += U2cStride;
         }
 
+        pos = checked((int)map.CblockInfo.Offset);
+
         foreach (NapsCblockInfoEntry entry in document.CblockInfos)
         {
             EncodeCblockInfoEntry(entry).CopyTo(span.Slice(pos, CblockInfoStride));
@@ -601,32 +639,76 @@ public static class ProsperoNapsLayout
     /// </summary>
     public static byte[] EncodeCblockInfoEntry(NapsCblockInfoEntry entry)
     {
-        ulong lo = (entry.IsRunBase ? entry.CoffsetEndMod256K : entry.CoffsetStartMod256K) & 0x3FFFF;
-        ulong hi;
+        UInt128 bits = (entry.IsRunBase ? entry.CoffsetEndMod256K : entry.CoffsetStartMod256K) & 0x3FFFF;
         if (!entry.IsRunBase)
         {
-            lo |= (ulong)(entry.UoffsetStart & 0x3FFFF) << 19;
-            lo |= (ulong)(entry.ClenEvenMinus1 & 0x1FFFF) << 37;
-            lo |= (ulong)(entry.Even & 0x1) << 54;
-            lo |= (ulong)(entry.Odd & 0x1) << 55;
-            lo |= (ulong)(entry.KdePredictor & 0x7) << 56;
-            lo |= (ulong)(entry.ShuffleIdx & 0xF) << 59;
-            hi = 0;
+            RequireFits(entry.ClenEvenMinus1, 18, nameof(entry.ClenEvenMinus1));
+            RequireFits(entry.UoffsetStart, 17, nameof(entry.UoffsetStart));
+            RequireFits(entry.Even, 3, nameof(entry.Even));
+            RequireFits(entry.Odd, 3, nameof(entry.Odd));
+            RequireFits(entry.KdePredictor, 6, nameof(entry.KdePredictor));
+            RequireFits(entry.ShuffleIdx, 4, nameof(entry.ShuffleIdx));
+            if (entry.ReservedBit19) bits |= (UInt128)1 << 19;
+            bits |= (UInt128)entry.ClenEvenMinus1 << 20;
+            bits |= (UInt128)entry.UoffsetStart << 38;
+            bits |= (UInt128)entry.Even << 55;
+            bits |= (UInt128)entry.Odd << 58;
+            bits |= (UInt128)entry.KdePredictor << 61;
+            if (entry.ReservedBit67) bits |= (UInt128)1 << 67;
+            bits |= (UInt128)entry.ShuffleIdx << 68;
         }
         else
         {
-            lo |= 1UL << 18; // m_isRunBase
-            lo |= (ulong)(entry.TweakIdxStart & 0xFFFFFFF) << 19;
-            lo |= (ulong)(entry.KeyTableIdx & 0x3) << 47;
-            lo |= (ulong)(entry.CoffsetStart256K & 0x7FFF) << 49;
-            hi = (entry.CoffsetStart256K >> 15) & 0x1FF;
+            RequireFits(entry.TweakIdxStart, 28, nameof(entry.TweakIdxStart));
+            RequireFits(entry.KeyTableIdx, 2, nameof(entry.KeyTableIdx));
+            RequireFits(entry.CoffsetStart256K, 22, nameof(entry.CoffsetStart256K));
+            bits |= (UInt128)1 << 18;
+            bits |= (UInt128)entry.TweakIdxStart << 20;
+            bits |= (UInt128)entry.KeyTableIdx << 48;
+            bits |= (UInt128)entry.CoffsetStart256K << 50;
         }
 
         var buffer = new byte[CblockInfoStride];
-        for (int i = 0; i < 8; i++)
-            buffer[i] = (byte)(lo >> (8 * i));
-        buffer[8] = (byte)hi;
+        for (int i = 0; i < buffer.Length; i++)
+            buffer[i] = (byte)(bits >> (8 * i));
         return buffer;
+    }
+
+    private static void ValidateCounts(NapsLayoutCounts counts)
+    {
+        if (counts.NumFiles < 1 || counts.NumFiles > 0x800000 || counts.NumKeys < 1 || counts.NumKeys > 4 ||
+            counts.NumShufflePatterns is < 0 or > 15 || counts.NumUBlocks is < 0 or > 0x400000 ||
+            counts.NumOuterBlocks is < 0 or > 0xFFFFFF || counts.NumCblockInfo is < 2 or > 0x1000001)
+            throw new ArgumentOutOfRangeException(nameof(counts), "NAPS counts exceed the kernel G6 profile.");
+    }
+
+    private static void ValidateDocument(NapsLayoutDocument document)
+    {
+        if (document.FileOffsets.Count != 0 && document.FileOffsets[0].Continuation)
+            throw new InvalidDataException("The first NAPS file entry cannot be a continuation.");
+        ulong maximum = checked((ulong)document.Counts.UBlockCount << 18);
+        ulong previous = 0;
+        for (int i = 0; i < document.FileOffsets.Count; i++)
+        {
+            ulong current = document.FileOffsets[i].UncompressedOffsetStart;
+            if (current < previous || current > maximum)
+                throw new InvalidDataException($"NAPS file boundary {i} is invalid.");
+            previous = current;
+        }
+        for (int block = 0; block < document.Counts.UBlockCount; block++)
+        {
+            NapsU2cEntry group = document.CblockInfoOffsetByUblock[block >> 3];
+            uint index = block % 8 == 0 ? group.InfoOffset9BBase : checked(group.InfoOffset9BBase + group.DeltaFromBase[(block & 7) - 1]);
+            if (index >= document.CblockInfos.Count || document.CblockInfos[(int)index].IsRunBase)
+                throw new InvalidDataException($"NAPS ublock {block} has an invalid CblockInfo reference.");
+        }
+    }
+
+    private static long AlignUp(long value, int alignment) => checked((value + alignment - 1) / alignment * alignment);
+
+    private static void RequireFits(uint value, int bits, string name)
+    {
+        if (value >= (1u << bits)) throw new ArgumentOutOfRangeException(name);
     }
 
 }

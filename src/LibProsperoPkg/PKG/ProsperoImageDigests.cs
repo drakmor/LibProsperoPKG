@@ -83,6 +83,7 @@ using System;
 using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Security.Cryptography;
+using LibProsperoPkg.Util;
 
 namespace LibProsperoPkg.PKG;
 
@@ -162,10 +163,7 @@ public static class ProsperoImageDigests
     /// </summary>
     public static byte[] Sha3_256(ReadOnlySpan<byte> data)
     {
-        if (!SHA3_256.IsSupported)
-            throw new PlatformNotSupportedException(
-                "SHA3-256 is required for PS5 finalized-image digests but is not available on this platform/runtime.");
-        return SHA3_256.HashData(data);
+        return ProsperoSha3.HashData(data);
     }
 
     /// <summary>

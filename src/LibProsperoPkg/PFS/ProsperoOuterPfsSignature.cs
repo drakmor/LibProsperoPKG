@@ -20,6 +20,7 @@
 #nullable enable
 using System;
 using System.Security.Cryptography;
+using LibProsperoPkg.Util;
 
 namespace LibProsperoPkg.PFS;
 
@@ -56,10 +57,7 @@ public static class ProsperoOuterPfsSignature
     /// </summary>
     public static byte[] ComputeBlockHash(ReadOnlySpan<byte> plaintextBlock)
     {
-        if (!SHA3_256.IsSupported)
-            throw new PlatformNotSupportedException(
-                "SHA3-256 is required for the PS5 outer-PFS block hash but is not available on this platform/runtime.");
-        return SHA3_256.HashData(plaintextBlock);
+        return ProsperoSha3.HashData(plaintextBlock);
     }
 
     /// <summary>
@@ -85,14 +83,10 @@ public static class ProsperoOuterPfsSignature
         if (superblock.Length < SuperblockIcvCoverage)
             throw new ArgumentException(
                 $"Superblock must be at least 0x{SuperblockIcvCoverage:x} bytes to compute the ICV.", nameof(superblock));
-        if (!SHA3_256.IsSupported)
-            throw new PlatformNotSupportedException(
-                "SHA3-256 is required for the PS5 outer-PFS superblock ICV but is not available on this platform/runtime.");
-
         Span<byte> region = stackalloc byte[SuperblockIcvCoverage];
         superblock[..SuperblockIcvCoverage].CopyTo(region);
         region.Slice(SuperblockIcvOffset, HashLength).Clear();
-        return SHA3_256.HashData(region);
+        return ProsperoSha3.HashData(region);
     }
 
     /// <summary>

@@ -11,6 +11,7 @@
 using System;
 using System.Buffers.Binary;
 using System.Security.Cryptography;
+using LibProsperoPkg.Util;
 
 namespace LibProsperoPkg.PFS.Compression;
 
@@ -34,7 +35,7 @@ public static class PfsDigest
     /// <summary>
     /// Gets a value indicating whether the host runtime and operating system provide SHA3-256.
     /// </summary>
-    public static bool IsSupported => SHA3_256.IsSupported;
+    public static bool IsSupported => ProsperoSha3.IsSupported;
 
     /// <summary>
     /// Computes the SHA3-256 digest of a single PFS block's <b>uncompressed</b> bytes, matching the
@@ -45,8 +46,7 @@ public static class PfsDigest
     /// <exception cref="PlatformNotSupportedException">SHA3-256 is unavailable on this host.</exception>
     public static byte[] ComputeBlockDigest(ReadOnlySpan<byte> uncompressedBlock)
     {
-        EnsureSupported();
-        return SHA3_256.HashData(uncompressedBlock);
+        return ProsperoSha3.HashData(uncompressedBlock);
     }
 
     /// <summary>
@@ -58,8 +58,7 @@ public static class PfsDigest
     /// <exception cref="PlatformNotSupportedException">SHA3-256 is unavailable on this host.</exception>
     public static int ComputeBlockDigest(ReadOnlySpan<byte> data, Span<byte> destination)
     {
-        EnsureSupported();
-        return SHA3_256.HashData(data, destination);
+        return ProsperoSha3.HashData(data, destination);
     }
 
     /// <summary>
@@ -72,17 +71,14 @@ public static class PfsDigest
     {
         if (expected.Length != DigestLength)
             return false;
-        EnsureSupported();
         Span<byte> actual = stackalloc byte[DigestLength];
-        SHA3_256.HashData(uncompressedBlock, actual);
+        ProsperoSha3.HashData(uncompressedBlock, actual);
         return CryptographicOperations.FixedTimeEquals(actual, expected);
     }
 
     private static void EnsureSupported()
     {
-        if (!SHA3_256.IsSupported)
-            throw new PlatformNotSupportedException(
-                "SHA3-256 is required for the PS5 PFSv3 compression format but is not available on this host.");
+        _ = ProsperoSha3.IsSupported;
     }
 
     /// <summary>The length, in bytes, of the header parameter slice (<c>container[0x08..0x20]</c>) the file digest hashes.</summary>
@@ -128,7 +124,7 @@ public static class PfsDigest
         // header32[12..16] stays zero (alignment padding).
         headerParams[8..].CopyTo(header32[16..]);  // param10 (0x10) + uncompressedSize (0x18)
 
-        using IncrementalHash hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA3_256);
+        var hash = new ProsperoSha3.Incremental();
         hash.AppendData(header32);
         hash.AppendData(shuffleSection);
         hash.AppendData(boundarySection);
