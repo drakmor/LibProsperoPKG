@@ -30,6 +30,12 @@ public sealed class PfscEncoderOptions
     public CompressionLevel CompressionLevel { get; set; } = CompressionLevel.SmallestSize;
 
     /// <summary>
+    /// Numeric zlib level (-1 = library default, 0 = stored, 1 = fastest, 9 = smallest).
+    /// When set, this takes precedence over <see cref="CompressionLevel"/>.
+    /// </summary>
+    public int? ZlibLevel { get; set; }
+
+    /// <summary>
     /// Minimum per-block gain percent (0-100) required to keep a block compressed.
     /// A block whose gain is below this stays raw. Default 0 (keep any gain).
     /// </summary>
@@ -51,6 +57,8 @@ public sealed class PfscEncoderOptions
             throw new ArgumentOutOfRangeException(nameof(ThresholdGain), ThresholdGain, "Threshold gain must be between 0 and 100.");
         if (MinCompressSize < 0)
             throw new ArgumentOutOfRangeException(nameof(MinCompressSize), MinCompressSize, "Minimum compress size must be non-negative.");
+        if (ZlibLevel is < -1 or > 9)
+            throw new ArgumentOutOfRangeException(nameof(ZlibLevel), ZlibLevel, "Zlib level must be in the range -1..9.");
     }
 }
 
@@ -94,11 +102,13 @@ public static class PfscEncoder
     public static long HeaderSize(long blockCount, int blockSize)
     {
         if (blockCount < 0) throw new ArgumentOutOfRangeException(nameof(blockCount));
-        long pointerTable = (blockCount + 1) * (long)OffsetEntrySize;
+        if (blockSize <= 0 || (blockSize & (blockSize - 1)) != 0)
+            throw new ArgumentOutOfRangeException(nameof(blockSize), "PFSC block size must be a positive power of two.");
+        long pointerTable = checked((blockCount + 1) * OffsetEntrySize);
         long capacity = InitialDataOffset - BlockOffsetsOffset;
         long extra = Math.Max(0, pointerTable - capacity);
         long extraBlocks = extra > 0 ? (extra + blockSize - 1) / blockSize : 0;
-        return InitialDataOffset + extraBlocks * (long)blockSize;
+        return checked(InitialDataOffset + extraBlocks * blockSize);
     }
 
     /// <summary>
@@ -133,8 +143,20 @@ public static class PfscEncoder
         if (length < 0) throw new ArgumentOutOfRangeException(nameof(length));
         options ??= new PfscEncoderOptions();
         options.Validate();
+        if (!input.CanRead)
+            throw new ArgumentException("Input stream must be readable.", nameof(input));
+        if (!input.CanSeek)
+            throw new ArgumentException(
+                "Input stream must be seekable so a non-beneficial PFSC encode can fall back to raw data.",
+                nameof(input));
+        if (!output.CanWrite)
+            throw new ArgumentException("Output stream must be writable.", nameof(output));
         if (!output.CanSeek)
             throw new ArgumentException("Output stream must be seekable.", nameof(output));
+
+        long inputStart = input.Position;
+        if (length > input.Length - inputStart)
+            throw new EndOfStreamException("The requested PFSC input length exceeds the remaining stream data.");
 
         int blockSize = options.BlockSize;
 
@@ -152,53 +174,61 @@ public static class PfscEncoder
             };
         }
 
-        long blockCount = (length + blockSize - 1) / blockSize;
+        long blockCount = checked((length + blockSize - 1) / blockSize);
         long headerSize = HeaderSize(blockCount, blockSize);
         long outStart = output.Position;
 
-        var offsets = new long[blockCount + 1];
+        if (blockCount >= int.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(length), "PFSC block count exceeds the supported table size.");
+        var offsets = new long[checked((int)blockCount + 1)];
         offsets[0] = headerSize;
 
         // Reserve header space and stream blocks after it.
         output.Position = outStart + headerSize;
 
         var blockBuf = new byte[blockSize];
+        using var compressedBuffer = new MemoryStream(blockSize);
         long compressedBlocks = 0;
         long produced = 0;
         for (long bi = 0; bi < blockCount; bi++)
         {
-            int filled = ReadUpTo(input, blockBuf, 0, blockSize);
+            int expected = checked((int)Math.Min(blockSize, length - produced));
+            int filled = ReadUpTo(input, blockBuf, 0, expected);
+            if (filled != expected)
+                throw new EndOfStreamException("Unexpected end of input while encoding a PFSC block.");
             // Zero the padding tail so the logical block is deterministic.
             if (filled < blockSize)
                 Array.Clear(blockBuf, filled, blockSize - filled);
 
-            byte[] compressed = Deflate(blockBuf, blockSize, options.CompressionLevel);
-            double gain = (blockSize - compressed.Length) / (double)blockSize * 100.0;
-            bool storeCompressed = compressed.Length < blockSize && gain >= options.ThresholdGain;
+            int compressedLength = Deflate(
+                blockBuf, blockSize, options.CompressionLevel, options.ZlibLevel, compressedBuffer);
+            int requiredSavings = checked((blockSize * options.ThresholdGain + 99) / 100);
+            bool storeCompressed = compressedLength < blockSize
+                && compressedLength <= blockSize - requiredSavings;
 
             if (storeCompressed)
             {
-                output.Write(compressed, 0, compressed.Length);
-                offsets[bi + 1] = offsets[bi] + compressed.Length;
+                output.Write(compressedBuffer.GetBuffer(), 0, compressedLength);
+                offsets[checked((int)bi + 1)] = offsets[checked((int)bi)] + compressedLength;
                 compressedBlocks++;
             }
             else
             {
                 output.Write(blockBuf, 0, blockSize);
-                offsets[bi + 1] = offsets[bi] + blockSize;
+                offsets[checked((int)bi + 1)] = offsets[checked((int)bi)] + blockSize;
             }
             produced += filled;
             progress?.Invoke(produced);
         }
 
-        long encodedSize = offsets[blockCount];
+        long encodedSize = offsets[checked((int)blockCount)];
 
         // If nothing compressed, or the wrapper is not smaller, fall back to raw.
         if (compressedBlocks == 0 || encodedSize >= length)
         {
             output.Position = outStart;
             output.SetLength(outStart);
-            input.Position = 0; // caller-provided substreams start at 0
+            input.Position = inputStart;
             CopyExact(input, output, length);
             return new PfscEncodeStats
             {
@@ -246,12 +276,20 @@ public static class PfscEncoder
     // Produces a zlib stream (2-byte header + raw DEFLATE + adler32), matching
     // Python's zlib.compress. PFSCReader skips the 2-byte header and inflates the
     // remainder with a raw DeflateStream, ignoring the trailing checksum.
-    private static byte[] Deflate(byte[] data, int count, CompressionLevel level)
+    private static int Deflate(
+        byte[] data,
+        int count,
+        CompressionLevel level,
+        int? zlibLevel,
+        MemoryStream destination)
     {
-        using var ms = new MemoryStream(count);
-        using (var zs = new ZLibStream(ms, level, leaveOpen: true))
+        destination.Position = 0;
+        destination.SetLength(0);
+        using (var zs = zlibLevel.HasValue
+            ? new ZLibStream(destination, new ZLibCompressionOptions { CompressionLevel = zlibLevel.Value }, leaveOpen: true)
+            : new ZLibStream(destination, level, leaveOpen: true))
             zs.Write(data, 0, count);
-        return ms.ToArray();
+        return checked((int)destination.Length);
     }
 
     private static int ReadUpTo(Stream s, byte[] buffer, int offset, int count)

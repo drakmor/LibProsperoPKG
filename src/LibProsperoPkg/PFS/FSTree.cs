@@ -140,13 +140,25 @@ public class FSDir : FSNode
 public class FSFile : FSNode
 {
     /// <summary>
+    /// Lower values are placed earlier when read-optimized physical file ordering is enabled.
+    /// The default preserves the existing traversal order.
+    /// </summary>
+    public int LayoutPriority;
+
+    /// <summary>
     /// Creates an FSFile from a real on-disk file.
     /// You need to set the name, inode, and parent.
     /// </summary>
     /// <param name="origFileName">Real path to the file.</param>
     public FSFile(string origFileName)
     {
-        Write = s => { using (var f = File.OpenRead(origFileName)) f.CopyTo(s); };
+        Write = destination =>
+        {
+            using var source = new FileStream(
+                origFileName, FileMode.Open, FileAccess.Read, FileShare.Read,
+                bufferSize: 1 << 20, FileOptions.SequentialScan);
+            source.CopyTo(destination, 1 << 20);
+        };
         Size = new FileInfo(origFileName).Length;
         _compressedSize = Size;
     }
@@ -215,4 +227,10 @@ public class FSFile : FSNode
     /// Flag for PFSC encoded files
     /// </summary>
     public bool Compress = false;
+
+    /// <summary>
+    /// True for the ppr_pfs PFSC v2 profile, whose inode Size remains the logical size while
+    /// Blocks describes the smaller stored container extent.
+    /// </summary>
+    public bool PprKrakenCompression = false;
 }

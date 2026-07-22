@@ -86,9 +86,9 @@ public static class Crypto
     private static byte[] RsaRawModExp(byte[] value, byte[] modulus, byte[] exponent)
     {
         // Append a trailing 0x00 (high byte in little-endian) to force a positive BigInteger.
-        var message = new BigInteger(value.Reverse().Concat(new byte[] { 0 }).ToArray());
-        var mod = new BigInteger(modulus.Reverse().Concat(new byte[] { 0 }).ToArray());
-        var exp = new BigInteger(exponent.Reverse().Concat(new byte[] { 0 }).ToArray());
+        var message = new BigInteger(value.AsEnumerable().Reverse().Concat(new byte[] { 0 }).ToArray());
+        var mod = new BigInteger(modulus.AsEnumerable().Reverse().Concat(new byte[] { 0 }).ToArray());
+        var exp = new BigInteger(exponent.AsEnumerable().Reverse().Concat(new byte[] { 0 }).ToArray());
         var leResult = BigInteger.ModPow(message, exp, mod).ToByteArray().Take(256).ToArray();
         return leResult
           .Concat(Enumerable.Range(0, 256 - leResult.Length).Select(_ => (byte)0))
@@ -217,8 +217,8 @@ public static class Crypto
     /// <returns></returns>
     public static byte[] RSA2048Encrypt(byte[] value, byte[] mod, int exp = 65537)
     {
-        var message = new BigInteger(value.Reverse().ToArray());
-        var modulus = new BigInteger(mod.Reverse().Concat(new byte[] { 0 }).ToArray());
+        var message = new BigInteger(value.AsEnumerable().Reverse().ToArray());
+        var modulus = new BigInteger(mod.AsEnumerable().Reverse().Concat(new byte[] { 0 }).ToArray());
         var exponent = new BigInteger(exp);
         var leResult = BigInteger.ModPow(message, exponent, modulus).ToByteArray().Take(256);
         return leResult
@@ -371,7 +371,7 @@ public static class Crypto
 
         Func<byte[], byte[]> h = useSha3 ? Sha3_256 : Sha256;
         byte[] data = new byte[96];
-        Buffer.BlockCopy(h(BitConverter.GetBytes(Index).Reverse().ToArray()), 0, data, 0, 32);
+        Buffer.BlockCopy(h(BitConverter.GetBytes(Index).AsEnumerable().Reverse().ToArray()), 0, data, 0, 32);
         Buffer.BlockCopy(h(Encoding.ASCII.GetBytes(ContentId.PadRight(48, '\0'))), 0, data, 32, 32);
         Buffer.BlockCopy(Encoding.ASCII.GetBytes(Passcode), 0, data, 64, 32);
 

@@ -175,8 +175,10 @@ public class PfsReader
         var maxPerSector = hdr.BlockSize / dinodeSize;
         sectorBuf = new byte[hdr.BlockSize];
         sectorStream = new MemoryStream(sectorBuf);
-        // skip over indirect blocks, block signatures are never checked anyway
-        var dinodeStartPos = hdr.BlockSize + (hdr.BlockSize * hdr.InodeBlockSig.IndirectBlocks.Where(b => b > 0).Count());
+        // The inode table is described by the superblock's signed inode descriptor. Publisher PPR-PFS
+        // images commonly place a signature/metadata block at block 1 and the inode table at block 2,
+        // so deriving this as "one block after the superblock" reads the wrong bytes.
+        var dinodeStartPos = (long)hdr.InodeBlockSig.StartBlock * hdr.BlockSize;
         for (var i = 0; i < hdr.DinodeBlockCount; i++)
         {
             var position = dinodeStartPos + (hdr.BlockSize * i);
@@ -188,8 +190,15 @@ public class PfsReader
         root = LoadDir(0, null, "");
         uroot = root.Get("uroot") as Dir;
         if (uroot == null)
-            throw new Exception("Invalid PFS image (no uroot)");
-        uroot.name = "uroot";
+        {
+            // Publisher PPR-PFS images use inode 0 as the user root directly and omit the classic
+            // super-root / flat_path_table wrapper.
+            uroot = root;
+        }
+        else
+        {
+            uroot.name = "uroot";
+        }
     }
 
     public PfsHeader Header => hdr;
@@ -267,46 +276,50 @@ public class PfsReader
         {
             if (!hdr.Mode.HasFlag(PfsMode.Signed))
             {
-                throw new Exception("Unsigned PFS images probably shouldn't have noncontiguous blocks");
-            }
-            blocks = new int[dinodes[dinode].Blocks];
-            var remainingBlocks = (long)dinodes[dinode].Blocks;
-            var sigsPerBlock = hdr.BlockSize / 36;
-            for (int i = 0; i < 12 && i < remainingBlocks; i++)
-            {
-                blocks[i] = dinodes[dinode].DirectBlocks[i];
-            }
-
-            var bufferedReader = new BufferedMemoryReader(reader, 0x10000);
-            remainingBlocks -= 12;
-            long blockIndexOffset = 12;
-            for (int i = 0; i < remainingBlocks && i < sigsPerBlock; i++)
-            {
-                bufferedReader.Read(dinodes[dinode].IndirectBlocks[0] * hdr.BlockSize + (i * 36) + 32, out blocks[i + blockIndexOffset]);
-            }
-            remainingBlocks -= sigsPerBlock;
-            blockIndexOffset += sigsPerBlock;
-            for (int j = 0; j * sigsPerBlock < remainingBlocks; j++)
-            {
-                bufferedReader.Read(dinodes[dinode].IndirectBlocks[1] * hdr.BlockSize + (j * 36) + 32, out int indirectBlockOffset);
-                for (int i = 0; i < sigsPerBlock && i + (j * sigsPerBlock) < remainingBlocks; i++)
-                {
-                    bufferedReader.Read(indirectBlockOffset * hdr.BlockSize + (i * 36) + 32, out blocks[i + blockIndexOffset]);
-                }
-                blockIndexOffset += sigsPerBlock;
-            }
-            bool contiguous = true;
-            int last = blocks[0] - 1;
-            for (int i = 1; i < blocks.Length; i++)
-            {
-                if (blocks[i - 1] + 1 != blocks[i])
-                {
-                    contiguous = false;
-                    break;
-                }
-            }
-            if (contiguous)
+                // Publisher unsigned PPR-PFS images fill more than one direct pointer even though the
+                // file extent itself is contiguous. StartBlock + Blocks is sufficient in this profile.
                 blocks = null;
+            }
+            else
+            {
+                blocks = new int[dinodes[dinode].Blocks];
+                var remainingBlocks = (long)dinodes[dinode].Blocks;
+                var sigsPerBlock = hdr.BlockSize / 36;
+                for (int i = 0; i < 12 && i < remainingBlocks; i++)
+                {
+                    blocks[i] = dinodes[dinode].DirectBlocks[i];
+                }
+
+                var bufferedReader = new BufferedMemoryReader(reader, 0x10000);
+                remainingBlocks -= 12;
+                long blockIndexOffset = 12;
+                for (int i = 0; i < remainingBlocks && i < sigsPerBlock; i++)
+                {
+                    bufferedReader.Read(dinodes[dinode].IndirectBlocks[0] * hdr.BlockSize + (i * 36) + 32, out blocks[i + blockIndexOffset]);
+                }
+                remainingBlocks -= sigsPerBlock;
+                blockIndexOffset += sigsPerBlock;
+                for (int j = 0; j * sigsPerBlock < remainingBlocks; j++)
+                {
+                    bufferedReader.Read(dinodes[dinode].IndirectBlocks[1] * hdr.BlockSize + (j * 36) + 32, out int indirectBlockOffset);
+                    for (int i = 0; i < sigsPerBlock && i + (j * sigsPerBlock) < remainingBlocks; i++)
+                    {
+                        bufferedReader.Read(indirectBlockOffset * hdr.BlockSize + (i * 36) + 32, out blocks[i + blockIndexOffset]);
+                    }
+                    blockIndexOffset += sigsPerBlock;
+                }
+                bool contiguous = true;
+                for (int i = 1; i < blocks.Length; i++)
+                {
+                    if (blocks[i - 1] + 1 != blocks[i])
+                    {
+                        contiguous = false;
+                        break;
+                    }
+                }
+                if (contiguous)
+                    blocks = null;
+            }
         }
         return new File(reader)
         {

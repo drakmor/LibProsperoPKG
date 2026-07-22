@@ -4,7 +4,7 @@ A .NET class library for building **PS5** packages. It turns a prepared
 application folder into a complete, signed PS5 package in-process, with no external
 command-line tool to install.
 
-The library is written in **C# 14** and targets **.NET 10**. It is self-contained and
+The library is written in **C# 13** and targets **.NET 9**. It is self-contained and
 exposes a small, documented public API so any .NET developer can consume it from their own
 application.
 
@@ -26,8 +26,8 @@ application.
 
 | | |
 |---|---|
-| Toolchain | .NET 10 SDK or newer |
-| Language | C# 14 |
+| Toolchain | .NET 9 SDK or newer |
+| Language | C# 13 |
 | Dependency | `Magick.NET-Q8-AnyCPU` |
 
 ---
@@ -40,6 +40,53 @@ dotnet build -c Release
 ```
 
 This produces `LibProsperoPkg.dll`.
+
+### Building standalone PFS images
+
+The bundled tool can select the filesystem layout independently from per-file compression:
+
+```powershell
+# Publisher direct-root PPR-PFS with PFSC v2 Kraken files (reference-style default)
+.\scripts\build-kraken-pfs.ps1 C:\app C:\out\app.pfs -Compression kraken -Level 8
+
+# Classic LibProsperoPKG super-root/FPT structure with classic PFSC/zlib files
+.\scripts\build-kraken-pfs.ps1 C:\app C:\out\app-classic.pfs -Classic -Compression zlib -Level 9
+
+# Classic structure with PPR-PFS Kraken files (must be read through ppr_pfs)
+.\scripts\build-kraken-pfs.ps1 C:\app C:\out\app-classic-kraken.pfs -Classic -Compression kraken -Level 8
+
+# ShadowMount PHUC: publisher direct-root outer PFS plus one Kraken-compressed pfs_image.dat
+.\scripts\build-phuc.ps1 C:\app C:\out\app.phuc
+
+# The same outer PHUC, using an already built inner PFS without rebuilding the game folder
+.\scripts\build-phuc.ps1 C:\images\pfs_image.dat C:\out\app.phuc
+
+# Smallest image (the former all-Kraken policy), or lowest decode latency
+.\scripts\build-phuc.ps1 C:\app C:\out\compact.phuc -ReadProfile compact
+.\scripts\build-phuc.ps1 C:\app C:\out\raw.phuc -ReadProfile raw
+```
+
+Compression can be `none`, `zlib`, or `kraken`. Kraken levels are `-4..9`; zlib levels are
+`0..9`. `-Exclude 'sce_sys/**','movies/*.mp4'` keeps matching files in the image but stores
+them raw. Direct-root `ppr + zlib` is rejected because it requires a separate PFSC v2 zlib
+writer; use the classic layout for zlib.
+
+The dedicated PHUC command accepts either a prepared game folder or an existing `pfs_image.dat`.
+For an existing image it validates PFS v2, block geometry, encryption state, and the inner
+`sce_sys/param.json`/`param.sfo`, then reuses it without rebuilding the game tree. It emits the
+reference direct-root geometry (inode bitmap in block 1, inode table in block 2, no super-root/FPT),
+places only the PFSC v2/Kraken `pfs_image.dat` in the direct-root outer PFS, and validates the finished image.
+Large files receive the same single- and double-indirect 32-bit block maps as publisher images;
+these maps are emitted after the contiguous data extent and checked entry by entry.
+PFSC keeps 128 KiB table entries, but full Kraken groups are encoded as one 256 KiB seeded/seedless
+pair (`C000 -> 4000 -> C000`), matching the requests issued by `ppr_pfs` to the I/O controller.
+The default `fast` read profile physically groups startup and small files in the inner image, leaves
+its metadata, `eboot.bin`, `sce_module/**`, `sce_sys/**`, and files up to 1 MiB in raw 256 KiB PFSC
+groups, and Kraken-compresses a remaining group only when it saves at least 12%. Use `compact` for
+the previous all-eligible-Kraken policy or `raw` to retain the PFSC v2 wrapper while storing every
+group without Kraken decoding. `-RawSmall`, `-RawInner`, `-RawMetadata`, and
+`-MinimumSavingsPercent` override the profile. A ready `pfs_image.dat` can be analyzed for raw ranges,
+but its existing physical file order cannot be changed without rebuilding it from a folder.
 
 ---
 

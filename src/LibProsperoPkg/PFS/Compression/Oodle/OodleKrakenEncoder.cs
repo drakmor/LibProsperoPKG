@@ -113,6 +113,24 @@ internal static class OodleKrakenEncoder
     private const int MaxArrayLength = 0x3FFFF; // DecodeBytes raw 3-byte size limit
     private const int MaxFirstChunkComp = 0x1FFFF; // size hint is 17-bit; first chunk must fit
     private const int MaxChainWalk = 128;
+    [ThreadStatic] private static int ActiveCompressionLevel;
+    [ThreadStatic] private static bool HasActiveCompressionLevel;
+
+    // Fast negative levels deliberately inspect fewer hash-chain candidates. Levels 4..9 use
+    // the full managed matcher. This makes the public level an actual speed/ratio control rather
+    // than merely a byte copied into the PFSC header.
+    private static int ChainWalkLimit => !HasActiveCompressionLevel ? MaxChainWalk : ActiveCompressionLevel switch
+    {
+        <= -4 => 4,
+        -3 => 8,
+        -2 => 16,
+        -1 => 32,
+        0 => 48,
+        1 => 64,
+        2 => 80,
+        3 => 96,
+        _ => MaxChainWalk,
+    };
     private const int HashBits = 17;
     private const int HashSize = 1 << HashBits;
     private const byte CtrlExcessMode = 0x80;   // post-seed control byte:0x80 | low6(excessCount), plus a continuation byte when excessCount > 0x1F
@@ -142,6 +160,30 @@ internal static class OodleKrakenEncoder
     /// size.
     /// </summary>
     public static EncodedBlock? EncodeBlock(ReadOnlySpan<byte> data) => EncodeBlock(data, useHuffmanArrays: false);
+
+    /// <summary>
+    /// Compresses a block using a Kraken level in the supported -4..9 range. Negative fast
+    /// levels reduce match-search effort and skip Huffman arrays; non-negative levels retain
+    /// entropy coding when requested.
+    /// </summary>
+    public static EncodedBlock? EncodeBlock(ReadOnlySpan<byte> data, bool useHuffmanArrays, int compressionLevel)
+    {
+        if (compressionLevel is < -4 or > 9)
+            throw new ArgumentOutOfRangeException(nameof(compressionLevel));
+        int savedLevel = ActiveCompressionLevel;
+        bool savedHasLevel = HasActiveCompressionLevel;
+        ActiveCompressionLevel = compressionLevel;
+        HasActiveCompressionLevel = true;
+        try
+        {
+            return EncodeBlock(data, useHuffmanArrays && compressionLevel >= 0);
+        }
+        finally
+        {
+            ActiveCompressionLevel = savedLevel;
+            HasActiveCompressionLevel = savedHasLevel;
+        }
+    }
 
     /// <summary>
     /// Compresses <paramref name="data"/> (one PFS block) into a section-7 payload of one or two
@@ -721,7 +763,7 @@ internal static class OodleKrakenEncoder
         uint h = Hash(data, pos);
         int cand = head[h];
         int walk = 0;
-        while (cand >= 0 && walk < MaxChainWalk)
+        while (cand >= 0 && walk < ChainWalkLimit)
         {
             int dist = pos - cand;
             if (dist >= MinDistance)
@@ -2462,7 +2504,7 @@ internal static class OodleKrakenEncoder
             uint h = Hash(data, pos);
             int cand = dpHead[h];
             int walk = 0;
-            while (cand >= 0 && walk < MaxChainWalk)
+            while (cand >= 0 && walk < ChainWalkLimit)
             {
                 int dist = pos - cand;
                 if (dist >= MinDistance)

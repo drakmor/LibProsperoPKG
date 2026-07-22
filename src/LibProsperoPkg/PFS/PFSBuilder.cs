@@ -106,7 +106,7 @@ public class PfsBuilder
     /// <returns>PFS Image size</returns>
     public long CalculatePfsSize()
     {
-        return hdr.Ndblock * hdr.BlockSize;
+        return checked(hdr.Ndblock * hdr.BlockSize);
     }
 
     /// <summary>
@@ -119,6 +119,27 @@ public class PfsBuilder
     /// <returns>A snapshot of the built image's super-root tree and superblock geometry.</returns>
     public ProsperoPfsImageTreeInfo CaptureImageTree()
     {
+        if (properties.DirectRootLayout)
+        {
+            var directRoot = ImageNodeFromDir(properties.root);
+            return new ProsperoPfsImageTreeInfo
+            {
+                BlockSize = (int)hdr.BlockSize,
+                ImageBlocks = hdr.Ndblock,
+                InodeCount = inodes.Count,
+                DinodeBlockCount = (int)hdr.DinodeBlockCount,
+                RootInodeNumber = properties.root.ino.Number,
+                DinodeBlock = hdr.InodeBlockSig.StartBlock,
+                DinodeSize = hdr.InodeBlockSig.Size,
+                DinodeFlags = (uint)hdr.InodeBlockSig.Flags,
+                Seed = hdr.Seed,
+                SuperblockIcv = SuperblockIcv,
+                Signed = false,
+                Encrypted = false,
+                Root = directRoot,
+            };
+        }
+
         var root = ImageNodeFromInode(super_root_ino, name: "", isDir: true, isInternal: false);
 
         // The PFS super-root holds the flat path table (+ optional collision resolver) and the user
@@ -223,6 +244,8 @@ public class PfsBuilder
         allDirs = properties.root.GetAllChildrenDirs();
         allFiles = properties.root.GetAllChildrenFiles().Where((f) =>
         {
+            if (!properties.FilterOuterPackageEntries)
+                return true;
             bool is_sce_sys = false;
             var name = f.name;
             var parent = f.Parent;
@@ -238,16 +261,30 @@ public class PfsBuilder
             }
             return !is_sce_sys || !PKG.EntryNames.NameToId.ContainsKey(name);
         }).ToList();
+        if (properties.OptimizeFileLayoutForReadSpeed)
+        {
+            // Put startup-sensitive and small random-access files into adjacent early extents.
+            // Besides reducing seeks, this lets the outer PFSC planner cover them with fewer raw
+            // 256 KiB groups while leaving large sequential assets available for Kraken.
+            allFiles = allFiles
+                .OrderBy(static file => file.LayoutPriority)
+                .ThenBy(static file => file.FullPath(), StringComparer.Ordinal)
+                .ToList();
+        }
         allNodes = new List<FSNode>(allDirs.OrderBy(d => d.FullPath()).ToList());
         allNodes.AddRange(allFiles);
 
-        SetupRootStructure(FlatPathTable.HasCollision(allNodes));
+        if (properties.DirectRootLayout)
+            SetupDirectRootStructure();
+        else
+            SetupRootStructure(FlatPathTable.HasCollision(allNodes));
 
         Log($"Creating inodes ({allDirs.Count} dirs and {allFiles.Count} files)...");
         addDirInodes();
         addFileInodes();
 
-        (fpt, colResolver) = FlatPathTable.Create(allNodes);
+        if (!properties.DirectRootLayout)
+            (fpt, colResolver) = FlatPathTable.Create(allNodes);
 
         Log("Calculating data block layout...");
         allNodes.Insert(0, properties.root);
@@ -258,19 +295,19 @@ public class PfsBuilder
     {
         Log("Writing data...");
         hdr.WriteToStream(stream);
+        if (properties.DirectRootLayout)
+            WriteDirectRootInodeBitmap(stream);
         WriteInodes(stream);
-        WriteSuperrootDirents(stream);
-
-        allNodes.Insert(0, new FSFile(s => fpt.WriteToStream(s), "flat_path_table", fpt.Size)
+        if (!properties.DirectRootLayout)
         {
-            ino = fpt_ino
-        });
-        if (colResolver != null)
-        {
-            allNodes.Insert(1, new FSFile(s => colResolver.WriteToStream(s), "collision_resolver", colResolver.Size)
+            WriteSuperrootDirents(stream);
+            stream.Position = checked((long)fpt_ino.StartBlock * hdr.BlockSize);
+            fpt.WriteToStream(stream);
+            if (colResolver != null)
             {
-                ino = cr_ino
-            });
+                stream.Position = checked((long)cr_ino.StartBlock * hdr.BlockSize);
+                colResolver.WriteToStream(stream);
+            }
         }
 
         for (var x = 0; x < allNodes.Count; x++)
@@ -279,6 +316,8 @@ public class PfsBuilder
             stream.Position = f.ino.StartBlock * hdr.BlockSize;
             WriteFSNode(stream, f);
         }
+        if (properties.DirectRootLayout)
+            WriteDirectRootIndirectBlocks(stream);
     }
 
     /// <summary>
@@ -327,19 +366,22 @@ public class PfsBuilder
                       var position = sig.Block * sig_buffer.Length;
                       view.ReadArray(position, sig_buffer, 0, sig_buffer.Length);
                       position = sig.SigOffset;
-                      view.WriteArray(position, Crypto.HmacSha256(signKey, sig_buffer), 0, 32);
+                      byte[] digest = hmac.ComputeHash(sig_buffer);
+                      view.WriteArray(position, digest, 0, digest.Length);
                       view.Write(position + 32, (int)sig.Block);
                       return local;
                   },
                   local => local.Item2.Dispose());
                 // The indirect blocks must be done after, since they rely on data block signatures
+                using var finalHmac = new HMACSHA256(signKey);
                 foreach (var sig in final_sigs)
                 {
                     var sig_buffer = new byte[sig.Size];
                     var position = sig.Block * properties.BlockSize;
                     view.ReadArray(position, sig_buffer, 0, sig_buffer.Length);
                     position = sig.SigOffset;
-                    view.WriteArray(position, Crypto.HmacSha256(signKey, sig_buffer), 0, 32);
+                    byte[] digest = finalHmac.ComputeHash(sig_buffer);
+                    view.WriteArray(position, digest, 0, digest.Length);
                     view.Write(position + 32, (int)sig.Block);
                 }
             }
@@ -380,13 +422,14 @@ public class PfsBuilder
         {
             Log("Signing...");
             var signKey = Crypto.PfsGenSignKey(properties.EKPFS, hdr.Seed);
+            using var hmac = new HMACSHA256(signKey);
             foreach (var sig in data_sigs.Concat(final_sigs))
             {
                 var sig_buffer = new byte[sig.Size];
                 stream.Position = sig.Block * properties.BlockSize;
                 stream.ReadExactly(sig_buffer, 0, sig.Size);
                 stream.Position = sig.SigOffset;
-                byte[] mac = Crypto.HmacSha256(signKey, sig_buffer);
+                byte[] mac = hmac.ComputeHash(sig_buffer);
                 stream.Write(mac, 0, 32);
                 stream.WriteLE((int)sig.Block);
                 // The superblock self-signature (block 0 @ 0x380) is this image's integrity value,
@@ -445,11 +488,11 @@ public class PfsBuilder
         foreach (var dir in allDirs.OrderBy(x => x.FullPath()))
         {
             var ino = MakeInode(
-              Mode: InodeMode.dir | Inode.RXOnly,
+              Mode: InodeMode.dir | (properties.DirectRootLayout ? (InodeMode)0x1ED : Inode.RXOnly),
               Number: (uint)inodes.Count,
               Blocks: 1,
               Size: 65536,
-              Flags: InodeFlags.@readonly,
+              Flags: properties.DirectRootLayout ? 0 : InodeFlags.@readonly,
               Nlink: 2 // 1 link each for its own dirent and its . dirent
             );
             dir.ino = ino;
@@ -471,12 +514,13 @@ public class PfsBuilder
         foreach (var file in allFiles.OrderBy(x => x.FullPath()))
         {
             var ino = MakeInode(
-              Mode: InodeMode.file | Inode.RXOnly,
-              Size: file.Size,
+              Mode: InodeMode.file | (properties.DirectRootLayout ? (InodeMode)0x1A4 : Inode.RXOnly),
+              Size: file.PprKrakenCompression ? file.CompressedSize : file.Size,
               SizeCompressed: file.CompressedSize,
               Number: (uint)inodes.Count,
-              Blocks: (uint)CeilDiv(file.Size, hdr.BlockSize),
-              Flags: InodeFlags.@readonly | (file.Compress ? InodeFlags.compressed : 0)
+              Blocks: checked((uint)CeilDiv(file.Size, hdr.BlockSize)),
+              Flags: (properties.DirectRootLayout ? 0 : InodeFlags.@readonly)
+                  | (file.Compress ? InodeFlags.compressed : 0)
             );
             if (properties.Sign) // HACK: Outer PFS images don't use readonly?
             {
@@ -519,6 +563,61 @@ public class PfsBuilder
     /// </summary>
     void CalculateDataBlockLayout()
     {
+        if (properties.DirectRootLayout)
+        {
+            if (properties.Sign || properties.Encrypt)
+                throw new NotSupportedException("The publisher direct-root layout currently supports plaintext unsigned images only.");
+
+            var inodesPerBlock = hdr.BlockSize / DinodeD32.SizeOf;
+            hdr.DinodeCount = inodes.Count;
+            hdr.DinodeBlockCount = CeilDiv(inodes.Count, inodesPerBlock);
+            hdr.InodeBlockSig.Blocks = checked((uint)hdr.DinodeBlockCount);
+            hdr.InodeBlockSig.Size = hdr.DinodeBlockCount * hdr.BlockSize;
+            hdr.InodeBlockSig.SizeCompressed = hdr.InodeBlockSig.Size;
+            hdr.InodeBlockSig.SetTime(properties.FileTime);
+
+            // Publisher PPR-PFS reserves block 1 for metadata and starts its inode table at block 2.
+            hdr.InodeBlockSig.SetDirectBlock(0, 2);
+            for (int i = 1; i < hdr.DinodeBlockCount && i < 12; i++)
+                hdr.InodeBlockSig.SetDirectBlock(i, 2 + i);
+            hdr.Ndblock = 2 + hdr.DinodeBlockCount;
+
+            foreach (var node in allNodes)
+            {
+                long blocks = CeilDiv(node.Size, hdr.BlockSize);
+                node.ino.SetDirectBlock(0, (int)hdr.Ndblock);
+                for (int i = 1; i < blocks && i < 12; i++)
+                    node.ino.SetDirectBlock(i, checked((int)hdr.Ndblock + i));
+                node.ino.Blocks = checked((uint)blocks);
+                node.ino.Size = node is FSDir
+                    ? node.Size
+                    : node is FSFile { PprKrakenCompression: true } pprFile ? pprFile.CompressedSize : node.Size;
+                if (node is FSDir)
+                    node.ino.SizeCompressed = node.Size;
+                else if (node.ino.SizeCompressed == 0)
+                    node.ino.SizeCompressed = node.ino.Size;
+                hdr.Ndblock += blocks;
+
+                // Publisher unsigned PPR-PFS uses ordinary 32-bit PFS block maps. Data is
+                // contiguous, but the kernel still expects ib[0]/ib[1] and their pointer blocks
+                // once the extent no longer fits in the twelve direct inode entries.
+                long pointersPerBlock = hdr.BlockSize / sizeof(int);
+                if (blocks > 12)
+                {
+                    node.ino.IndirectBlocks[0] = checked((int)hdr.Ndblock++);
+                    long doublyIndirectBlocks = blocks - 12 - pointersPerBlock;
+                    if (doublyIndirectBlocks > 0)
+                    {
+                        node.ino.IndirectBlocks[1] = checked((int)hdr.Ndblock++);
+                        hdr.Ndblock += CeilDiv(doublyIndirectBlocks, pointersPerBlock);
+                    }
+                }
+            }
+
+            hdr.Ndblock = Math.Max(hdr.Ndblock, properties.MinBlocks);
+            return;
+        }
+
         // TODO: Consolidate of all this duplicate code
         if (properties.Sign)
         {
@@ -527,7 +626,7 @@ public class PfsBuilder
             var inodesPerBlock = hdr.BlockSize / DinodeS32.SizeOf;
             hdr.DinodeCount = inodes.Count;
             hdr.DinodeBlockCount = CeilDiv(inodes.Count, inodesPerBlock);
-            hdr.InodeBlockSig.Blocks = (uint)hdr.DinodeBlockCount;
+            hdr.InodeBlockSig.Blocks = checked((uint)hdr.DinodeBlockCount);
             hdr.InodeBlockSig.Size = hdr.DinodeBlockCount * hdr.BlockSize;
             hdr.InodeBlockSig.SizeCompressed = hdr.DinodeBlockCount * hdr.BlockSize;
             hdr.InodeBlockSig.SetTime(properties.FileTime);
@@ -546,7 +645,7 @@ public class PfsBuilder
             fpt_ino.SetDirectBlock(0, super_root_ino.StartBlock + 1);
             fpt_ino.Size = fpt.Size;
             fpt_ino.SizeCompressed = fpt.Size;
-            fpt_ino.Blocks = (uint)CeilDiv(fpt.Size, hdr.BlockSize);
+            fpt_ino.Blocks = checked((uint)CeilDiv(fpt.Size, hdr.BlockSize));
             final_sigs.Push(new BlockSigInfo(fpt_ino.StartBlock, inoNumberToOffset(fpt_ino.Number)));
 
             for (int i = 1; i < fpt_ino.Blocks && i < 12; i++)
@@ -570,8 +669,10 @@ public class PfsBuilder
             {
                 var blocks = CeilDiv(n.Size, hdr.BlockSize);
                 n.ino.SetDirectBlock(0, (int)hdr.Ndblock);
-                n.ino.Blocks = (uint)blocks;
-                n.ino.Size = n is FSDir ? roundUpSizeToBlock(n.Size) : n.Size;
+                n.ino.Blocks = checked((uint)blocks);
+                n.ino.Size = n is FSDir
+                    ? roundUpSizeToBlock(n.Size)
+                    : n is FSFile { PprKrakenCompression: true } pprFile ? pprFile.CompressedSize : n.Size;
                 if (n.ino.SizeCompressed == 0)
                     n.ino.SizeCompressed = n.ino.Size;
 
@@ -618,7 +719,7 @@ public class PfsBuilder
             var inodesPerBlock = hdr.BlockSize / DinodeD32.SizeOf;
             hdr.DinodeCount = inodes.Count;
             hdr.DinodeBlockCount = CeilDiv(inodes.Count, inodesPerBlock);
-            hdr.InodeBlockSig.Blocks = (uint)hdr.DinodeBlockCount;
+            hdr.InodeBlockSig.Blocks = checked((uint)hdr.DinodeBlockCount);
             hdr.InodeBlockSig.Size = hdr.DinodeBlockCount * hdr.BlockSize;
             hdr.InodeBlockSig.SizeCompressed = hdr.DinodeBlockCount * hdr.BlockSize;
             hdr.InodeBlockSig.SetDirectBlock(0, (int)hdr.Ndblock++);
@@ -636,7 +737,7 @@ public class PfsBuilder
             fpt_ino.SetDirectBlock(0, (int)hdr.Ndblock++);
             fpt_ino.Size = fpt.Size;
             fpt_ino.SizeCompressed = fpt.Size;
-            fpt_ino.Blocks = (uint)CeilDiv(fpt.Size, hdr.BlockSize);
+            fpt_ino.Blocks = checked((uint)CeilDiv(fpt.Size, hdr.BlockSize));
 
             for (int i = 1; i < fpt_ino.Blocks && i < 12; i++)
                 fpt_ino.SetDirectBlock(i, (int)hdr.Ndblock++);
@@ -652,7 +753,7 @@ public class PfsBuilder
                 cr_ino.SetDirectBlock(0, (int)hdr.Ndblock++);
                 cr_ino.Size = colResolver.Size;
                 cr_ino.SizeCompressed = colResolver.Size;
-                cr_ino.Blocks = (uint)CeilDiv(colResolver.Size, hdr.BlockSize);
+                cr_ino.Blocks = checked((uint)CeilDiv(colResolver.Size, hdr.BlockSize));
 
                 for (int i = 1; i < cr_ino.Blocks && i < 12; i++)
                     cr_ino.SetDirectBlock(i, (int)hdr.Ndblock++);
@@ -663,8 +764,10 @@ public class PfsBuilder
             {
                 var blocks = CeilDiv(n.Size, hdr.BlockSize);
                 n.ino.SetDirectBlock(0, (int)hdr.Ndblock);
-                n.ino.Blocks = (uint)blocks;
-                n.ino.Size = n is FSDir ? roundUpSizeToBlock(n.Size) : n.Size;
+                n.ino.Blocks = checked((uint)blocks);
+                n.ino.Size = n is FSDir
+                    ? roundUpSizeToBlock(n.Size)
+                    : n is FSFile { PprKrakenCompression: true } pprFile ? pprFile.CompressedSize : n.Size;
                 if (n.ino.SizeCompressed == 0)
                     n.ino.SizeCompressed = n.ino.Size;
                 for (int i = 1; i < blocks && i < 12; i++)
@@ -780,18 +883,100 @@ public class PfsBuilder
     }
 
     /// <summary>
+    /// Creates the publisher PPR-PFS root, where inode 0 is the user root directly.
+    /// </summary>
+    void SetupDirectRootStructure()
+    {
+        var rootInode = MakeInode(
+          Mode: InodeMode.dir | (InodeMode)0x1ED,
+          Number: 0,
+          Size: 65536,
+          SizeCompressed: 65536,
+          Blocks: 1,
+          Flags: 0,
+          Nlink: 2
+        );
+        properties.root.name = "";
+        properties.root.ino = rootInode;
+        properties.root.Dirents = new List<PfsDirent>
+        {
+            new PfsDirent { Name = ".", Type = DirentType.Dot, InodeNumber = 0 },
+            new PfsDirent { Name = "..", Type = DirentType.DotDot, InodeNumber = 0 },
+        };
+    }
+
+    /// <summary>
     /// Writes all the inodes to the image file. 
     /// </summary>
     /// <param name="s"></param>
     void WriteInodes(Stream s)
     {
-        s.Position = hdr.BlockSize;
+        s.Position = (long)hdr.InodeBlockSig.StartBlock * hdr.BlockSize;
         foreach (var di in inodes)
         {
             di.WriteToStream(s);
             if (s.Position % hdr.BlockSize > hdr.BlockSize - (properties.Sign ? DinodeS32.SizeOf : DinodeD32.SizeOf))
             {
                 s.Position += hdr.BlockSize - (s.Position % hdr.BlockSize);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Writes the inode allocation bitmap used by publisher PPR-PFS images in block 1.
+    /// One low-to-high bit is set for every materialized inode.
+    /// </summary>
+    void WriteDirectRootInodeBitmap(Stream stream)
+    {
+        stream.Position = hdr.BlockSize;
+        int fullBytes = inodes.Count / 8;
+        for (int i = 0; i < fullBytes; i++)
+            stream.WriteByte(0xFF);
+        int remainingBits = inodes.Count % 8;
+        if (remainingBits != 0)
+            stream.WriteByte((byte)((1 << remainingBits) - 1));
+    }
+
+    /// <summary>
+    /// Writes the unsigned 32-bit single- and double-indirect block maps used by the publisher
+    /// direct-root profile. The reference layout places these maps immediately after each file's
+    /// contiguous data extent: ib[0], ib[1], then the ib[1] leaf blocks.
+    /// </summary>
+    void WriteDirectRootIndirectBlocks(Stream stream)
+    {
+        long pointersPerBlock = hdr.BlockSize / sizeof(int);
+        foreach (FSNode node in allNodes)
+        {
+            long blocks = node.ino.Blocks;
+            if (blocks <= 12)
+                continue;
+
+            int dataStart = node.ino.StartBlock;
+            int singleIndirect = node.ino.IndirectBlocks[0];
+            stream.Position = checked((long)singleIndirect * hdr.BlockSize);
+            long singleCount = Math.Min(blocks - 12, pointersPerBlock);
+            for (long index = 0; index < singleCount; index++)
+                stream.WriteLE(checked(dataStart + 12 + (int)index));
+
+            long remaining = blocks - 12 - pointersPerBlock;
+            if (remaining <= 0)
+                continue;
+
+            int doubleIndirect = node.ino.IndirectBlocks[1];
+            int firstLeaf = checked(doubleIndirect + 1);
+            long leafCount = CeilDiv(remaining, pointersPerBlock);
+            stream.Position = checked((long)doubleIndirect * hdr.BlockSize);
+            for (int leaf = 0; leaf < leafCount; leaf++)
+                stream.WriteLE(checked(firstLeaf + leaf));
+
+            long dataIndex = 12 + pointersPerBlock;
+            for (int leaf = 0; leaf < leafCount; leaf++)
+            {
+                stream.Position = checked((long)(firstLeaf + leaf) * hdr.BlockSize);
+                long leafEntries = Math.Min(remaining, pointersPerBlock);
+                for (long entry = 0; entry < leafEntries; entry++)
+                    stream.WriteLE(checked(dataStart + (int)dataIndex++));
+                remaining -= leafEntries;
             }
         }
     }
@@ -832,7 +1017,15 @@ public class PfsBuilder
         else if (f is FSFile)
         {
             var file = (FSFile)f;
+            long start = s.Position;
             file.Write(s);
+            long expectedEnd = checked(start + file.Size);
+            if (s.Position != expectedEnd)
+            {
+                throw new InvalidDataException(
+                    $"File writer for '{file.FullPath()}' produced {s.Position - start:N0} bytes; "
+                    + $"the planned extent is {file.Size:N0} bytes.");
+            }
         }
     }
 }

@@ -18,6 +18,20 @@ public class PfsProperties
     public uint MinBlocks = 0;
     public bool Encrypt;
     public bool Sign;
+    /// <summary>
+    /// Use the publisher PPR-PFS geometry: reserve block 1, place the inode table at block 2,
+    /// and expose inode 0 as the user root without a super-root or flat-path-table wrapper.
+    /// </summary>
+    public bool DirectRootLayout;
+
+    /// <summary>
+    /// Remove files under sce_sys that are normally represented as outer package entries.
+    /// Disable this for standalone publisher PPR-PFS images, which retain those files.
+    /// </summary>
+    public bool FilterOuterPackageEntries = true;
+
+    /// <summary>Place lower-priority-number files first and keep each extent contiguous.</summary>
+    public bool OptimizeFileLayoutForReadSpeed;
     public byte[] EKPFS;
     public byte[] Seed;
 

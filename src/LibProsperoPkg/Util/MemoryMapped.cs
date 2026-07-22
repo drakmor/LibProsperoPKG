@@ -106,12 +106,22 @@ class ChunkedMemoryReader : IMemoryReader
 
     public void Read(long pos, byte[] buf, int offset, int count)
     {
+        ArgumentNullException.ThrowIfNull(buf);
+        ArgumentOutOfRangeException.ThrowIfNegative(pos);
+        ArgumentOutOfRangeException.ThrowIfNegative(offset);
+        ArgumentOutOfRangeException.ThrowIfNegative(count);
+        if (offset > buf.Length - count)
+            throw new ArgumentException("The destination range is outside the buffer.", nameof(offset));
+
         var chunkIdx = pos / chunkSize;
         while (count > 0)
         {
+            if ((ulong)chunkIdx >= (ulong)chunks.Length)
+                throw new EndOfStreamException("Read extends past the chunked file extent.");
             int offsetIntoChunk = (int)(pos % chunkSize);
             int toReadFromChunk = Math.Min(chunkSize - offsetIntoChunk, count);
-            reader.Read((long)chunks[chunkIdx++] * chunkSize + offsetIntoChunk, buf, offset, count);
+            reader.Read((long)chunks[chunkIdx++] * chunkSize + offsetIntoChunk,
+                buf, offset, toReadFromChunk);
             pos += toReadFromChunk;
             offset += toReadFromChunk;
             count -= toReadFromChunk;
@@ -139,7 +149,14 @@ class BufferedMemoryReader : IMemoryReader
 
     public void Read(long pos, byte[] buf, int offset, int count)
     {
-        while (count > 0 && pos > 0)
+        ArgumentNullException.ThrowIfNull(buf);
+        ArgumentOutOfRangeException.ThrowIfNegative(pos);
+        ArgumentOutOfRangeException.ThrowIfNegative(offset);
+        ArgumentOutOfRangeException.ThrowIfNegative(count);
+        if (offset > buf.Length - count)
+            throw new ArgumentException("The destination range is outside the buffer.", nameof(offset));
+
+        while (count > 0)
         {
             if (bufferStart > pos || pos >= bufferStart + buffer.Length)
             {
@@ -230,7 +247,15 @@ public class StreamWrapper : Stream
 
     public override long Length { get; }
 
-    public override long Position { get => position; set => position = value; }
+    public override long Position
+    {
+        get => position;
+        set
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(value);
+            position = value;
+        }
+    }
 
     public override void Flush()
     {
@@ -239,9 +264,17 @@ public class StreamWrapper : Stream
 
     public override int Read(byte[] buffer, int offset, int count)
     {
-        reader.Read(position, buffer, offset, count);
-        position += count;
-        return count;
+        ArgumentNullException.ThrowIfNull(buffer);
+        ArgumentOutOfRangeException.ThrowIfNegative(offset);
+        ArgumentOutOfRangeException.ThrowIfNegative(count);
+        if (offset > buffer.Length - count)
+            throw new ArgumentException("The destination range is outside the buffer.", nameof(offset));
+        if (position >= Length)
+            return 0;
+        int actual = checked((int)Math.Min(count, Length - position));
+        reader.Read(position, buffer, offset, actual);
+        position += actual;
+        return actual;
     }
 
     public override long Seek(long offset, SeekOrigin origin)
@@ -258,6 +291,8 @@ public class StreamWrapper : Stream
                 position = Length + offset;
                 break;
         }
+        if (position < 0)
+            throw new IOException("Cannot seek before the beginning of the stream.");
         return position;
     }
 

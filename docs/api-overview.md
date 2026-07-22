@@ -77,7 +77,7 @@ The primary entry point.
 
 | Type | Purpose |
 |---|---|
-| `ProsperoPfsLayout` | Build a plaintext inner-PFS image from a folder. `BuildFromFolder`, `VerifyRoundTrip`. |
+| `ProsperoPfsLayout` | Build a plaintext inner-PFS image from a folder. `BuildFromFolder`, `VerifyRoundTrip`. `FileCompression` selects `None`, classic PFSC `Zlib`, or PFSC v2 `Kraken`; `CompressionLevel` controls zlib (0..9) or Kraken (-4..9), and `CompressionExcludePatterns` controls raw-file path globs. `UsePublisherPprLayout` selects the direct inode-0 root, inode bitmap at block 1, and inode table at block 2; false retains the classic super-root/FPT layout. `OptimizeFileLayoutForReadSpeed` orders latency-sensitive and small files first. |
 | `ProsperoPfsImage` | AES-XTS encrypt/decrypt a PFS image. `EncryptInPlace`, `VerifyRoundTrip`. |
 | `ProsperoOuterPfsImage` | AES-XTS encrypt/decrypt the PS5 nwonly **outer** finalized-image PFS (whole 0x10000 block = one XTS unit; sector = block index, or `0x800000000000 | index` for signed blocks; superblock block left plaintext). `Transform` (block-index or `ProsperoOuterBlockKind[]` overload), `EncryptInPlace`/`DecryptInPlace` (key- or content-id/passcode-driven), `MetadataBlockIndex`. Decrypt and re-encrypt round-trips byte-for-byte. |
 | `ProsperoOuterPfsSignature` | PS5 nwonly outer-PFS signing primitives. `ComputeBlockHash` (plain SHA3-256 per-block/dinode hash), `ComputeSuperblockIcv`/`WriteSuperblockIcv` (`SHA3-256(superblock[0:0x5a0])` with the `icv` field zeroed), `BlockSector(index, signed)` (the bit-47 signed-block sector flag). |
@@ -88,7 +88,7 @@ The primary entry point.
 Each carries an options/result record pair (`ProsperoPfsLayoutOptions`/`Result`,
 `ProsperoPfsImageOptions`/`Result`, `ProsperoPfscOptions`/`Result`).
 
-### `LibProsperoPkg.PFS.Compression` — PS5 PFSv3 Kraken codec
+### `LibProsperoPkg.PFS.Compression` — PS5 Kraken codecs
 
 The PS5 compression-file (`PFSC` v3) codec used by the `nwonly` path.
 
@@ -99,6 +99,8 @@ The PS5 compression-file (`PFSC` v3) codec used by the `nwonly` path.
 | `CompressedPfsFile` | Parse a PFSv3 `PFSC` container. `Parse`, detection helpers, `VerifyFileDigest`, and `Decompress()` (drives `KrakenDecoder` for a full byte-exact decode). |
 | `Oodle.KrakenDecoder` | Internal newLZ (Kraken) decoder: raw + Huffman literal/cmd/offset/length arrays, post-seed excess framing with length escapes, both literal models, multi-chunk and multi-block. Decodes two embedded reference vectors and checks SHA3-256. |
 | `Oodle.KrakenHuffmanArrayEncoder` | Internal Huffman entropy-array encoder (chunk type 2, 3-stream split, K.3 length-limit) — the inverse of the decoder's array path; Huffman-codes each chunk's literal/command/length streams. Output round-trips through `KrakenDecoder` byte-for-byte. |
+| `PprPfsKraken` | Streaming writer/reader for the distinct per-file PFSC v2 layout consumed by `ppr_pfs`: algorithm 2, 128 KiB table entries grouped into seeded/seedless 256 KiB Kraken requests, absolute low-48-bit boundaries and high-bit Kraken/stored flags. `PprPfsKrakenWriteOptions` can force selected ranges to stored groups and reject compression below a minimum saving. `PackFile`, `Write`, `UnpackFile`, `Unpack`. |
+| `PprPfsReadOptimizer` | Inspects a ready inner PFS and produces merged, 256 KiB-aligned raw ranges for metadata, small files, and path patterns. The plan can be passed to `PprPfsKrakenWriteOptions.RawRanges` when building a PHUC outer layer. |
 | `PfsDigest` | SHA3-256 helpers for the per-block hashes and the `@0x28` file digest. |
 | `PfsShuffle` | The 13 pre-compression SoA de-interleave (shuffle/deshuffle) transforms. |
 
