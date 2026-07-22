@@ -101,10 +101,12 @@ public static class ProsperoFihBuilder
     /// image and threads it in. When null, standalone finalize falls back to a best-effort SHA3-256
     /// of the outer image (it cannot recover the encrypted inner image on its own).
     /// </param>
+    /// <param name="napsLayoutSize">Unpadded byte size of <c>naps_pkg_layout.dat</c>, or zero for a legacy image.</param>
     public static System.Collections.Generic.IReadOnlyList<string> BuildFromCnt(
         string cntPath, string fihOutputPath, ProsperoFihVariant variant = ProsperoFihVariant.Debug,
         Action<string>? logger = null, byte[]? siArchive = null,
-        Func<byte[], byte[]>? siArchiveFactory = null, byte[]? nestedImageDigest = null)
+        Func<byte[], byte[]>? siArchiveFactory = null, byte[]? nestedImageDigest = null,
+        ulong napsLayoutSize = 0)
     {
         ArgumentException.ThrowIfNullOrEmpty(cntPath);
         ArgumentException.ThrowIfNullOrEmpty(fihOutputPath);
@@ -138,7 +140,7 @@ public static class ProsperoFihBuilder
 
         ulong embeddedCntOffset = (ulong)ProsperoPkgLayout.FihHeaderRegionSize + pfsImageSize;
         byte[] header = BuildFihHeaderBlock(variant, pfsImageSize, embeddedCntOffset, image, warnings,
-            nestedImageDigest: nestedImageDigest);
+            nestedImageDigest: nestedImageDigest, napsLayoutSize: napsLayoutSize);
 
         log($"Writing finalized {(variant == ProsperoFihVariant.Debug ? "debug" : "official")} (FIH) image: " +
             $"image=0x{pfsImageSize:X} @0x{ProsperoPkgLayout.FihHeaderRegionSize:X}, CNT @0x{embeddedCntOffset:X}.");
@@ -199,7 +201,7 @@ public static class ProsperoFihBuilder
     internal static byte[] BuildFihHeaderBlock(
         ProsperoFihVariant variant, ulong pfsImageSize, ulong embeddedCntOffset,
         byte[] image, System.Collections.Generic.List<string>? warnings = null,
-        byte[]? nestedImageDigest = null)
+        byte[]? nestedImageDigest = null, ulong napsLayoutSize = 0)
     {
         byte[] h = new byte[ProsperoPkgLayout.FihHeaderRegionSize];
 
@@ -216,8 +218,12 @@ public static class ProsperoFihBuilder
         BinaryPrimitives.WriteUInt64LittleEndian(h.AsSpan(ProsperoPkgLayout.FihPfsImageSizeField), pfsImageSize);
         BinaryPrimitives.WriteUInt64LittleEndian(h.AsSpan(0x28), (ulong)ProsperoPkgLayout.FihHeaderRegionSize);
         BinaryPrimitives.WriteUInt64LittleEndian(h.AsSpan(ProsperoPkgLayout.FihEmbeddedCntOffsetField), embeddedCntOffset);
+        BinaryPrimitives.WriteUInt64LittleEndian(h.AsSpan(0x50), 0x40);
         BinaryPrimitives.WriteUInt64LittleEndian(h.AsSpan(0x60), (ulong)ProsperoPkgLayout.FihHeaderRegionSize);
         BinaryPrimitives.WriteUInt64LittleEndian(h.AsSpan(0x68), 0x800000000000UL);
+        BinaryPrimitives.WriteUInt32LittleEndian(h.AsSpan(0x9C), 1);
+        BinaryPrimitives.WriteUInt64LittleEndian(h.AsSpan(0xA8), napsLayoutSize);
+        BinaryPrimitives.WriteUInt64LittleEndian(h.AsSpan(0xF8), 2);
 
         // ---- Finalized-image digest table. ----
         // game-digest == sblock-digest == SHA3-256(plaintext outer superblock block, 0x10000 bytes),

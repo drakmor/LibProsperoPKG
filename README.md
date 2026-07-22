@@ -108,6 +108,10 @@ var options = new ProsperoBuildOptions
     TitleId      = "PPSA00000",
     Title        = "My PS5 Application",
     Version      = "01.00",
+    // Default: publisher data-first outer PFS + NAPS + direct-offset PPR-PFS.
+    UsePublisherPprNaps = true,
+    // Optional when the publishing environment supplies the separate 16-byte NAPS CMAC key:
+    // NapsOuterBlockCmacKey = Convert.FromHexString("00112233445566778899AABBCCDDEEFF"),
 };
 
 ProsperoBuildResult result = ProsperoPackageBuilder.Build(options, Console.WriteLine);

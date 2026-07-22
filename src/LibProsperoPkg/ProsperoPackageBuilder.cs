@@ -139,6 +139,18 @@ public sealed class ProsperoBuildOptions
     /// </list>
     /// </summary>
     public ProsperoInnerCompression InnerCompression { get; set; } = ProsperoInnerCompression.None;
+
+    /// <summary>
+    /// Build the publisher data-first outer PFS containing NAPS-packed, direct-offset PPR-PFS data.
+    /// Enabled by default. Set false only for the legacy superblock-first/PFSC package profile.
+    /// </summary>
+    public bool UsePublisherPprNaps { get; set; } = true;
+
+    /// <summary>
+    /// Optional 16-byte publishing CMAC key for the NAPS outer-block digest slots. The structural
+    /// package remains readable without it, but strict publisher integrity verification requires it.
+    /// </summary>
+    public byte[]? NapsOuterBlockCmacKey { get; set; }
 }
 
 /// <summary>The result of a build: the output path plus any non-fatal warnings.</summary>
@@ -382,7 +394,12 @@ public static class ProsperoPackageBuilder
             VolumeType = ProsperoVolumeTypeForMode(options.Mode),
             CompressInnerImage = options.CompressInnerImage,
             InnerCompression = options.InnerCompression,
+            UsePublisherPprNaps = options.UsePublisherPprNaps,
+            NapsOuterBlockCmacKey = options.NapsOuterBlockCmacKey,
         };
+
+        if (options.UsePublisherPprNaps && options.NapsOuterBlockCmacKey is null)
+            warnings.Add("NAPS outer-block CMAC key was not supplied; its eight-byte integrity tags are zero.");
 
         log("Building the PS5 package...");
         LibProsperoPkg.PKG.ProsperoPkgBuilder.Build(buildProps, cntPath, out byte[]? nestedImageDigest, out var siInputs, log);
@@ -431,7 +448,8 @@ public static class ProsperoPackageBuilder
             var fihWarnings = LibProsperoPkg.PKG.ProsperoFihBuilder.BuildFromCnt(
                 cntPath, finalPath, LibProsperoPkg.PKG.ProsperoFihVariant.Debug, log,
                 siArchiveFactory: siFactory,
-                nestedImageDigest: nestedImageDigest);
+                nestedImageDigest: nestedImageDigest,
+                napsLayoutSize: siInputs?.NapsLayoutSize ?? 0);
             warnings.AddRange(fihWarnings);
 
             var fihType = ProsperoPkgReader.DetectType(finalPath);

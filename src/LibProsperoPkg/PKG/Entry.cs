@@ -191,22 +191,38 @@ public class PkgEntryKey
 /// </summary>
 public class KeysEntry : Entry
 {
+    private readonly bool publisherProfile;
+
     public KeysEntry(byte[] digest, PkgEntryKey[] keys)
+        : this(digest, keys, publisherProfile: false)
+    {
+    }
+
+    private KeysEntry(byte[] digest, PkgEntryKey[] keys, bool publisherProfile)
     {
         seedDigest = digest;
         Keys = keys;
+        this.publisherProfile = publisherProfile;
     }
     public KeysEntry(string contentId, string passcode)
+        : this(contentId, passcode, publisherProfile: false)
     {
-        Keys = new PkgEntryKey[7];
+    }
+
+    public KeysEntry(string contentId, string passcode, bool publisherProfile)
+    {
+        this.publisherProfile = publisherProfile;
+        const int keyCount = 7;
+        Keys = new PkgEntryKey[keyCount];
         seedDigest = Crypto.Sha256(Encoding.ASCII.GetBytes(contentId.PadRight(48, '\0')));
-        for (uint i = 0; i < 7; i++)
+        for (uint i = 0; i < keyCount; i++)
         {
             var passcodeKey = Crypto.ComputeKeys(contentId, passcode, i);
+            int publicKeyIndex = Math.Min((int)i, Util.CryptoKeys.PkgPublicKeys.Length - 1);
             Keys[i] = new PkgEntryKey
             {
                 digest = Crypto.Sha256(passcodeKey).Xor(passcodeKey),
-                key = Crypto.RSA2048EncryptKey(Util.CryptoKeys.PkgPublicKeys[i], passcodeKey)
+                key = Crypto.RSA2048EncryptKey(Util.CryptoKeys.PkgPublicKeys[publicKeyIndex], passcodeKey)
             };
         }
         Keys[0].key = Crypto.RSA2048EncryptKey(Util.CryptoKeys.PkgPublicKeys[0], Encoding.ASCII.GetBytes(passcode));
@@ -215,7 +231,7 @@ public class KeysEntry : Entry
     public PkgEntryKey[] Keys;
     public override EntryId Id => EntryId.ENTRY_KEYS;
     public override string Name => null;
-    public override uint Length => 2048;
+    public override uint Length => publisherProfile ? 0xB80u : 0x800u;
     public override void Write(Stream s)
     {
         s.Write(seedDigest, 0, 32);
@@ -225,28 +241,32 @@ public class KeysEntry : Entry
         }
         foreach (var key in Keys)
         {
-            s.Write(key.key, 0, 256);
+            s.Write(key.key, 0, key.key.Length);
+            if (publisherProfile && key.key.Length < 384)
+                s.Write(new byte[384 - key.key.Length], 0, 384 - key.key.Length);
         }
     }
     public static KeysEntry Read(MetaEntry e, Stream pkg)
     {
         pkg.Position = e.DataOffset;
         var seedDigest = pkg.ReadBytes(32);
-        var digests = new byte[7][];
-        var keys = new PkgEntryKey[7];
-        for (var x = 0; x < 7; x++)
+        const int keyCount = 7;
+        int keySize = e.DataSize >= 0xB80 ? 384 : 256;
+        var digests = new byte[keyCount][];
+        var keys = new PkgEntryKey[keyCount];
+        for (var x = 0; x < keyCount; x++)
         {
             digests[x] = pkg.ReadBytes(32);
         }
-        for (var x = 0; x < 7; x++)
+        for (var x = 0; x < keyCount; x++)
         {
             keys[x] = new PkgEntryKey
             {
                 digest = digests[x],
-                key = pkg.ReadBytes(256)
+                key = pkg.ReadBytes(keySize)
             };
         }
-        return new KeysEntry(seedDigest, keys) { meta = e };
+        return new KeysEntry(seedDigest, keys, keySize == 384) { meta = e };
     }
 }
 

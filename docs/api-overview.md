@@ -27,7 +27,8 @@ The primary entry point.
 
 - **`ProsperoBuildOptions`** — the build description: `Mode`, `OutputFormat`, `SourceFolder`,
   `OutputFolder`, `ContentId`, `Passcode`, `Title`, `TitleId`, `Version`,
-  `GenerateParamJsonIfMissing`, `CompressInnerImage`, `InnerCompression`.
+  `GenerateParamJsonIfMissing`, `CompressInnerImage`, `InnerCompression`, `UsePublisherPprNaps`
+  (default true), and optional 16-byte `NapsOuterBlockCmacKey`.
 - **`ProsperoBuildResult`** — `OutputPath` and a list of non-fatal `Warnings`.
 - **`ProsperoPackageMode`** — `Application`, `Homebrew`, `AdditionalContentData`,
   `AdditionalContentNoData`.
@@ -69,7 +70,9 @@ The primary entry point.
 
 ### Build properties
 
-- **`ProsperoPkgBuildProperties`** and **`ProsperoVolumeType`** drive the low-level builder.
+- **`ProsperoPkgBuildProperties`** and **`ProsperoVolumeType`** drive the low-level builder. The
+  publisher path is selected by `UsePublisherPprNaps`; `NapsOuterBlockCmacKey` supplies the separate
+  publishing CMAC input when strict NAPS outer-block tags are required.
 - **`ProsperoPkgLayout`** and **`ProsperoEntryId`** describe the container layout and entry ids.
 
 ---
@@ -84,7 +87,7 @@ The primary entry point.
 | `ProsperoOuterPfsImage` | AES-XTS encrypt/decrypt the PS5 nwonly **outer** finalized-image PFS (whole 0x10000 block = one XTS unit; sector = block index, or `0x800000000000 | index` for signed blocks; superblock block left plaintext). `Transform` (block-index or `ProsperoOuterBlockKind[]` overload), `EncryptInPlace`/`DecryptInPlace` (key- or content-id/passcode-driven), `MetadataBlockIndex`. Decrypt and re-encrypt round-trips byte-for-byte. |
 | `ProsperoOuterPfsSignature` | PS5 nwonly outer-PFS signing primitives. `ComputeBlockHash` (plain SHA3-256 per-block/dinode hash), `ComputeSuperblockIcv`/`WriteSuperblockIcv` (`SHA3-256(superblock[0:0x5a0])` with the `icv` field zeroed), `BlockSector(index, signed)` (the bit-47 signed-block sector flag). |
 | `ProsperoOuterPfsBuilder` | PS5 nwonly outer-PFS **structure generator**: assembles the data-first 11-block plaintext outer image from its outer files (`pfs_image.dat`, `naps_pkg_layout.dat`) — inode table with per-block SHA3 hashes, super-root/uroot dirents, the `\x7fFLT` inode_flat_path_table (custom reduced-Keccak path hash), and the signed superblock (+`icv`). `BuildPlaintext`, `Encrypt`, `BuildEncrypted`. Produces byte-exact plaintext and ciphertext output. Types: `ProsperoOuterFile`, `ProsperoOuterPfsBuildParameters`, `ProsperoOuterPfsBuildResult`. |
-| `ProsperoPublisherPprBuilder` | Publisher artifact pipeline from a source folder through relocated direct-offset PPR-PFS (`mode 0x18`, superblock at logical 0x400000), NAPS, data-first outer PFS and AES-XTS. `Build` returns every intermediate path and validates the reverse path. |
+| `ProsperoPublisherPprBuilder` | Publisher artifact pipeline from a source folder through relocated direct-offset PPR-PFS (`mode 0x18`, superblock at logical 0x400000), NAPS, data-first outer PFS and AES-XTS. `Build` returns every intermediate path plus publisher `imagedigs.dat` and the logical FIH digest, and validates the reverse path. |
 | `ProsperoPfsKeys` | PFS-image key derivation using SHA3-256. `DeriveEkpfs(contentId, passcode)`, `DeriveImageEncryptionKeys(ekpfs, seed)` → `(tweakKey, dataKey)`, overload `DeriveImageEncryptionKeys(contentId, passcode, seed)` → `(tweakKey, dataKey)`, `DeriveImageSignKey(ekpfs, seed)`. |
 | `ProsperoPfsc` | PFSC block compression. `PackFile`, `Unpack`, `IsPfsc`. |
 

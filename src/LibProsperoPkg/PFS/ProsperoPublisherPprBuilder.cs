@@ -41,6 +41,13 @@ public sealed class ProsperoPublisherPprBuildResult
     public required byte[] OuterSeed { get; init; }
     public required int OuterSuperblockIndex { get; init; }
     public required int InnerFileCount { get; init; }
+    /// <summary>
+    /// CNT <c>imagedigs.dat</c>: one byte-reversed SHA3-256 digest for every plaintext 64-KiB
+    /// outer-PFS block. This formula is byte-exact against publisher-produced packages.
+    /// </summary>
+    public required byte[] ImageDigests { get; init; }
+    /// <summary>SHA3-256 of the complete uncompressed logical PPR-PFS stream (FIH slot 0xB0).</summary>
+    public required byte[] LogicalImageDigest { get; init; }
     public required ProsperoNapsBuildResult Naps { get; init; }
 }
 
@@ -144,6 +151,7 @@ public static class ProsperoPublisherPprBuilder
         log("Building and encrypting the data-first outer PFS...");
         ProsperoOuterPfsBuildResult outer = ProsperoOuterPfsBuilder.BuildPlaintext(outerFiles, parameters);
         byte[] plaintext = outer.Plaintext.AsSpan().ToArray();
+        byte[] imageDigests = BuildImageDigests(plaintext);
         byte[] ekpfs = ProsperoPfsKeys.DeriveEkpfs(options.ContentId, options.Passcode);
         var keys = ProsperoPfsKeys.DeriveImageEncryptionKeys(ekpfs, seed);
         ProsperoOuterPfsBuilder.Encrypt(outer, keys.TweakKey, keys.DataKey);
@@ -168,8 +176,26 @@ public static class ProsperoPublisherPprBuilder
             OuterSeed = seed,
             OuterSuperblockIndex = outer.SuperblockIndex,
             InnerFileCount = innerFileCount,
+            ImageDigests = imageDigests,
+            LogicalImageDigest = ProsperoImageDigests.Sha3_256(logical),
             Naps = naps,
         };
+    }
+
+    private static byte[] BuildImageDigests(byte[] plaintext)
+    {
+        if (plaintext.Length % ProsperoOuterPfsBuilder.BlockSize != 0)
+            throw new InvalidDataException("Outer PFS is not block aligned.");
+        int blocks = plaintext.Length / ProsperoOuterPfsBuilder.BlockSize;
+        var result = new byte[checked(blocks * 32)];
+        for (int block = 0; block < blocks; block++)
+        {
+            byte[] digest = ProsperoOuterPfsSignature.ComputeBlockHash(
+                plaintext.AsSpan(block * ProsperoOuterPfsBuilder.BlockSize, ProsperoOuterPfsBuilder.BlockSize));
+            Array.Reverse(digest);
+            digest.CopyTo(result, block * 32);
+        }
+        return result;
     }
 
     private static int ValidateInner(byte[] logical)

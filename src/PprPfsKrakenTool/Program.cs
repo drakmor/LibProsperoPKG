@@ -1,3 +1,4 @@
+using LibProsperoPkg;
 using LibProsperoPkg.PFS;
 using LibProsperoPkg.PFS.Compression;
 using LibProsperoPkg.PKG;
@@ -41,6 +42,7 @@ internal static class Program
                 "build" => BuildPfs(args),
                 "build-phuc" => BuildPhuc(args),
                 "build-publisher-artifacts" => BuildPublisherArtifacts(args),
+                "build-pkg" => BuildPackage(args),
                 "pack" => PackFile(args),
                 "unpack" => UnpackFile(args),
                 "list" => ListPfs(args),
@@ -55,6 +57,8 @@ internal static class Program
                 "roundtrip-naps" => RoundTripNaps(args),
                 "inspect-pkg" => InspectPackage(args),
                 "extract-pkg-outer" => ExtractPackageOuter(args),
+                "dump-pkg-outer" => DumpPackageOuter(args),
+                "check-pkg-imagedigs" => CheckPackageImageDigests(args),
                 "extract-pkg-inner" => ExtractPackageInner(args),
                 "extract-pkg-cnt" => ExtractPackageCnt(args),
                 "selftest" => SelfTest(args),
@@ -75,6 +79,37 @@ internal static class Program
         Console.WriteLine($"files={document.Counts.NumFiles} compression={document.Counts.CompressionType} keys={document.Counts.NumKeys}");
         Console.WriteLine($"ublocks={document.Counts.UBlockCount} outer={document.Counts.NumOuterBlocks} cblockInfo={document.Counts.NumCblockInfo}");
         Console.WriteLine($"layout-size=0x{document.Map.TotalSize:x} footer={document.TrailingZeroBytes}");
+        return 0;
+    }
+
+    private static int BuildPackage(string[] args)
+    {
+        if (args.Length is < 5 or > 7)
+            throw new ArgumentException(
+                "build-pkg requires <source-dir> <output-dir> <content-id> <app|ac|al> [passcode] [naps-cmac-key-hex].");
+        ProsperoPackageMode mode = args[4].ToLowerInvariant() switch
+        {
+            "app" => ProsperoPackageMode.Application,
+            "ac" => ProsperoPackageMode.AdditionalContentData,
+            "al" => ProsperoPackageMode.AdditionalContentNoData,
+            _ => throw new ArgumentException("Package mode must be app, ac, or al."),
+        };
+        byte[]? cmac = args.Length == 7 ? Convert.FromHexString(args[6]) : null;
+        var result = ProsperoPackageBuilder.Build(
+            new ProsperoBuildOptions
+            {
+                SourceFolder = args[1],
+                OutputFolder = args[2],
+                ContentId = args[3],
+                TitleId = args[3].Substring(7, 9),
+                Mode = mode,
+                Passcode = args.Length >= 6 ? args[5] : new string('0', 32),
+                UsePublisherPprNaps = true,
+                NapsOuterBlockCmacKey = cmac,
+            },
+            Console.WriteLine);
+        Console.WriteLine(result.OutputPath);
+        foreach (string warning in result.Warnings) Console.WriteLine("warning: " + warning);
         return 0;
     }
 
@@ -162,6 +197,10 @@ internal static class Program
         Console.WriteLine($"type={package.Type} content-id={package.Header?.ContentId}");
         Console.WriteLine($"outer=0x{map.OuterPfsOffset:x}+0x{map.OuterPfsSize:x} superblock={map.OuterSuperblockIndex}");
         Console.WriteLine($"cnt=0x{map.CntOffset:x}+0x{map.CntSize:x} supplement=0x{map.SupplementSize:x} entries={package.Entries.Count}");
+        foreach (ProsperoPkgEntry entry in package.Entries)
+            Console.WriteLine(
+                $"entry=0x{entry.RawId:x4} flags=0x{entry.Flags1:x8}/0x{entry.Flags2:x8} " +
+                $"offset=0x{entry.DataOffset:x} size=0x{entry.DataSize:x} name={entry.Name ?? "-"}");
         return 0;
     }
 
@@ -172,6 +211,45 @@ internal static class Program
         IReadOnlyList<string> files = ProsperoPackageArchive.ExtractOuterFiles(args[1], args[2], passcode);
         Console.WriteLine($"extracted {files.Count} outer-PFS files");
         return 0;
+    }
+
+    private static int DumpPackageOuter(string[] args)
+    {
+        if (args.Length is < 3 or > 4)
+            throw new ArgumentException("Usage: dump-pkg-outer <package.pkg> <output.pfs> [passcode]");
+        string passcode = args.Length == 4 ? args[3] : new string('0', 32);
+        File.WriteAllBytes(args[2], ProsperoPackageArchive.DecryptOuterPfs(args[1], passcode));
+        Console.WriteLine(args[2]);
+        return 0;
+    }
+
+    private static int CheckPackageImageDigests(string[] args)
+    {
+        if (args.Length is < 2 or > 3)
+            throw new ArgumentException("Usage: check-pkg-imagedigs <package.pkg> [passcode]");
+        string passcode = args.Length == 3 ? args[2] : new string('0', 32);
+        byte[] outer = ProsperoPackageArchive.DecryptOuterPfs(args[1], passcode);
+        string temporary = Path.Combine(Path.GetTempPath(), "libprospero-imagedigs-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            ProsperoPackageArchive.ExtractCntEntries(args[1], temporary);
+            byte[] expected = File.ReadAllBytes(Path.Combine(temporary, "entry-0000040a.bin"));
+            int blockCount = outer.Length / ProsperoPackageArchive.OuterBlockSize;
+            int reverseSha3Matches = 0;
+            for (int i = 0; i < blockCount; i++)
+            {
+                byte[] digest = ProsperoSha3.HashData(
+                    outer.AsSpan(i * ProsperoPackageArchive.OuterBlockSize, ProsperoPackageArchive.OuterBlockSize));
+                Array.Reverse(digest);
+                if (expected.AsSpan(i * 32, 32).SequenceEqual(digest)) reverseSha3Matches++;
+            }
+            Console.WriteLine($"blocks={blockCount} imagedigs={expected.Length} reverse-sha3-matches={reverseSha3Matches}");
+            return 0;
+        }
+        finally
+        {
+            if (Directory.Exists(temporary)) Directory.Delete(temporary, recursive: true);
+        }
     }
 
     private static int ExtractPackageInner(string[] args)
@@ -1116,6 +1194,7 @@ internal static class Program
         Console.WriteLine("        [--exclude \"sce_sys/**;movies/*.mp4\"] [--only-if-smaller false]");
         Console.WriteLine("        [--classic true]   (alias for --layout classic)");
         Console.WriteLine("  build-publisher-artifacts <source-folder> <output-dir> <content-id> <passcode> [cmac-key-hex]");
+        Console.WriteLine("  build-pkg <source-dir> <output-dir> <content-id> <app|ac|al> [passcode] [naps-cmac-key-hex]");
         Console.WriteLine("  pack  <input-file> <output.pfsc> [--compression zlib|kraken|none] [--level N]");
         Console.WriteLine("        [--min-savings-percent 0]");
         Console.WriteLine("  unpack <input-or-image> <output-file> [--offset 0x0]");
@@ -1131,6 +1210,8 @@ internal static class Program
         Console.WriteLine("  roundtrip-naps <input> <output>");
         Console.WriteLine("  inspect-pkg <package.pkg>");
         Console.WriteLine("  extract-pkg-outer <package.pkg> <output-dir> [passcode]");
+        Console.WriteLine("  dump-pkg-outer <package.pkg> <output.pfs> [passcode]");
+        Console.WriteLine("  check-pkg-imagedigs <package.pkg> [passcode]");
         Console.WriteLine("  extract-pkg-inner <package.pkg> <output-dir> [passcode]");
         Console.WriteLine("  extract-pkg-cnt <package.pkg> <output-dir>");
         Console.WriteLine("  selftest");
