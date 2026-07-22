@@ -724,7 +724,10 @@ internal static class KrakenDecoder
         {
             byte fill = syms[0];
             for (int i = 0; i < outputSize; i++) output[i] = fill;
-            return sp - srcEnd;
+            // A singleton Huffman alphabet consumes the complete declared entropy payload.  The
+            // previous pointer-difference return was zero/negative and rejected valid publisher
+            // NAPS constant blocks such as 27 FF FC 00 03 00 40 00 (128 KiB of zeroes).
+            return srcSize;
         }
 
         var lut = new NewHuffLut();

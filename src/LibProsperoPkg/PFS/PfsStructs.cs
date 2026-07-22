@@ -23,6 +23,8 @@ public enum PfsMode : ushort
     Is64Bit = 0x2,
     Encrypted = 0x4,
     UnknownFlagAlwaysSet = 0x8,
+    /// <summary>PPR direct-offset inode profile used by publisher NAPS images.</summary>
+    PprDirectOffsets = 0x10,
 }
 /// <summary>
 /// Represents a PFS image suberblock.
@@ -301,6 +303,77 @@ public class DinodeD32 : Inode
         return di;
     }
 };
+
+/// <summary>
+/// Publisher PPR inode. The common 0x60-byte prefix matches an unsigned inode, but the 0x48-byte
+/// tail starts with an absolute logical byte offset instead of <c>blocks + db[] + ib[]</c>.
+/// </summary>
+public sealed class DinodePpr : Inode
+{
+    public const long SizeOf = 0xA8;
+    public long DataOffset;
+    public byte[] Tail = new byte[0x40];
+
+    public override int StartBlock => checked((int)(DataOffset / 0x10000));
+    public override IList<int> DirectBlocks => [StartBlock];
+    public override IList<int> IndirectBlocks => [];
+
+    public override void SetDirectBlock(int idx, int block)
+    {
+        if (idx != 0) throw new ArgumentOutOfRangeException(nameof(idx));
+        DataOffset = (long)block * 0x10000;
+    }
+
+    public override void WriteToStream(Stream s)
+    {
+        s.WriteLE((ushort)Mode);
+        s.WriteLE(Nlink);
+        s.WriteLE((uint)Flags);
+        s.WriteLE(Size);
+        s.WriteLE(SizeCompressed);
+        s.WriteLE(Time1_sec);
+        s.WriteLE(Time2_sec);
+        s.WriteLE(Time3_sec);
+        s.WriteLE(Time4_sec);
+        s.WriteLE(Time1_nsec);
+        s.WriteLE(Time2_nsec);
+        s.WriteLE(Time3_nsec);
+        s.WriteLE(Time4_nsec);
+        s.WriteLE(Uid);
+        s.WriteLE(Gid);
+        s.WriteLE(Unk1);
+        s.WriteLE(Unk2);
+        s.WriteLE(DataOffset);
+        s.Write(Tail, 0, Tail.Length);
+    }
+
+    public static DinodePpr ReadFromStream(Stream s)
+    {
+        var inode = new DinodePpr
+        {
+            Mode = (InodeMode)s.ReadUInt16LE(),
+            Nlink = s.ReadUInt16LE(),
+            Flags = (InodeFlags)s.ReadUInt32LE(),
+            Size = s.ReadInt64LE(),
+            SizeCompressed = s.ReadInt64LE(),
+            Time1_sec = s.ReadInt64LE(),
+            Time2_sec = s.ReadInt64LE(),
+            Time3_sec = s.ReadInt64LE(),
+            Time4_sec = s.ReadInt64LE(),
+            Time1_nsec = s.ReadUInt32LE(),
+            Time2_nsec = s.ReadUInt32LE(),
+            Time3_nsec = s.ReadUInt32LE(),
+            Time4_nsec = s.ReadUInt32LE(),
+            Uid = s.ReadUInt32LE(),
+            Gid = s.ReadUInt32LE(),
+            Unk1 = s.ReadUInt64LE(),
+            Unk2 = s.ReadUInt64LE(),
+            DataOffset = s.ReadInt64LE(),
+            Tail = s.ReadBytes(0x40),
+        };
+        return inode;
+    }
+}
 /// <summary>
 /// Data structure used in signed 32 bit PFS images
 /// </summary>

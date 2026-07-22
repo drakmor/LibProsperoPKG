@@ -96,10 +96,15 @@ This document describes the current LibProsperoPkg package-building and reading 
 ### NAPS streaming and Kraken inner compression
 
 - Implements `ProsperoNapsLayout` as a parser and byte-exact serializer for `naps_pkg_layout.dat`.
+- Implements `ProsperoNapsImage.BuildPlan` as the managed equivalent of the span/ublock/file-view construction used by `ric.exe`: fidx terminal boundaries, U2C base-plus-delta lookup, run-base records, terminal records, 18-bit wrapped compressed and uncompressed lengths, tweak/key propagation, and physical `pfs_image.dat` offsets.
+- Implements `ProsperoNapsImage.Decompress`, including raw spans, two-chunk Kraken spans, newLZ/bare-entropy mode selection, strict coverage checks, and the publisher singleton-Huffman representation used for constant blocks.
+- Implements the high-level `ProsperoPackageArchive` read path for finalized debug images: decrypt and verify the outer PFS, extract `naps_pkg_layout.dat` and `pfs_image.dat`, reconstruct the logical inner image, and extract its files.
+- Reads the publisher PPR direct-offset inode profile (`superblock.mode & 0x10`, 0xA8-byte inode). In this profile the value at inode `+0x60` is an absolute logical byte offset rather than the classic block-pointer array.
+- The complete PKG -> outer PFS -> NAPS -> inner PPR-PFS -> files path has been exercised successfully on publisher-produced `dlc_baseline.pkg`, `dlc.pkg`, `sftest.pkg`, `PPSX40000.pkg`, `forza_premium_1.0.pkg`, and `horizon_west.pkg`. The baseline also passes `prospero-pub-cmd img_verify --format_check on --integrity_check on`.
 - The layout serializer round-trips the tested 544-byte sample: 533 bytes of section content plus 11 trailing zero pad bytes.
 - Implements the 16-byte layout header bit packing: file count, compression type, key count, shuffle-pattern count, uncompressed-block count, outer-block count, and compressed-block-info count.
 - Implements the section order and strides: outer block digest (8 bytes), shuffle pattern (8 bytes), uncompressed offset by file index (6 bytes), compressed-info offset by uncompressed-block index (10 bytes), and compressed-block info (9 bytes).
-- Implements both 9-byte compressed-block-info record formats and all bit offsets used by the tested 45-record sample.
+- Implements both 9-byte compressed-block-info record formats. For a normal record the confirmed bit layout is compressed offset `[0..17]`, run/terminal flags `[18..19]`, uncompressed offset `[20..37]`, first-chunk compressed length minus one `[38..54]`, even/odd modes `[55..60]`, predictor `[61..66]`, reserved bit 67, and shuffle `[68..71]`.
 - `BuildLayout` defaults to 16-byte alignment, matching the tested sample.
 - Data-dependent NAPS record value generation is only self-consistent for the library's own inner-image compressor output. Byte-identical reproduction of a specific package requires byte-identical Kraken-compressed block sizes.
 - Implements a Kraken encoder and `KrakenDecoder` under `PFS/Compression/Oodle`, plus `CompressedPfsFileWriter` and `CompressedPfsFile` for the PFSC container.
@@ -126,13 +131,15 @@ This document describes the current LibProsperoPkg package-building and reading 
 - Retail finalized images with signed byte `0x80` are not implemented. They require console-side finalization material that the library does not have.
 - Retail install-metadata archives are not implemented. The retail variant is encrypted and is not produced by the library.
 - On-console installation acceptance is not guaranteed. Library code verifies structure and round-tripping; acceptance depends on console mode and firmware.
-- The full NAPS streaming outer producer is not complete. Remaining pieces include rolling/weak/strong deduplication, block shuffle, per-outer-block encryption/CRC/digest integration, complete `naps_meta_*.dat` generation, full `pfsimage.xml` named-digest population for all package shapes, and final `\x7FFIH` assembly for enforced streaming use.
-- NAPS layout record values are not fully generated from arbitrary input. The format parser and serializer are implemented, but values derived from exact compression bookkeeping are only self-consistent for this library's own compressor output.
+- The full NAPS streaming outer producer is not complete. The inverse writer still needs to generate span/run/U2C/fidx records and physical outer blocks from arbitrary inner PPR-PFS input, then integrate those bytes into package finalization.
+- The current NAPS decoder intentionally rejects non-zero `KdePredictor` and non-zero shuffle profiles. The tested publisher packages use predictor/shuffle zero; other publisher modes still require reference vectors and inverse transforms.
+- The high-level read path currently materializes complete outer and logical images in memory. A stream/file-backed path is still needed for multi-gigabyte packages.
+- PPR direct-offset inodes are decoded as a single contiguous extent. Additional tail fields or fragmented/extents profiles, if emitted for large/base/patch packages, still require corpus coverage.
 - `naps_meta_300/301/302/308.dat` (the 48-byte records) are reproduced byte-exact by `ProsperoNapsMeta` from the build's own inner-image size and emitted in the SI segment automatically. The keyed `naps_meta_18.dat` metric blob has no off-console producer: it is accepted as an input and emitted verbatim when supplied, otherwise omitted — never fabricated.
 - The `pfsimage.xml` `<chunkinfo>`, `<pfs-image>`, and `<nested-image>` introspection trees are emitted from the build's own captured outer/inner-PFS inode layout, so they are self-consistent snapshots of this library's image rather than byte matches of a specific reference package. The outer superblock `<icv>` is the real captured superblock HMAC and the `<seed>` is all-zero; because this library writes a superblock-first outer PFS while the reference layout is data-first, the reported block indices and metadata offsets differ from a specific reference package. The nested `<metadata>` pseudo-element and per-file `poffset` are intentionally omitted (not stably derivable for compressed inner content). These sections live in the supplemental `sce_suppl` ZIP that the console loader does not read, so they do not affect installability.
 - Keyed or console-produced `pfsimage.xml` digest members in the install-metadata archive are supplied by the caller or left as placeholders; they are not fabricated.
 - Byte-identical reproduction of a specific `nwonly` package remains limited by exact Kraken encoder choices at compression level 7. The generated package is valid and internally consistent, but downstream NAPS layout values and digests that depend on exact compressed bytes can differ.
-- Automatic emission of `naps_pkg_layout.dat` for package builds is not complete; the implemented component is the parser and serializer. Existing package-level status data says this file was absent from all real `nwonly` samples used for emission checks, so the builder does not claim package-emission coverage.
+- Automatic emission of `naps_pkg_layout.dat` for package builds is not complete. Parsing, serialization, span planning and full decoding are implemented; arbitrary-input record generation and package wiring remain.
 
 ## Summary table
 
@@ -168,7 +175,8 @@ This document describes the current LibProsperoPkg package-building and reading 
 | Keystone (`sce_sys/keystone`) | Implemented, byte-exact from passcode for version 2 and version 3 |
 | DDS BC7 texture generation | Implemented |
 | GP5 project model | Implemented |
-| NAPS layout parser and serializer | Implemented; automatic package emission incomplete |
+| NAPS layout parser and serializer | Implemented; confirmed field semantics and strict validation |
+| NAPS image planner and decoder | Implemented for raw/Kraken publisher profiles with predictor/shuffle zero; tested end to end on six publisher packages |
 | NAPS streaming outer producer | Not implemented |
 | Retail install-metadata archive | Not implemented |
 | Retail finalized image (`0x80`) | Not implemented |

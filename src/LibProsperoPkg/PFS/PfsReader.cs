@@ -83,28 +83,44 @@ public class PfsReader
         }
         public void Save(string path, bool decompress = false)
         {
-            var buf = new byte[blockSize];
             using (var file = System.IO.File.OpenWrite(path))
             {
-                bool isCompressed = flags.HasFlag(InodeFlags.compressed);
-                var sz = size;
-                long pos = 0;
-                var reader = GetView();
-                if (decompress && isCompressed)
-                {
-                    sz = compressed_size;
-                    reader = new PFSCReader(reader);
-                }
-                file.SetLength(sz);
-                while (sz > 0)
-                {
-                    var toRead = (int)Math.Min(sz, buf.Length);
-                    reader.Read(pos, buf, 0, toRead);
-                    file.Write(buf, 0, toRead);
-                    pos += toRead;
-                    sz -= toRead;
-                }
+                CopyTo(file, decompress);
             }
+        }
+
+        /// <summary>Copies this inode to an arbitrary writable stream.</summary>
+        public void CopyTo(Stream destination, bool decompress = false)
+        {
+            if (destination == null) throw new ArgumentNullException(nameof(destination));
+            if (!destination.CanWrite) throw new ArgumentException("Destination must be writable.", nameof(destination));
+            var buf = new byte[blockSize];
+            bool isCompressed = flags.HasFlag(InodeFlags.compressed);
+            var sz = size;
+            long pos = 0;
+            var source = GetView();
+            if (decompress && isCompressed)
+            {
+                sz = compressed_size;
+                source = new PFSCReader(source);
+            }
+            if (destination.CanSeek) destination.SetLength(sz);
+            while (sz > 0)
+            {
+                var toRead = (int)Math.Min(sz, buf.Length);
+                source.Read(pos, buf, 0, toRead);
+                destination.Write(buf, 0, toRead);
+                pos += toRead;
+                sz -= toRead;
+            }
+        }
+
+        /// <summary>Reads the complete inode into memory.</summary>
+        public byte[] ReadAllBytes(bool decompress = false)
+        {
+            using var memory = new MemoryStream();
+            CopyTo(memory, decompress);
+            return memory.ToArray();
         }
     }
 
@@ -134,7 +150,14 @@ public class PfsReader
         int dinodeSize;
         Func<Stream, Inode> dinodeReader;
         bool is64 = hdr.Mode.HasFlag(PfsMode.Is64Bit);
-        if (hdr.Mode.HasFlag(PfsMode.Signed))
+        bool pprDirectOffsets = hdr.Mode.HasFlag(PfsMode.PprDirectOffsets);
+        if (pprDirectOffsets)
+        {
+            dinodes = new DinodePpr[hdr.DinodeCount];
+            dinodeReader = DinodePpr.ReadFromStream;
+            dinodeSize = (int)DinodePpr.SizeOf;
+        }
+        else if (hdr.Mode.HasFlag(PfsMode.Signed))
         {
             // PS5 signed images use 64-bit block pointers in their inodes.
             if (is64)
@@ -232,17 +255,23 @@ public class PfsReader
         var ret = new Dir() { name = name, parent = parent };
         var ino = dinodes[dinode];
         var postLoad = new List<Func<Dir>>();
-        var blocks = (int)ino.Blocks;
-        if (blocks < 1 || ino.StartBlock < 1 || ino.StartBlock > MAX_BLOCKS || blocks > MAX_BLOCKS)
+        bool pprDirect = ino is DinodePpr;
+        var blocks = pprDirect
+            ? checked((int)Math.Max(1, (ino.Size + hdr.BlockSize - 1) / hdr.BlockSize))
+            : (int)ino.Blocks;
+        long firstOffset = pprDirect ? ((DinodePpr)ino).DataOffset : (long)ino.StartBlock * hdr.BlockSize;
+        if (blocks < 1 || firstOffset < 0
+            || firstOffset / hdr.BlockSize > MAX_BLOCKS || blocks > MAX_BLOCKS)
         {
             throw new Exception($"Inode {dinode} is corrupt. ");
         }
-        foreach (var x in Enumerable.Range(ino.StartBlock, blocks))
+        for (int block = 0; block < blocks; block++)
         {
-            var position = hdr.BlockSize * x;
-            reader.Read(position, sectorBuf, 0, sectorBuf.Length);
+            long blockOffset = checked(firstOffset + (long)block * hdr.BlockSize);
+            long position = blockOffset;
+            reader.Read(blockOffset, sectorBuf, 0, sectorBuf.Length);
             sectorStream.Position = 0;
-            while (position < hdr.BlockSize * (x + 1))
+            while (position < blockOffset + hdr.BlockSize)
             {
                 var dirent = PfsDirent.ReadFromStream(sectorStream);
                 if (dirent.EntSize == 0) break;
@@ -327,7 +356,9 @@ public class PfsReader
         {
             name = name,
             parent = parent,
-            offset = dinodes[dinode].StartBlock * hdr.BlockSize,
+            offset = dinodes[dinode] is DinodePpr ppr
+                ? ppr.DataOffset
+                : (long)dinodes[dinode].StartBlock * hdr.BlockSize,
             size = dinodes[dinode].Size,
             compressed_size = dinodes[dinode].SizeCompressed,
             ino = dinode,

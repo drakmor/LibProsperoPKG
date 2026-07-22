@@ -1,6 +1,7 @@
 // LibProsperoPkg - complete structural access to finalized Prospero packages.
 #nullable enable
 using LibProsperoPkg.PFS;
+using LibProsperoPkg.PFS.Compression;
 using LibProsperoPkg.Util;
 using System;
 using System.Buffers.Binary;
@@ -116,6 +117,55 @@ public static class ProsperoPackageArchive
         return written;
     }
 
+    /// <summary>
+    /// Decrypts the outer filesystem, resolves its NAPS sidecar and expands <c>pfs_image.dat</c> to
+    /// the complete logical inner PPR-PFS image.
+    /// </summary>
+    public static byte[] DecodeInnerPfs(string packagePath, string passcode)
+    {
+        byte[] outerImage = DecryptOuterPfs(packagePath, passcode);
+        ProsperoPkg package = ProsperoPkgReader.Read(packagePath);
+        int outerSuperblock = ResolveSuperblockIndex(package.Fih!, outerImage.Length / OuterBlockSize);
+        using var memory = new MemoryStream(outerImage, writable: false);
+        using var source = new LibProsperoPkg.Util.StreamReader(memory);
+        var outer = new PfsReader(
+            source,
+            superblockOffset: (long)outerSuperblock * OuterBlockSize,
+            encryptedDataAlreadyDecrypted: true);
+        PfsReader.File packedImage = FindFile(outer, "pfs_image.dat");
+        PfsReader.File layoutFile = FindFile(outer, ProsperoNapsLayout.FileName);
+        byte[] packed = packedImage.ReadAllBytes();
+        NapsLayoutDocument layout = ProsperoNapsLayout.Parse(layoutFile.ReadAllBytes());
+        using var packedStream = new MemoryStream(packed, writable: false);
+        using var logical = new MemoryStream();
+        ProsperoNapsImage.Decompress(packedStream, layout, logical);
+        return logical.ToArray();
+    }
+
+    /// <summary>Extracts every file from the NAPS-decoded inner PPR-PFS image.</summary>
+    public static IReadOnlyList<string> ExtractInnerFiles(
+        string packagePath, string outputDirectory, string passcode, bool decompressFiles = true)
+    {
+        byte[] innerImage = DecodeInnerPfs(packagePath, passcode);
+        int superblockOffset = ProsperoImageDigests.LocateSuperblock(innerImage);
+        if (superblockOffset < 0)
+            throw new InvalidDataException("The NAPS logical stream does not contain an inner PPR-PFS superblock.");
+        using var memory = new MemoryStream(innerImage, writable: false);
+        using var source = new LibProsperoPkg.Util.StreamReader(memory);
+        var inner = new PfsReader(source, superblockOffset: superblockOffset, encryptedDataAlreadyDecrypted: true);
+        Directory.CreateDirectory(outputDirectory);
+        var written = new List<string>();
+        foreach (PfsReader.File file in inner.GetAllFiles())
+        {
+            string relative = NormalizeRelativePath(file.FullName);
+            string target = SafeTarget(outputDirectory, relative);
+            Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+            file.Save(target, decompressFiles);
+            written.Add(relative);
+        }
+        return written;
+    }
+
     public static IReadOnlyList<string> ExtractCntEntries(string packagePath, string outputDirectory, bool includeEncrypted = true)
     {
         using var input = File.OpenRead(packagePath);
@@ -152,6 +202,13 @@ public static class ProsperoPackageArchive
         long index = checked((long)fih.InnerImageBlockCount + napsBlocks);
         if (index < 0 || index >= blocks) throw new InvalidDataException("FIH-derived outer superblock index is out of range.");
         return (int)index;
+    }
+
+    private static PfsReader.File FindFile(PfsReader pfs, string name)
+    {
+        PfsReader.File? result = pfs.GetAllFiles().FirstOrDefault(
+            file => string.Equals(Path.GetFileName(file.FullName), name, StringComparison.Ordinal));
+        return result ?? throw new InvalidDataException($"Outer PFS does not contain {name}.");
     }
 
     private static void ValidateSuperblockShape(ReadOnlySpan<byte> sb, int blocks)

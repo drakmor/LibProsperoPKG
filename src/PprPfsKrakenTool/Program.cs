@@ -47,9 +47,13 @@ internal static class Program
                 "verify-phuc" => VerifyPhuc(args),
                 "verify" => VerifyFolder(args),
                 "inspect-naps" => InspectNaps(args),
+                "dump-naps" => DumpNaps(args),
+                "plan-naps" => PlanNaps(args),
+                "decompress-naps" => DecompressNaps(args),
                 "roundtrip-naps" => RoundTripNaps(args),
                 "inspect-pkg" => InspectPackage(args),
                 "extract-pkg-outer" => ExtractPackageOuter(args),
+                "extract-pkg-inner" => ExtractPackageInner(args),
                 "extract-pkg-cnt" => ExtractPackageCnt(args),
                 "selftest" => SelfTest(args),
                 _ => throw new ArgumentException($"Unknown command: {args[0]}")
@@ -69,6 +73,53 @@ internal static class Program
         Console.WriteLine($"files={document.Counts.NumFiles} compression={document.Counts.CompressionType} keys={document.Counts.NumKeys}");
         Console.WriteLine($"ublocks={document.Counts.UBlockCount} outer={document.Counts.NumOuterBlocks} cblockInfo={document.Counts.NumCblockInfo}");
         Console.WriteLine($"layout-size=0x{document.Map.TotalSize:x} footer={document.TrailingZeroBytes}");
+        return 0;
+    }
+
+    private static int DumpNaps(string[] args)
+    {
+        if (args.Length != 2) throw new ArgumentException("dump-naps requires <naps_pkg_layout.dat>.");
+        NapsLayoutDocument document = ProsperoNapsLayout.Parse(File.ReadAllBytes(args[1]));
+        for (int i = 0; i < document.FileOffsets.Count; i++)
+            Console.WriteLine($"file[{i}] type=0x{document.FileOffsets[i].Type:x2} uoff=0x{document.FileOffsets[i].UncompressedOffsetStart:x}");
+        for (int i = 0; i < document.CblockInfos.Count; i++)
+        {
+            NapsCblockInfoEntry c = document.CblockInfos[i];
+            Console.WriteLine(c.IsRunBase
+                ? $"cbi[{i}] run end=0x{c.CoffsetEndMod256K:x} tweak=0x{c.TweakIdxStart:x} key={c.KeyTableIdx} base=0x{c.CoffsetStart256K:x}"
+                : $"cbi[{i}] block coff=0x{c.CoffsetStartMod256K:x} uoff=0x{c.UoffsetStart:x} clen=0x{c.ClenEvenMinus1 + 1:x} even={c.Even} odd={c.Odd} kde={c.KdePredictor} shuffle={c.ShuffleIdx}");
+        }
+        return 0;
+    }
+
+    private static int PlanNaps(string[] args)
+    {
+        if (args.Length != 2) throw new ArgumentException("plan-naps requires <naps_pkg_layout.dat>.");
+        NapsLayoutDocument document = ProsperoNapsLayout.Parse(File.ReadAllBytes(args[1]));
+        ProsperoNapsPlan plan = ProsperoNapsImage.BuildPlan(document);
+        foreach (ProsperoNapsSpan span in plan.Spans)
+        {
+            Console.WriteLine(
+                $"span[{span.Index}] cbi={span.CblockInfoIndex} "
+                + $"stored=0x{span.StoredOffset:x}+0x{span.CompressedLength:x} "
+                + $"logical=0x{span.UncompressedOffset:x}+0x{span.UncompressedLength:x} "
+                + $"first=0x{span.FirstChunkCompressedLength:x} "
+                + $"tweak={span.TweakIndex} key={span.KeyTableIndex} "
+                + $"even={span.Even} odd={span.Odd}");
+        }
+        Console.WriteLine($"logical-size=0x{plan.UncompressedSize:x} files={plan.Files.Count} spans={plan.Spans.Count}");
+        return 0;
+    }
+
+    private static int DecompressNaps(string[] args)
+    {
+        if (args.Length != 4)
+            throw new ArgumentException("decompress-naps requires <pfs_image.dat> <naps_pkg_layout.dat> <output>.");
+        NapsLayoutDocument document = ProsperoNapsLayout.Parse(File.ReadAllBytes(args[2]));
+        using var source = File.OpenRead(args[1]);
+        using var output = File.Create(args[3]);
+        ProsperoNapsImage.Decompress(source, document, output);
+        Console.WriteLine($"decompressed 0x{output.Length:x} bytes");
         return 0;
     }
 
@@ -102,6 +153,15 @@ internal static class Program
         string passcode = args.Length == 4 ? args[3] : new string('0', 32);
         IReadOnlyList<string> files = ProsperoPackageArchive.ExtractOuterFiles(args[1], args[2], passcode);
         Console.WriteLine($"extracted {files.Count} outer-PFS files");
+        return 0;
+    }
+
+    private static int ExtractPackageInner(string[] args)
+    {
+        if (args.Length is < 3 or > 4) throw new ArgumentException("extract-pkg-inner requires <package.pkg> <output-dir> [passcode].");
+        string passcode = args.Length == 4 ? args[3] : new string('0', 32);
+        IReadOnlyList<string> files = ProsperoPackageArchive.ExtractInnerFiles(args[1], args[2], passcode);
+        Console.WriteLine($"extracted {files.Count} inner PPR-PFS files");
         return 0;
     }
 
@@ -1018,9 +1078,13 @@ internal static class Program
         Console.WriteLine("  verify-phuc <image.phuc>");
         Console.WriteLine("  verify <source-folder> [the same build options]");
         Console.WriteLine("  inspect-naps <naps_pkg_layout.dat>");
+        Console.WriteLine("  dump-naps <naps_pkg_layout.dat>");
+        Console.WriteLine("  plan-naps <naps_pkg_layout.dat>");
+        Console.WriteLine("  decompress-naps <pfs_image.dat> <naps_pkg_layout.dat> <output>");
         Console.WriteLine("  roundtrip-naps <input> <output>");
         Console.WriteLine("  inspect-pkg <package.pkg>");
         Console.WriteLine("  extract-pkg-outer <package.pkg> <output-dir> [passcode]");
+        Console.WriteLine("  extract-pkg-inner <package.pkg> <output-dir> [passcode]");
         Console.WriteLine("  extract-pkg-cnt <package.pkg> <output-dir>");
         Console.WriteLine("  selftest");
         Console.WriteLine("  Levels: Kraken -4..9 (default 8), zlib 0..9 (default 9).");

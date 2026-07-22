@@ -72,7 +72,7 @@ namespace LibProsperoPkg.PKG;
 /// Section counts of a <c>naps_pkg_layout.dat</c> structure. Every count is the number of records
 /// in the matching section; the strides are fixed and validated (see <see cref="ProsperoNapsLayout"/>).
 /// </summary>
-/// <param name="NumFiles">Files in the package (<c>m_numFilesMinus1 + 1</c>).</param>
+/// <param name="NumFiles">fidx records (<c>m_numFilesMinus1 + 1</c>), including the final boundary record.</param>
 /// <param name="CompressionType">Oodle codec selector (<c>m_compressionType</c>).</param>
 /// <param name="NumKeys">Encryption keys (<c>m_numKeysMinus1 + 1</c>).</param>
 /// <param name="NumShufflePatterns">Shuffle-pattern entries (0 = no shuffling).</param>
@@ -88,6 +88,9 @@ public readonly record struct NapsLayoutCounts(
     int NumOuterBlocks,
     int NumCblockInfo)
 {
+    /// <summary>Number of logical file ranges; fidx carries one additional terminal boundary.</summary>
+    public int LogicalFileCount => checked(NumFiles - 1);
+
     /// <summary>Actual number of uncompressed blocks represented by the inclusive maximum index.</summary>
     public int UBlockCount => checked(NumUBlocks + 1);
 
@@ -179,13 +182,16 @@ public readonly record struct NapsCblockInfoEntry
     /// <summary><c>m_coffsetStartMod256K</c> (18 bits). Model bit-offset.</summary>
     public uint CoffsetStartMod256K { get; init; }
 
-    /// <summary>Raw bit 19 between the discriminator and length field; preserved for lossless tooling.</summary>
+    /// <summary>Terminal/sentinel marker at bit 19. Terminal entries are boundaries, not data spans.</summary>
     public bool ReservedBit19 { get; init; }
 
-    /// <summary><c>m_uoffsetStart</c> (17 bits, bits 38..54).</summary>
+    /// <summary>True when this normal-format record is the terminal compressed-stream boundary.</summary>
+    public bool IsTerminal => !IsRunBase && ReservedBit19;
+
+    /// <summary><c>m_uoffsetStart</c> (18 bits, bits 20..37).</summary>
     public uint UoffsetStart { get; init; }
 
-    /// <summary><c>m_clenEvenMinus1</c> (18 bits, bits 20..37).</summary>
+    /// <summary><c>m_clenEvenMinus1</c> (17 bits, bits 38..54).</summary>
     public uint ClenEvenMinus1 { get; init; }
 
     /// <summary><c>m_even</c> (3 bits, bits 55..57).</summary>
@@ -454,8 +460,8 @@ public static class ProsperoNapsLayout
                 IsRunBase = false,
                 CoffsetStartMod256K = coffsetMod256K,
                 ReservedBit19 = ((bits >> 19) & 1) != 0,
-                ClenEvenMinus1 = (uint)((bits >> 20) & 0x3FFFF),
-                UoffsetStart = (uint)((bits >> 38) & 0x1FFFF),
+                UoffsetStart = (uint)((bits >> 20) & 0x3FFFF),
+                ClenEvenMinus1 = (uint)((bits >> 38) & 0x1FFFF),
                 Even = (byte)((bits >> 55) & 0x7),
                 Odd = (byte)((bits >> 58) & 0x7),
                 KdePredictor = (byte)((bits >> 61) & 0x3F),
@@ -642,15 +648,15 @@ public static class ProsperoNapsLayout
         UInt128 bits = (entry.IsRunBase ? entry.CoffsetEndMod256K : entry.CoffsetStartMod256K) & 0x3FFFF;
         if (!entry.IsRunBase)
         {
-            RequireFits(entry.ClenEvenMinus1, 18, nameof(entry.ClenEvenMinus1));
-            RequireFits(entry.UoffsetStart, 17, nameof(entry.UoffsetStart));
+            RequireFits(entry.UoffsetStart, 18, nameof(entry.UoffsetStart));
+            RequireFits(entry.ClenEvenMinus1, 17, nameof(entry.ClenEvenMinus1));
             RequireFits(entry.Even, 3, nameof(entry.Even));
             RequireFits(entry.Odd, 3, nameof(entry.Odd));
             RequireFits(entry.KdePredictor, 6, nameof(entry.KdePredictor));
             RequireFits(entry.ShuffleIdx, 4, nameof(entry.ShuffleIdx));
             if (entry.ReservedBit19) bits |= (UInt128)1 << 19;
-            bits |= (UInt128)entry.ClenEvenMinus1 << 20;
-            bits |= (UInt128)entry.UoffsetStart << 38;
+            bits |= (UInt128)entry.UoffsetStart << 20;
+            bits |= (UInt128)entry.ClenEvenMinus1 << 38;
             bits |= (UInt128)entry.Even << 55;
             bits |= (UInt128)entry.Odd << 58;
             bits |= (UInt128)entry.KdePredictor << 61;
@@ -699,9 +705,18 @@ public static class ProsperoNapsLayout
         {
             NapsU2cEntry group = document.CblockInfoOffsetByUblock[block >> 3];
             uint index = block % 8 == 0 ? group.InfoOffset9BBase : checked(group.InfoOffset9BBase + group.DeltaFromBase[(block & 7) - 1]);
-            if (index >= document.CblockInfos.Count || document.CblockInfos[(int)index].IsRunBase)
+            if (index >= document.CblockInfos.Count
+                || document.CblockInfos[(int)index].IsRunBase
+                || document.CblockInfos[(int)index].IsTerminal)
                 throw new InvalidDataException($"NAPS ublock {block} has an invalid CblockInfo reference.");
         }
+
+        int terminalCount = 0;
+        foreach (NapsCblockInfoEntry entry in document.CblockInfos)
+            if (entry.IsTerminal)
+                terminalCount++;
+        if (terminalCount != 1 || !document.CblockInfos[^1].IsTerminal)
+            throw new InvalidDataException("NAPS CblockInfo must end in exactly one terminal boundary.");
     }
 
     private static long AlignUp(long value, int alignment) => checked((value + alignment - 1) / alignment * alignment);
