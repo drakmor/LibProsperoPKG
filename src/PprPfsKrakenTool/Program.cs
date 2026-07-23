@@ -1,4 +1,5 @@
 using LibProsperoPkg;
+using LibProsperoPkg.GP5;
 using LibProsperoPkg.PFS;
 using LibProsperoPkg.PFS.Compression;
 using LibProsperoPkg.PKG;
@@ -11,6 +12,7 @@ using System.IO;
 using System.IO.MemoryMappedFiles;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Text;
 
 namespace PprPfsKrakenTool;
 
@@ -47,10 +49,17 @@ internal static class Program
                 "unpack" => UnpackFile(args),
                 "list" => ListPfs(args),
                 "inspect-file" => InspectPfsFile(args),
+                "hash-flt" => HashFlatPath(args),
                 "verify-phuc" => VerifyPhuc(args),
                 "verify" => VerifyFolder(args),
                 "inspect-naps" => InspectNaps(args),
+                "inspect-naps-meta18" => InspectNapsMeta18(args),
+                "decrypt-naps-meta18" => DecryptNapsMeta18(args),
+                "check-naps-meta18-obcc" => CheckNapsMeta18Obcc(args),
                 "dump-naps" => DumpNaps(args),
+                "check-naps-cmac" => CheckNapsCmac(args),
+                "encode-dds" => EncodeDds(args),
+                "roundtrip-gp5" => RoundTripGp5(args),
                 "plan-naps" => PlanNaps(args),
                 "decompress-naps" => DecompressNaps(args),
                 "pack-naps" => PackNaps(args),
@@ -58,9 +67,14 @@ internal static class Program
                 "inspect-pkg" => InspectPackage(args),
                 "extract-pkg-outer" => ExtractPackageOuter(args),
                 "dump-pkg-outer" => DumpPackageOuter(args),
+                "check-pkg-fih" => CheckPackageFih(args),
                 "check-pkg-imagedigs" => CheckPackageImageDigests(args),
+                "check-pkg-signature" => CheckPackageSignature(args),
+                "resign-pkg" => ResignPackage(args),
                 "extract-pkg-inner" => ExtractPackageInner(args),
                 "extract-pkg-cnt" => ExtractPackageCnt(args),
+                "extract-pkg-si" => ExtractPackageSi(args),
+                "probe-entry-crypto" => ProbeEntryCrypto(args),
                 "selftest" => SelfTest(args),
                 _ => throw new ArgumentException($"Unknown command: {args[0]}")
             };
@@ -68,8 +82,40 @@ internal static class Program
         catch (Exception exception)
         {
             Console.Error.WriteLine("error: " + exception.Message);
+            if (string.Equals(
+                    Environment.GetEnvironmentVariable("LIBPROSPERO_TRACE"),
+                    "1",
+                    StringComparison.Ordinal))
+                Console.Error.WriteLine(exception);
             return 1;
         }
+    }
+
+    private static int EncodeDds(string[] args)
+    {
+        if (args.Length != 3)
+            throw new ArgumentException("encode-dds requires <input.png> <output.dds>.");
+
+        byte[] dds = ProsperoDdsEncoder.EncodePngToDds(File.ReadAllBytes(args[1]));
+        string? directory = Path.GetDirectoryName(Path.GetFullPath(args[2]));
+        if (!string.IsNullOrEmpty(directory))
+            Directory.CreateDirectory(directory);
+        File.WriteAllBytes(args[2], dds);
+        Console.WriteLine($"DDS BC7 written: {args[2]} ({dds.Length} bytes)");
+        return 0;
+    }
+
+    private static int RoundTripGp5(string[] args)
+    {
+        if (args.Length != 3)
+            throw new ArgumentException("roundtrip-gp5 requires <input.gp5> <output.gp5>.");
+
+        Gp5Project project = Gp5Project.ReadFrom(args[1]);
+        Gp5Project.WriteTo(project, args[2]);
+        Console.WriteLine(
+            $"GP5 written: type={project.Volume.Type}, layout={project.Layout}, " +
+            $"files={project.Files.Count}, chunks={project.Volume.ChunkInfo?.Chunks.Count ?? 0}");
+        return 0;
     }
 
     private static int InspectNaps(string[] args)
@@ -84,11 +130,103 @@ internal static class Program
         return 0;
     }
 
+    private static int InspectNapsMeta18(string[] args)
+    {
+        if (args.Length != 2)
+            throw new ArgumentException("inspect-naps-meta18 requires <naps_meta_18.dat>.");
+
+        byte[] plain = ProsperoNapsMeta.DecryptMeta18(File.ReadAllBytes(args[1]));
+        int offset = 0;
+        int records = 0;
+        while (offset < plain.Length)
+        {
+            if (plain.Length - offset < 16)
+                throw new InvalidDataException($"Truncated meta18 record header at 0x{offset:X}.");
+            string tag = new string(
+            [
+                (char)plain[offset + 3],
+                (char)plain[offset + 2],
+                (char)plain[offset + 1],
+                (char)plain[offset],
+            ]);
+            byte version = plain[offset + 4];
+            ulong length = BinaryPrimitives.ReadUInt64LittleEndian(plain.AsSpan(offset + 8, 8));
+            if (length > (ulong)(plain.Length - offset - 16))
+                throw new InvalidDataException(
+                    $"Meta18 record '{tag}' at 0x{offset:X} exceeds the file: length=0x{length:X}.");
+            Console.WriteLine(
+                $"record[{records}] tag={tag} version={version} offset=0x{offset:X} size=0x{length:X}");
+            offset = checked(offset + 16 + (int)length);
+            records++;
+        }
+        Console.WriteLine($"records={records} plaintext-size=0x{plain.Length:X}");
+        return 0;
+    }
+
+    private static int DecryptNapsMeta18(string[] args)
+    {
+        if (args.Length != 3)
+            throw new ArgumentException(
+                "decrypt-naps-meta18 requires <naps_meta_18.dat> <plaintext-output>.");
+        byte[] plain = ProsperoNapsMeta.DecryptMeta18(File.ReadAllBytes(args[1]));
+        File.WriteAllBytes(args[2], plain);
+        Console.WriteLine($"decrypted 0x{plain.Length:X} bytes");
+        return 0;
+    }
+
+    private static int CheckNapsMeta18Obcc(string[] args)
+    {
+        if (args.Length != 3)
+            throw new ArgumentException(
+                "check-naps-meta18-obcc requires <naps_meta_18.dat> <pfs_image.dat>.");
+        byte[] plain = ProsperoNapsMeta.DecryptMeta18(File.ReadAllBytes(args[1]));
+        byte[] expected = FindMeta18Record(plain, "obcc");
+        byte[] expectedDigests = FindMeta18Record(plain, "obdg");
+        byte[] image = File.ReadAllBytes(args[2]);
+        int blocks = checked((image.Length + 0xFFFF) / 0x10000);
+        if (expected.Length != blocks * 4)
+            throw new InvalidDataException(
+                $"obcc contains {expected.Length / 4} records, while pfs_image.dat contains {blocks} blocks.");
+        if (expectedDigests.Length != blocks * 32)
+            throw new InvalidDataException(
+                $"obdg contains {expectedDigests.Length / 32} records, while pfs_image.dat contains {blocks} blocks.");
+
+        int matches = 0;
+        int digestMatches = 0;
+        for (int i = 0; i < blocks; i++)
+        {
+            int offset = i * 0x10000;
+            int size = Math.Min(0x10000, image.Length - offset);
+            uint actual = ProsperoCrc32C.Compute(image.AsSpan(offset, size));
+            uint wanted = BinaryPrimitives.ReadUInt32LittleEndian(expected.AsSpan(i * 4, 4));
+            byte[] digest = ProsperoImageDigests.Sha3_256(image.AsSpan(offset, size));
+            if (digest.AsSpan().SequenceEqual(expectedDigests.AsSpan(i * 32, 32)))
+                digestMatches++;
+            if (actual == wanted)
+                matches++;
+            else if (i < 8)
+                Console.WriteLine($"obcc[{i}] expected=0x{wanted:X8} crc32c=0x{actual:X8}");
+        }
+        Console.WriteLine(
+            $"obcc-blocks={blocks} crc32c-matches={matches} mismatches={blocks - matches} " +
+            $"obdg-sha3-matches={digestMatches}");
+        return matches == blocks ? 0 : 1;
+    }
+
+    private static int HashFlatPath(string[] args)
+    {
+        if (args.Length < 2)
+            throw new ArgumentException("hash-flt requires one or more paths.");
+        foreach (string path in args.Skip(1))
+            Console.WriteLine($"{path}=0x{ProsperoPs5FlatPathTable.HashPath(path):x16}");
+        return 0;
+    }
+
     private static int BuildPackage(string[] args)
     {
-        if (args.Length is < 5 or > 7)
+        if (args.Length is < 5 or > 11)
             throw new ArgumentException(
-                "build-pkg requires <source-dir> <output-dir> <content-id> <app|ac|al> [passcode] [naps-cmac-key-hex].");
+                "build-pkg requires <source-dir> <output-dir> <content-id> <app|ac|al> [passcode] [naps-cmac-key-hex|-] [naps-meta-18-file|-] [metadata-private-key.pem|-] [outer-pfs-seed-hex|-] [deterministic].");
         ProsperoPackageMode mode = args[4].ToLowerInvariant() switch
         {
             "app" => ProsperoPackageMode.Application,
@@ -96,7 +234,20 @@ internal static class Program
             "al" => ProsperoPackageMode.AdditionalContentNoData,
             _ => throw new ArgumentException("Package mode must be app, ac, or al."),
         };
-        byte[]? cmac = args.Length == 7 ? Convert.FromHexString(args[6]) : null;
+        byte[]? cmac = args.Length >= 7 && args[6] != "-" ? Convert.FromHexString(args[6]) : null;
+        byte[]? napsMeta18 = args.Length >= 8 && args[7] != "-" ? File.ReadAllBytes(args[7]) : null;
+        using ProsperoRsaMetadataSigner? metadataSigner = args.Length >= 9 && args[8] != "-"
+            ? ProsperoRsaMetadataSigner.LoadPem(args[8])
+            : null;
+        byte[]? outerPfsSeed = args.Length >= 10 && args[9] != "-"
+            ? Convert.FromHexString(args[9])
+            : null;
+        bool deterministic = args.Length == 11 &&
+            string.Equals(args[10], "deterministic", StringComparison.OrdinalIgnoreCase);
+        if (args.Length == 11 && !deterministic)
+            throw new ArgumentException("The final build-pkg argument must be 'deterministic'.");
+        if (outerPfsSeed is { Length: not 16 })
+            throw new ArgumentException("Outer PFS seed must decode to exactly 16 bytes.");
         var result = ProsperoPackageBuilder.Build(
             new ProsperoBuildOptions
             {
@@ -108,6 +259,10 @@ internal static class Program
                 Passcode = args.Length >= 6 ? args[5] : new string('0', 32),
                 UsePublisherPprNaps = true,
                 NapsOuterBlockCmacKey = cmac,
+                NapsMeta18 = napsMeta18,
+                MetadataSigner = metadataSigner,
+                OuterPfsSeed = outerPfsSeed,
+                DeterministicBuild = deterministic,
             },
             Console.WriteLine);
         Console.WriteLine(result.OutputPath);
@@ -121,6 +276,12 @@ internal static class Program
         NapsLayoutDocument document = ProsperoNapsLayout.Parse(File.ReadAllBytes(args[1]));
         for (int i = 0; i < document.FileOffsets.Count; i++)
             Console.WriteLine($"file[{i}] type=0x{document.FileOffsets[i].Type:x2} uoff=0x{document.FileOffsets[i].UncompressedOffsetStart:x}");
+        for (int i = 0; i < document.CblockInfoOffsetByUblock.Count; i++)
+        {
+            NapsU2cEntry u = document.CblockInfoOffsetByUblock[i];
+            Console.WriteLine($"u2c[{i}] base={u.InfoOffset9BBase} indexes=" +
+                string.Join(',', u.StartCblockInfoIndex));
+        }
         for (int i = 0; i < document.CblockInfos.Count; i++)
         {
             NapsCblockInfoEntry c = document.CblockInfos[i];
@@ -128,7 +289,44 @@ internal static class Program
                 ? $"cbi[{i}] run end=0x{c.CoffsetEndMod256K:x} tweak=0x{c.TweakIdxStart:x} key={c.KeyTableIdx} base=0x{c.CoffsetStart256K:x}"
                 : $"cbi[{i}] block coff=0x{c.CoffsetStartMod256K:x} uoff=0x{c.UoffsetStart:x} clen=0x{c.ClenEvenMinus1 + 1:x} even={c.Even} odd={c.Odd} kde={c.KdePredictor} shuffle={c.ShuffleIdx}");
         }
+        for (int i = 0; i < document.OuterBlockDigests.Count; i++)
+            Console.WriteLine($"outer-cmac[{i}]={Convert.ToHexString(document.OuterBlockDigests[i]).ToLowerInvariant()}");
         return 0;
+    }
+
+    private static int CheckNapsCmac(string[] args)
+    {
+        if (args.Length != 4)
+            throw new ArgumentException(
+                "check-naps-cmac requires <naps_pkg_layout.dat> <pfs_image.dat> <16-byte-key-hex>.");
+
+        NapsLayoutDocument document = ProsperoNapsLayout.Parse(File.ReadAllBytes(args[1]));
+        byte[] image = File.ReadAllBytes(args[2]);
+        byte[] key = Convert.FromHexString(args[3]);
+        if (key.Length != 16)
+            throw new ArgumentException("NAPS CMAC key must decode to exactly 16 bytes.");
+
+        int blockSize = ProsperoNapsImage.OuterBlockSize;
+        int physicalBlocks = checked((image.Length + blockSize - 1) / blockSize);
+        if (physicalBlocks != document.Counts.NumOuterBlocks)
+            throw new InvalidDataException(
+                $"pfs_image.dat has {physicalBlocks} outer blocks, layout declares {document.Counts.NumOuterBlocks}.");
+
+        int matches = 0;
+        for (int i = 0; i < physicalBlocks; i++)
+        {
+            int offset = i * blockSize;
+            int available = Math.Min(blockSize, image.Length - offset);
+            byte[] padded = new byte[blockSize];
+            image.AsSpan(offset, available).CopyTo(padded);
+            byte[] actual = ProsperoNapsImage.ComputeOuterBlockDigest(padded, key);
+            if (document.OuterBlockDigests[i].AsSpan().SequenceEqual(actual))
+                matches++;
+        }
+
+        Console.WriteLine(
+            $"outer-blocks={physicalBlocks} cmac-matches={matches} cmac-mismatches={physicalBlocks - matches}");
+        return matches == physicalBlocks ? 0 : 1;
     }
 
     private static int PlanNaps(string[] args)
@@ -254,6 +452,133 @@ internal static class Program
         }
     }
 
+    private static int CheckPackageFih(string[] args)
+    {
+        if (args.Length is < 2 or > 3)
+            throw new ArgumentException("Usage: check-pkg-fih <package.pkg> [passcode]");
+        string passcode = args.Length == 3 ? args[2] : new string('0', 32);
+        byte[] package = File.ReadAllBytes(args[1]);
+        if (package.Length < ProsperoPkgLayout.FihHeaderRegionSize)
+            throw new InvalidDataException("Package is too short to contain a FIH header.");
+
+        ulong superblockOffset = BinaryPrimitives.ReadUInt64LittleEndian(package.AsSpan(0x20));
+        ulong superblockSize = BinaryPrimitives.ReadUInt64LittleEndian(package.AsSpan(0x28));
+        ulong outerOffset = BinaryPrimitives.ReadUInt64LittleEndian(package.AsSpan(0x10));
+        ulong outerSize = BinaryPrimitives.ReadUInt64LittleEndian(package.AsSpan(0x18));
+        if (superblockSize > int.MaxValue || superblockOffset + superblockSize > (ulong)package.Length)
+            throw new InvalidDataException("FIH superblock range is outside the package.");
+
+        ReadOnlySpan<byte> expectedGame = package.AsSpan(0x30, 32);
+        byte[] rawGame = ProsperoImageDigests.Sha3_256(
+            package.AsSpan(checked((int)superblockOffset), checked((int)superblockSize)));
+        byte[] plainOuter = ProsperoPackageArchive.DecryptOuterPfs(args[1], passcode);
+        ulong relative = checked(superblockOffset - outerOffset);
+        if (relative + superblockSize > (ulong)plainOuter.Length || outerSize > (ulong)plainOuter.Length)
+            throw new InvalidDataException("FIH superblock range is outside the decrypted outer PFS.");
+        byte[] plainGame = ProsperoImageDigests.Sha3_256(
+            plainOuter.AsSpan(checked((int)relative), checked((int)superblockSize)));
+
+        Console.WriteLine(
+            $"game-digest raw={expectedGame.SequenceEqual(rawGame)} plaintext={expectedGame.SequenceEqual(plainGame)} " +
+            $"copies70={expectedGame.SequenceEqual(package.AsSpan(0x70, 32))} " +
+            $"copiesd0={expectedGame.SequenceEqual(package.AsSpan(0xd0, 32))}");
+
+        ulong cntOffset = BinaryPrimitives.ReadUInt64LittleEndian(package.AsSpan(0x58));
+        if (cntOffset + 0x5a0 > (ulong)package.Length)
+            throw new InvalidDataException("FIH CNT offset is outside the package.");
+        ReadOnlySpan<byte> cntTail = package.AsSpan(checked((int)cntOffset));
+        ulong cntSize = BinaryPrimitives.ReadUInt64BigEndian(cntTail.Slice(0x4b8, 8));
+        if (cntSize < 0x1180 || cntSize > (ulong)cntTail.Length || cntSize > int.MaxValue)
+            throw new InvalidDataException("CNT region size is outside the package.");
+        ReadOnlySpan<byte> cnt = cntTail[..checked((int)cntSize)];
+        byte[] fixedInfo = ProsperoImageDigests.ComputeFixedInfoDigest(
+            package.AsSpan(0, ProsperoPkgLayout.FihHeaderRegionSize));
+        byte[] packageDigest = ProsperoImageDigests.ComputePackageDigest(cnt);
+        byte[] rollup = ProsperoImageDigests.ComputeCntHeaderRollupDigest(cnt);
+        Console.WriteLine(
+            $"cnt-pfs-digest={expectedGame.SequenceEqual(cnt.Slice(0x440, 32))} " +
+            $"cnt-fixed-digest={fixedInfo.AsSpan().SequenceEqual(cnt.Slice(0x460, 32))} " +
+            $"cnt-package-digest={packageDigest.AsSpan().SequenceEqual(cnt.Slice(0xfe0, 32))} " +
+            $"cnt-rollup={rollup.AsSpan().SequenceEqual(cnt.Slice(0x100, 32))}");
+
+        uint imageKeyOffset = BinaryPrimitives.ReadUInt32BigEndian(cnt.Slice(0x510, 4));
+        uint imageKeySize = BinaryPrimitives.ReadUInt32BigEndian(cnt.Slice(0x514, 4));
+        uint mandatoryOffset = BinaryPrimitives.ReadUInt32BigEndian(cnt.Slice(0x518, 4));
+        uint mandatorySize = BinaryPrimitives.ReadUInt32BigEndian(cnt.Slice(0x51c, 4));
+        bool descriptorRangesValid = imageKeyOffset <= cnt.Length && imageKeySize <= cnt.Length - imageKeyOffset
+            && mandatoryOffset <= cnt.Length && mandatorySize <= cnt.Length - mandatoryOffset;
+        bool descriptorDigestValid = false;
+        if (descriptorRangesValid)
+        {
+            byte[] descriptorDigest = new byte[64];
+            ProsperoImageDigests.Sha3_256(cnt.Slice((int)imageKeyOffset, (int)imageKeySize)).CopyTo(descriptorDigest, 0);
+            ProsperoImageDigests.Sha3_256(cnt.Slice((int)mandatoryOffset, (int)mandatorySize)).CopyTo(descriptorDigest, 32);
+            descriptorDigestValid = descriptorDigest.AsSpan().SequenceEqual(cnt.Slice(0x520, 64));
+        }
+        bool seedValid = cnt.Slice(0x4a0, 16).SequenceEqual(
+            plainOuter.AsSpan(checked((int)relative + 0x370), 16));
+        Console.WriteLine(
+            $"cnt-image-seed={seedValid} descriptor-ranges={descriptorRangesValid} " +
+            $"descriptor-digest={descriptorDigestValid} rsa3072={ProsperoPackageArchive.VerifyCntMetadataSignature(args[1])}");
+
+        string temporary = Path.Combine(Path.GetTempPath(), "libprospero-fih-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            ProsperoPackageArchive.ExtractOuterFiles(args[1], temporary, passcode);
+            string layoutPath = Path.Combine(temporary, "uroot", ProsperoNapsLayout.FileName);
+            byte[] layout = File.ReadAllBytes(layoutPath);
+            ulong recordedLength = BinaryPrimitives.ReadUInt64LittleEndian(package.AsSpan(0xa8));
+            byte[] nestedDigest = ProsperoImageDigests.Sha3_256(layout);
+            Console.WriteLine(
+                $"nested-size=0x{recordedLength:x}/0x{layout.Length:x} " +
+                $"nested-digest={package.AsSpan(0xb0, 32).SequenceEqual(nestedDigest)}");
+        }
+        finally
+        {
+            if (Directory.Exists(temporary)) Directory.Delete(temporary, recursive: true);
+        }
+        return 0;
+    }
+
+    private static int CheckPackageSignature(string[] args)
+    {
+        if (args.Length != 2)
+            throw new ArgumentException("check-pkg-signature requires <package.pkg>.");
+        bool valid = ProsperoPackageArchive.VerifyCntMetadataSignature(args[1]);
+        Console.WriteLine($"cnt-metadata-signature={(valid ? "valid" : "invalid")}");
+        return valid ? 0 : 2;
+    }
+
+    private static int ResignPackage(string[] args)
+    {
+        if (args.Length != 3)
+            throw new ArgumentException("resign-pkg requires <input.pkg> <output.pkg>.");
+        string input = Path.GetFullPath(args[1]);
+        string output = Path.GetFullPath(args[2]);
+        if (string.Equals(input, output, StringComparison.OrdinalIgnoreCase))
+            throw new ArgumentException("Input and output package paths must be different.");
+
+        byte[] fih = new byte[ProsperoPkgLayout.FihHeaderRegionSize];
+        using (var source = File.OpenRead(input))
+            source.ReadExactly(fih);
+        ulong cntOffset = BinaryPrimitives.ReadUInt64LittleEndian(fih.AsSpan(0x58, 8));
+        if (cntOffset > long.MaxValue)
+            throw new InvalidDataException("FIH CNT offset exceeds the supported file range.");
+
+        File.Copy(input, output, overwrite: true);
+        using var package = new FileStream(output, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+        if ((ulong)package.Length < cntOffset + 0x1180)
+            throw new InvalidDataException("Embedded CNT header/signature is outside the package.");
+        package.Position = (long)cntOffset;
+        byte[] signedHeader = new byte[0x1000];
+        package.ReadExactly(signedHeader);
+        byte[] signature = ProsperoPkgSigner.SignDigest(Crypto.Sha256(signedHeader));
+        package.Position = checked((long)cntOffset + 0x1000);
+        package.Write(signature);
+        Console.WriteLine($"resigned CNT+0x1000 with RSA-3072: {output}");
+        return 0;
+    }
+
     private static int ExtractPackageInner(string[] args)
     {
         if (args.Length is < 3 or > 4) throw new ArgumentException("extract-pkg-inner requires <package.pkg> <output-dir> [passcode].");
@@ -265,9 +590,65 @@ internal static class Program
 
     private static int ExtractPackageCnt(string[] args)
     {
-        if (args.Length != 3) throw new ArgumentException("extract-pkg-cnt requires <package.pkg> <output-dir>.");
-        IReadOnlyList<string> files = ProsperoPackageArchive.ExtractCntEntries(args[1], args[2]);
-        Console.WriteLine($"extracted {files.Count} CNT entries (encrypted entries remain raw)");
+        if (args.Length is < 3 or > 4)
+            throw new ArgumentException("extract-pkg-cnt requires <package.pkg> <output-dir> [passcode].");
+        IReadOnlyList<string> files = args.Length == 4
+            ? ProsperoPackageArchive.ExtractCntEntries(args[1], args[2], args[3])
+            : ProsperoPackageArchive.ExtractCntEntries(args[1], args[2]);
+        Console.WriteLine(args.Length == 4
+            ? $"extracted {files.Count} CNT entries (protected entries decrypted)"
+            : $"extracted {files.Count} CNT entries (protected entries remain raw)");
+        return 0;
+    }
+
+    private static int ProbeEntryCrypto(string[] args)
+    {
+        if (args.Length != 4)
+            throw new ArgumentException("probe-entry-crypto requires <package.pkg> <entry-id-hex> <passcode>.");
+        uint id = uint.Parse(args[2].Replace("0x", "", StringComparison.OrdinalIgnoreCase), NumberStyles.HexNumber);
+        ProsperoPkg pkg = ProsperoPkgReader.Read(args[1]);
+        ProsperoPkgEntry entry = pkg.Entries.First(e => e.RawId == id);
+        if (pkg.Header is null) throw new InvalidDataException("Package has no embedded CNT header.");
+        long cntBase = pkg.Fih is null ? 0 : checked((long)pkg.Fih.EmbeddedCntOffset);
+        byte[] ciphertext = new byte[entry.DataSize];
+        using (var fs = File.OpenRead(args[1]))
+        {
+            fs.Position = cntBase + entry.DataOffset;
+            fs.ReadExactly(ciphertext);
+        }
+
+        byte[] meta = new byte[32];
+        BinaryPrimitives.WriteUInt32BigEndian(meta.AsSpan(0x00), entry.RawId);
+        BinaryPrimitives.WriteUInt32BigEndian(meta.AsSpan(0x04), entry.NameTableOffset);
+        BinaryPrimitives.WriteUInt32BigEndian(meta.AsSpan(0x08), entry.Flags1);
+        BinaryPrimitives.WriteUInt32BigEndian(meta.AsSpan(0x0C), entry.Flags2);
+        BinaryPrimitives.WriteUInt32BigEndian(meta.AsSpan(0x10), entry.DataOffset);
+        BinaryPrimitives.WriteUInt32BigEndian(meta.AsSpan(0x14), entry.DataSize);
+        uint keyIndex = (entry.Flags2 >> 12) & 0xF;
+        foreach (bool sha3Kdf in new[] { false, true })
+        foreach (bool sha3Iv in new[] { false, true })
+        {
+            byte[] dk = Crypto.ComputeKeys(pkg.Header.ContentId, args[3], keyIndex, sha3Kdf);
+            byte[] preimage = meta.Concat(dk).ToArray();
+            byte[] ivKey = sha3Iv ? Crypto.Sha3_256(preimage) : Crypto.Sha256(preimage);
+            byte[] plaintext = new byte[ciphertext.Length];
+            Crypto.AesCbcCfb128Decrypt(
+                plaintext, ciphertext, ciphertext.Length,
+                ivKey.Skip(16).Take(16).ToArray(), ivKey.Take(16).ToArray());
+            ReadOnlySpan<byte> prefix = plaintext.AsSpan(0, Math.Min(64, plaintext.Length));
+            string ascii = new(prefix.ToArray().Select(b => b is >= 0x20 and < 0x7F ? (char)b : '.').ToArray());
+            Console.WriteLine($"kdf={(sha3Kdf ? "sha3" : "sha256")} iv={(sha3Iv ? "sha3" : "sha256")} " +
+                              $"prefix={Convert.ToHexString(prefix)} ascii={ascii}");
+        }
+        return 0;
+    }
+
+    private static int ExtractPackageSi(string[] args)
+    {
+        if (args.Length != 3)
+            throw new ArgumentException("extract-pkg-si requires <package.pkg> <output-dir>.");
+        IReadOnlyList<string> files = ProsperoPackageArchive.ExtractSiEntries(args[1], args[2]);
+        Console.WriteLine($"extracted {files.Count} SI entries");
         return 0;
     }
 
@@ -279,7 +660,242 @@ internal static class Program
         if (!string.Equals(actual, emptySha3, StringComparison.Ordinal))
             throw new InvalidDataException($"Managed SHA3-256 KAT failed: {actual}");
         Console.WriteLine("selftest: SHA3-256 known-answer test passed");
+
+        byte[] checksumKat = [1, 2, 3];
+        ulong weak = ProsperoNapsMeta.ComputeInputChecksum(checksumKat);
+        ulong rolling = ProsperoNapsMeta.ComputeRollingHash(checksumKat);
+        if (weak != 0x0000000D00000006UL || rolling != 0x00000BFFF0000006UL)
+            throw new InvalidDataException(
+                $"NAPS checksum KAT failed: ihsh=0x{weak:X16}, rhsh=0x{rolling:X16}");
+        if (ProsperoCrc32C.Compute("123456789"u8) != 0xE3069283u)
+            throw new InvalidDataException("CRC32C known-answer test failed.");
+        Console.WriteLine("selftest: NAPS ihsh/rhsh and CRC32C primitive known-answer tests passed");
+
+        byte[] meta18 = ProsperoNapsMeta.BuildMeta18(
+            0x20000,
+            new byte[0x10000],
+            [("selftest.bin", 1L)],
+            inner: null,
+            integrityProvider: new SelfTestNapsIntegrityProvider());
+        byte[] plain = ProsperoNapsMeta.DecryptMeta18(meta18);
+        byte[] ihsh = FindMeta18Record(plain, "ihsh");
+        byte[] rhsh = FindMeta18Record(plain, "rhsh");
+        byte[] obcc = FindMeta18Record(plain, "obcc");
+        if (!ihsh.AsSpan(0, 8).SequenceEqual(Enumerable.Range(1, 8).Select(i => (byte)i).ToArray())
+            || !rhsh.SequenceEqual(Enumerable.Range(0x11, 8).Select(i => (byte)i).ToArray())
+            || !obcc.SequenceEqual(Enumerable.Range(0x21, 8).Select(i => (byte)i).ToArray()))
+        {
+            throw new InvalidDataException("NAPS protected-integrity provider tables were not serialized verbatim.");
+        }
+        Console.WriteLine("selftest: NAPS protected-integrity provider passed");
+
+        const string complexGp5 = """
+            <?xml version="1.0" encoding="utf-8"?>
+            <psproject fmt="gp5" version="1000">
+              <volume>
+                <volume_type>prospero_app</volume_type>
+                <package passcode="00000000000000000000000000000000"
+                         entitlement_key="00112233445566778899AABBCCDDEEFF"/>
+                <chunk_info chunk_count="2" scenario_count="1">
+                  <chunks supported_languages="en-US ja-JP" default_language="en-US">
+                    <chunk id="0" layer_no="0" languages="en-US ja-JP" label="base"/>
+                    <chunk id="1" layer_no="0" languages="ja-JP" label="jp"/>
+                  </chunks>
+                  <scenarios default_id="0">
+                    <scenario id="0" type="playmode" initial_chunk_count="1">0 1</scenario>
+                  </scenarios>
+                </chunk_info>
+              </volume>
+              <files>
+                <file dst_path="sce_sys/icon0.png" src_path="icon.png"
+                      content_config_label="us" chunk="0" pfs_compression="disable"/>
+                <file dst_path="data/late.bin" chunk="1"/>
+              </files>
+            </psproject>
+            """;
+        using var gp5Input = new MemoryStream(Encoding.UTF8.GetBytes(complexGp5));
+        Gp5Project gp5 = Gp5Project.ReadFrom(gp5Input);
+        if (!gp5.VersionSpecified || !gp5.FilesSpecified ||
+            gp5.Volume.Package.EntitlementKey != "00112233445566778899AABBCCDDEEFF" ||
+            gp5.Volume.ChunkInfo?.ChunkSet.DefaultLanguage != "en-US" ||
+            gp5.Volume.ChunkInfo.Chunks.Count != 2 ||
+            gp5.Volume.ChunkInfo.Chunks[1].Languages != "ja-JP" ||
+            gp5.Files.Count != 2 || !gp5.Files[0].ChunkSpecified ||
+            gp5.Files[0].ContentConfigLabel != "us" ||
+            gp5.Files[0].PfsCompression != "disable" ||
+            gp5.Files[1].SourcePath is not null)
+        {
+            throw new InvalidDataException("Complex GP5 attributes were not preserved.");
+        }
+        using var gp5Output = new MemoryStream();
+        Gp5Project.WriteTo(gp5, gp5Output);
+        gp5Output.Position = 0;
+        Gp5Project gp5Again = Gp5Project.ReadFrom(gp5Output);
+        if (gp5Again.Volume.ChunkInfo?.Chunks.Count != 2 ||
+            gp5Again.Files[0].ContentConfigLabel != "us" ||
+            gp5Again.Files[1].SourcePath is not null)
+            throw new InvalidDataException("Complex GP5 write/read round trip failed.");
+
+        const string nestedGp5 = """
+            <psproject fmt="gp5">
+              <volume><volume_type>prospero_app</volume_type></volume>
+              <rootdir src_path="root">
+                <dir dst_path="dirC" virtual="true">
+                  <file dst_path="fileA.txt" src_path="\fileA.txt"/>
+                </dir>
+              </rootdir>
+            </psproject>
+            """;
+        using var nestedInput = new MemoryStream(Encoding.UTF8.GetBytes(nestedGp5));
+        Gp5Project nested = Gp5Project.ReadFrom(nestedInput);
+        if (nested.Layout != Gp5Layout.Normal ||
+            nested.RootDir.Directories.Count != 1 ||
+            !nested.RootDir.Directories[0].VirtualSpecified ||
+            !nested.RootDir.Directories[0].Virtual ||
+            nested.RootDir.Directories[0].Files.Single().SourcePath != "\\fileA.txt")
+            throw new InvalidDataException("Nested rootdir GP5 mapping was not preserved.");
+
+        const string alGp5 = """
+            <psproject fmt="gp5">
+              <volume>
+                <volume_type>prospero_al</volume_type>
+                <package passcode="00000000000000000000000000000000"
+                         c_date="2024-01-02 03:04:05"
+                         entitlement_key="00112233445566778899AABBCCDDEEFF"/>
+              </volume>
+              <files/>
+            </psproject>
+            """;
+        using var alInput = new MemoryStream(Encoding.UTF8.GetBytes(alGp5));
+        Gp5Project al = Gp5Project.ReadFrom(alInput);
+        if (al.Volume.Type != Gp5VolumeType.prospero_al || al.VersionSpecified ||
+            !al.FilesSpecified || al.Layout != Gp5Layout.Flat ||
+            al.Volume.Package.CreationDate != "2024-01-02 03:04:05")
+            throw new InvalidDataException("AL GP5 profile was not preserved.");
+        Console.WriteLine("selftest: AL, PlayGo, content-config and nested-rootdir GP5 round trips passed");
+
+        var deterministicKeys1 = new KeysEntry(
+            "IV9999-UMTX11110_00-XXXXXXXXXXXXXXXX",
+            "00000000000000000000000000000000",
+            publisherProfile: true,
+            deterministic: true);
+        var deterministicKeys2 = new KeysEntry(
+            "IV9999-UMTX11110_00-XXXXXXXXXXXXXXXX",
+            "00000000000000000000000000000000",
+            publisherProfile: true,
+            deterministic: true);
+        using var keys1 = new MemoryStream();
+        using var keys2 = new MemoryStream();
+        deterministicKeys1.Write(keys1);
+        deterministicKeys2.Write(keys2);
+        if (!keys1.ToArray().AsSpan().SequenceEqual(keys2.ToArray()))
+            throw new InvalidDataException("Deterministic RSA-wrapped ENTRY_KEYS differ.");
+        Console.WriteLine("selftest: deterministic RSA-3072 ENTRY_KEYS generation passed");
+
+        string regressionRoot = Path.Combine(
+            Path.GetTempPath(), "LibProsperoPkg-selftest-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            string source1 = Path.Combine(regressionRoot, "source1");
+            string source2 = Path.Combine(regressionRoot, "source2");
+            string output1 = Path.Combine(regressionRoot, "output1");
+            string output2 = Path.Combine(regressionRoot, "output2");
+            Directory.CreateDirectory(Path.Combine(source1, "data"));
+            Directory.CreateDirectory(Path.Combine(source2, "data"));
+
+            // Create the same tree in opposite host-enumeration order. The package writer must
+            // sort by logical path, so creation order and temporary root names cannot affect bytes.
+            File.WriteAllBytes(Path.Combine(source1, "data", "z.bin"), [0x5A, 0x31]);
+            File.WriteAllBytes(Path.Combine(source1, "data", "a.bin"), [0x41, 0x31]);
+            File.WriteAllBytes(Path.Combine(source2, "data", "a.bin"), [0x41, 0x31]);
+            File.WriteAllBytes(Path.Combine(source2, "data", "z.bin"), [0x5A, 0x31]);
+
+            const string deterministicContentId = "IV9999-PPSA00000_00-DETERMINISTIC000";
+            const string deterministicPasscode = "00000000000000000000000000000000";
+            ProsperoBuildResult build1 = ProsperoPackageBuilder.Build(
+                new ProsperoBuildOptions
+                {
+                    SourceFolder = source1,
+                    OutputFolder = output1,
+                    ContentId = deterministicContentId,
+                    TitleId = "PPSA00000",
+                    Mode = ProsperoPackageMode.Application,
+                    Passcode = deterministicPasscode,
+                    DeterministicBuild = true,
+                },
+                _ => { });
+            ProsperoBuildResult build2 = ProsperoPackageBuilder.Build(
+                new ProsperoBuildOptions
+                {
+                    SourceFolder = source2,
+                    OutputFolder = output2,
+                    ContentId = deterministicContentId,
+                    TitleId = "PPSA00000",
+                    Mode = ProsperoPackageMode.Application,
+                    Passcode = deterministicPasscode,
+                    DeterministicBuild = true,
+                },
+                _ => { });
+            byte[] package1 = File.ReadAllBytes(build1.OutputPath);
+            byte[] package2 = File.ReadAllBytes(build2.OutputPath);
+            if (!package1.AsSpan().SequenceEqual(package2))
+            {
+                throw new InvalidDataException(
+                    $"Deterministic APP/PPR-NAPS packages differ: " +
+                    $"{Convert.ToHexString(ProsperoSha3.HashData(package1))} != " +
+                    $"{Convert.ToHexString(ProsperoSha3.HashData(package2))}.");
+            }
+            if (ProsperoPkgReader.Read(build1.OutputPath).Type != ProsperoPkgType.FullDebug)
+                throw new InvalidDataException("Deterministic APP regression package is not a finalized debug image.");
+            Console.WriteLine(
+                "selftest: deterministic APP/PPR-NAPS full-package regression passed " +
+                $"(SHA3-256 {Convert.ToHexString(ProsperoSha3.HashData(package1))})");
+        }
+        finally
+        {
+            try
+            {
+                if (Directory.Exists(regressionRoot))
+                    Directory.Delete(regressionRoot, recursive: true);
+            }
+            catch
+            {
+                // Best-effort cleanup must not hide the regression result.
+            }
+        }
         return 0;
+    }
+
+    private static byte[] FindMeta18Record(byte[] plain, string wantedTag)
+    {
+        for (int pos = 0; pos + 16 <= plain.Length;)
+        {
+            string tag = new([
+                (char)plain[pos + 3],
+                (char)plain[pos + 2],
+                (char)plain[pos + 1],
+                (char)plain[pos],
+            ]);
+            ulong length = BinaryPrimitives.ReadUInt64LittleEndian(plain.AsSpan(pos + 8, 8));
+            if (length > int.MaxValue || pos + 16L + (long)length > plain.Length)
+                throw new InvalidDataException("Malformed naps_meta_18 self-test TLV.");
+            if (string.Equals(tag, wantedTag, StringComparison.Ordinal))
+                return plain.AsSpan(pos + 16, (int)length).ToArray();
+            pos = checked(pos + 16 + (int)length);
+        }
+        throw new InvalidDataException($"naps_meta_18 self-test record '{wantedTag}' was not found.");
+    }
+
+    private sealed class SelfTestNapsIntegrityProvider : IProsperoNapsIntegrityProvider
+    {
+        public byte[] BuildIhshPrefixes(ProsperoNapsIntegrityContext context) =>
+            Enumerable.Range(1, checked(context.MappingBlocks.Count * 8)).Select(i => (byte)i).ToArray();
+
+        public byte[] BuildRollingHashes(ProsperoNapsIntegrityContext context) =>
+            Enumerable.Range(0x11, checked(context.MappingBlocks.Count * 8)).Select(i => (byte)i).ToArray();
+
+        public byte[] BuildOuterBlockCheckCodes(ProsperoNapsIntegrityContext context) =>
+            Enumerable.Range(0x21, checked(context.PhysicalInnerBlockCount * 4)).Select(i => (byte)i).ToArray();
     }
 
     private static int BuildPfs(string[] args)
@@ -1196,16 +1812,23 @@ internal static class Program
         Console.WriteLine("        [--exclude \"sce_sys/**;movies/*.mp4\"] [--only-if-smaller false]");
         Console.WriteLine("        [--classic true]   (alias for --layout classic)");
         Console.WriteLine("  build-publisher-artifacts <source-folder> <output-dir> <content-id> <passcode> [cmac-key-hex]");
-        Console.WriteLine("  build-pkg <source-dir> <output-dir> <content-id> <app|ac|al> [passcode] [naps-cmac-key-hex]");
+        Console.WriteLine("  build-pkg <source-dir> <output-dir> <content-id> <app|ac|al> [passcode] [naps-cmac-key-hex|-] [naps-meta-18-file|-] [metadata-private-key.pem|-] [outer-pfs-seed-hex|-] [deterministic]");
         Console.WriteLine("  pack  <input-file> <output.pfsc> [--compression zlib|kraken|none] [--level N]");
         Console.WriteLine("        [--min-savings-percent 0]");
         Console.WriteLine("  unpack <input-or-image> <output-file> [--offset 0x0]");
         Console.WriteLine("  list <image.pfs>");
         Console.WriteLine("  inspect-file <image.pfs> <path>");
+        Console.WriteLine("  hash-flt <path> [path ...]");
         Console.WriteLine("  verify-phuc <image.phuc>");
         Console.WriteLine("  verify <source-folder> [the same build options]");
         Console.WriteLine("  inspect-naps <naps_pkg_layout.dat>");
+        Console.WriteLine("  inspect-naps-meta18 <naps_meta_18.dat>");
+        Console.WriteLine("  decrypt-naps-meta18 <naps_meta_18.dat> <plaintext-output>");
+        Console.WriteLine("  check-naps-meta18-obcc <naps_meta_18.dat> <pfs_image.dat>");
         Console.WriteLine("  dump-naps <naps_pkg_layout.dat>");
+        Console.WriteLine("  check-naps-cmac <naps_pkg_layout.dat> <pfs_image.dat> <16-byte-key-hex>");
+        Console.WriteLine("  encode-dds <input.png> <output.dds>");
+        Console.WriteLine("  roundtrip-gp5 <input.gp5> <output.gp5>");
         Console.WriteLine("  plan-naps <naps_pkg_layout.dat>");
         Console.WriteLine("  decompress-naps <pfs_image.dat> <naps_pkg_layout.dat> <output>");
         Console.WriteLine("  pack-naps <logical-pfs> <pfs_image.dat> <naps_pkg_layout.dat> [cmac-key-hex]");
@@ -1213,9 +1836,14 @@ internal static class Program
         Console.WriteLine("  inspect-pkg <package.pkg>");
         Console.WriteLine("  extract-pkg-outer <package.pkg> <output-dir> [passcode]");
         Console.WriteLine("  dump-pkg-outer <package.pkg> <output.pfs> [passcode]");
+        Console.WriteLine("  check-pkg-fih <package.pkg> [passcode]");
         Console.WriteLine("  check-pkg-imagedigs <package.pkg> [passcode]");
+        Console.WriteLine("  check-pkg-signature <package.pkg>");
+        Console.WriteLine("  resign-pkg <input.pkg> <output.pkg>");
         Console.WriteLine("  extract-pkg-inner <package.pkg> <output-dir> [passcode]");
-        Console.WriteLine("  extract-pkg-cnt <package.pkg> <output-dir>");
+        Console.WriteLine("  extract-pkg-cnt <package.pkg> <output-dir> [passcode]");
+        Console.WriteLine("  extract-pkg-si <package.pkg> <output-dir>");
+        Console.WriteLine("  probe-entry-crypto <package.pkg> <entry-id-hex> <passcode>");
         Console.WriteLine("  selftest");
         Console.WriteLine("  Levels: Kraken -4..9 (default 8), zlib 0..9 (default 9).");
         Console.WriteLine("  Valid builds: ppr+kraken/none; classic+zlib/kraken/none.");

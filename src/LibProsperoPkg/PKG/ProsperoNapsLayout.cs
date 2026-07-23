@@ -259,6 +259,8 @@ public sealed class NapsLayoutDocument
 /// </summary>
 public static class ProsperoNapsLayout
 {
+    /// <summary>Default trailing alignment used by publisher NAPS layout blobs.</summary>
+    public const int DefaultAlignment = 16;
     /// <summary>On-disk file name of the NAPS layout structure.</summary>
     public const string FileName = "naps_pkg_layout.dat";
 
@@ -694,20 +696,24 @@ public static class ProsperoNapsLayout
             throw new InvalidDataException("The first NAPS file entry cannot be a continuation.");
         ulong maximum = checked((ulong)document.Counts.UBlockCount << 18);
         ulong previous = 0;
+        // Every fidx record is a real monotonic boundary; the final type-0x40 record is the mount end.
         for (int i = 0; i < document.FileOffsets.Count; i++)
         {
             ulong current = document.FileOffsets[i].UncompressedOffsetStart;
             if (current < previous || current > maximum)
-                throw new InvalidDataException($"NAPS file boundary {i} is invalid.");
+                throw new InvalidDataException(
+                    $"NAPS file boundary {i} is invalid: current=0x{current:X}, previous=0x{previous:X}, maximum=0x{maximum:X}.");
             previous = current;
         }
         for (int block = 0; block < document.Counts.UBlockCount; block++)
         {
             NapsU2cEntry group = document.CblockInfoOffsetByUblock[block >> 3];
             uint index = block % 8 == 0 ? group.InfoOffset9BBase : checked(group.InfoOffset9BBase + group.DeltaFromBase[(block & 7) - 1]);
+            bool beyondMountBoundary = document.FileOffsets.Count != 0
+                && checked((ulong)block << 18) >= document.FileOffsets[^1].UncompressedOffsetStart;
             if (index >= document.CblockInfos.Count
                 || document.CblockInfos[(int)index].IsRunBase
-                || document.CblockInfos[(int)index].IsTerminal)
+                || (document.CblockInfos[(int)index].IsTerminal && !beyondMountBoundary))
                 throw new InvalidDataException($"NAPS ublock {block} has an invalid CblockInfo reference.");
         }
 

@@ -72,7 +72,9 @@ The primary entry point.
 
 - **`ProsperoPkgBuildProperties`** and **`ProsperoVolumeType`** drive the low-level builder. The
   publisher path is selected by `UsePublisherPprNaps`; `NapsOuterBlockCmacKey` supplies the separate
-  publishing CMAC input when strict NAPS outer-block tags are required.
+  publishing CMAC input when strict NAPS outer-block tags are required. Set
+  `DeterministicBuild` to derive repeatable seeds and RSA padding for byte-identical debug/test
+  packages; the default mode retains cryptographic randomness.
 - **`ProsperoPkgLayout`** and **`ProsperoEntryId`** describe the container layout and entry ids.
 
 ---
@@ -119,8 +121,11 @@ The PS5 compression-file (`PFSC` v3) codec used by the `nwonly` path.
   folder.
 - **`Gp5Project`** — the GP5 document model, with both the "normal" (`rootdir`-walked) and
   "flat" (`files`/`folders`-listed) layouts represented via `Gp5Layout`. Elements:
-  `Gp5Volume`, `Gp5Package`, `Gp5ChunkInfo`, `Gp5Chunk`, `Gp5Scenarios`, `Gp5Scenario`,
+  `Gp5Volume`, `Gp5Package`, `Gp5ChunkInfo`, `Gp5Chunks`, `Gp5Chunk`, `Gp5Scenarios`, `Gp5Scenario`,
   `Gp5RootDir`, `Gp5File`, `Gp5Dir`.
+  The model preserves AL entitlement/date fields, PlayGo language/layer attributes,
+  per-file chunk/content-config/compression settings, implicit source paths, and recursive
+  overlay/virtual directories.
 
 ---
 

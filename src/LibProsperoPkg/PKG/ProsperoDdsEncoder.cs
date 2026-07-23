@@ -8,15 +8,19 @@
 // and pic*.dds are 3840x2160 (8294548 bytes), exactly 148 header bytes + width*height BC7 payload
 // bytes.
 //
-// This file produces byte-exact DDS headers and a spec-conformant BC7 payload using mode 6
-// (single subset, RGBA, 7-bit endpoints + per-endpoint p-bit, 16 four-bit indices). Mode 6 is the
-// simplest BC7 block that still covers the full RGBA range, so the output is a valid BC7 texture
-// the console GPU can sample.
+// This file produces byte-exact DDS headers and an adaptive BC7 payload. Publisher output uses
+// modes 0..7 according to each 4x4 block; forcing every block to mode 6 is valid but produces
+// needlessly different media and lower quality. BCnEncoder.NET supplies the full deterministic
+// mode search. The local mode-6 block writer is retained as a small known-answer implementation.
 
 #nullable enable
 
+using BCnEncoder.Encoder;
+using BCnEncoder.Shared;
 using ImageMagick;
 using System;
+using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 
 namespace LibProsperoPkg.PKG;
@@ -39,6 +43,14 @@ public static class ProsperoDdsEncoder
         { 0, 4, 9, 13, 17, 21, 26, 30, 34, 38, 43, 47, 51, 55, 60, 64 };
 
     /// <summary>
+    /// Optional explicit path to the Publishing Tools <c>p2d.exe</c> converter. When it is not set,
+    /// <see cref="EncodePngToDds(byte[])"/> checks <c>LIBPROSPERO_P2D_PATH</c>, the application
+    /// directory and the standard Publishing Tools installation. If no converter exists, the
+    /// portable managed BC7 encoder is used.
+    /// </summary>
+    public static string? PublisherP2dPath { get; set; }
+
+    /// <summary>
     /// Decodes <paramref name="pngBytes"/> and re-encodes it as a BC7 DX10 DDS file (full
     /// resolution, no mipmaps). Throws if the image cannot be decoded.
     /// </summary>
@@ -46,6 +58,10 @@ public static class ProsperoDdsEncoder
     {
         if (pngBytes is null || pngBytes.Length == 0)
             throw new ArgumentException("Empty image.", nameof(pngBytes));
+
+        string? p2dPath = FindPublisherP2d();
+        if (p2dPath is not null)
+            return EncodePngWithPublisherP2d(pngBytes, p2dPath);
 
         using var image = new MagickImage(pngBytes);
         int width = (int)image.Width;
@@ -58,6 +74,88 @@ public static class ProsperoDdsEncoder
             ?? throw new InvalidDataException("Unable to read RGBA pixels.");
 
         return EncodeRgbaToDds(rgba, width, height);
+    }
+
+    private static string? FindPublisherP2d()
+    {
+        var candidates = new List<string?>(6)
+        {
+            PublisherP2dPath,
+            Environment.GetEnvironmentVariable("LIBPROSPERO_P2D_PATH"),
+            Path.Combine(AppContext.BaseDirectory, "p2d.exe"),
+            Path.Combine(AppContext.BaseDirectory, "ext", "p2d.exe"),
+        };
+        if (OperatingSystem.IsWindows())
+        {
+            candidates.Add(
+                @"C:\SCE\Prospero\Tools\Publishing Tools\bin\ext\p2d.exe");
+        }
+
+        foreach (string? candidate in candidates)
+        {
+            if (!string.IsNullOrWhiteSpace(candidate) && File.Exists(candidate))
+                return Path.GetFullPath(candidate);
+        }
+        return null;
+    }
+
+    private static byte[] EncodePngWithPublisherP2d(byte[] pngBytes, string p2dPath)
+    {
+        string tempDirectory =
+            Path.Combine(Path.GetTempPath(), "libprospero-p2d-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempDirectory);
+        string inputPath = Path.Combine(tempDirectory, "input.png");
+        string outputPath = Path.Combine(tempDirectory, "output.dds");
+        try
+        {
+            File.WriteAllBytes(inputPath, pngBytes);
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = p2dPath,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+            };
+            // This is the exact profile used by Publishing Tools 2.79. Single-threading makes the
+            // reproducibility guarantee explicit without changing the resulting BC7 stream.
+            startInfo.ArgumentList.Add("--high");
+            startInfo.ArgumentList.Add("--st");
+            startInfo.ArgumentList.Add(inputPath);
+            startInfo.ArgumentList.Add(outputPath);
+
+            using Process process = Process.Start(startInfo)
+                ?? throw new InvalidOperationException($"Unable to start publisher DDS encoder: {p2dPath}");
+            string stdout = process.StandardOutput.ReadToEnd();
+            string stderr = process.StandardError.ReadToEnd();
+            process.WaitForExit();
+            // p2d returns 0x100 for a recoverable libpng/iCCP warning while still writing the
+            // exact DDS accepted by Publishing Tools. Treat the presence and format of the output
+            // as authoritative; a nonzero exit code is fatal only when no output was produced.
+            if (!File.Exists(outputPath))
+            {
+                throw new InvalidDataException(
+                    $"Publisher DDS encoder failed with exit code {process.ExitCode}: "
+                    + string.Join(" ", stdout.Trim(), stderr.Trim()).Trim());
+            }
+
+            byte[] dds = File.ReadAllBytes(outputPath);
+            if (dds.Length < HeaderSize
+                || dds[0] != (byte)'D'
+                || dds[1] != (byte)'D'
+                || dds[2] != (byte)'S'
+                || dds[3] != (byte)' '
+                || BitConverter.ToUInt32(dds, 0x80) != DxgiFormatBc7Unorm)
+            {
+                throw new InvalidDataException("Publisher DDS encoder returned a non-BC7 DDS file.");
+            }
+            return dds;
+        }
+        finally
+        {
+            if (Directory.Exists(tempDirectory))
+                Directory.Delete(tempDirectory, recursive: true);
+        }
     }
 
     /// <summary>
@@ -74,24 +172,28 @@ public static class ProsperoDdsEncoder
 
         int blocksX = (width + 3) / 4;
         int blocksY = (height + 3) / 4;
-        int surfaceWidth = blocksX * 4;
-        int surfaceHeight = blocksY * 4;
-        long payloadSize = (long)surfaceWidth * surfaceHeight; // BC7 is 16 bytes per 4x4 block = 1 byte/texel.
+        int payloadSize = checked(blocksX * blocksY * 16);
 
         byte[] dds = new byte[HeaderSize + payloadSize];
-        WriteHeader(dds, surfaceWidth, surfaceHeight, (uint)payloadSize);
+        // DDS records the logical dimensions. Only the encoded storage is rounded to 4x4 blocks.
+        WriteHeader(dds, width, height, (uint)payloadSize);
 
-        int offset = HeaderSize;
-        var block = new byte[16 * 4];
-        for (int by = 0; by < blocksY; by++)
+        var encoder = new BcEncoder(CompressionFormat.Bc7);
+        encoder.OutputOptions.GenerateMipMaps = false;
+        encoder.OutputOptions.Quality = CompressionQuality.BestQuality;
+        // Keep package builds reproducible regardless of worker scheduling.
+        encoder.Options.IsParallel = false;
+
+        byte[][] mipLevels =
+            encoder.EncodeToRawBytes(rgba, width, height, PixelFormat.Rgba32);
+        if (mipLevels.Length != 1 || mipLevels[0].Length != payloadSize)
         {
-            for (int bx = 0; bx < blocksX; bx++)
-            {
-                GatherBlock(rgba, width, height, bx * 4, by * 4, block);
-                EncodeBlockMode6(block, dds, offset);
-                offset += 16;
-            }
+            throw new InvalidDataException(
+                $"BC7 encoder returned {mipLevels.Length} levels and "
+                + $"{(mipLevels.Length == 0 ? 0 : mipLevels[0].Length)} bytes; "
+                + $"expected one {payloadSize}-byte surface.");
         }
+        mipLevels[0].CopyTo(dds, HeaderSize);
 
         return dds;
     }

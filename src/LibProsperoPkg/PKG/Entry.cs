@@ -27,11 +27,16 @@ public abstract class Entry
     /// Writes the entry in an encrypted form to the given stream.
     /// </summary>
     public void WriteEncrypted(Stream s, string contentId, string passcode)
+        => WriteEncrypted(s, contentId, passcode, publisherProfile: false);
+
+    /// <summary>
+    /// Writes the entry using either the legacy SHA-256 or publisher PS5 SHA3 profile.
+    /// </summary>
+    public void WriteEncrypted(Stream s, string contentId, string passcode, bool publisherProfile)
     {
-        var iv_key = Crypto.Sha256(
-              meta.GetBytes()
-              .Concat(Crypto.ComputeKeys(contentId, passcode, meta.KeyIndex))
-              .ToArray());
+        byte[] keySeed = Crypto.ComputeKeys(contentId, passcode, meta.KeyIndex, useSha3: publisherProfile);
+        byte[] keyMaterial = meta.GetBytes().Concat(keySeed).ToArray();
+        byte[] iv_key = publisherProfile ? Crypto.Sha3_256(keyMaterial) : Crypto.Sha256(keyMaterial);
         var tmp = new byte[Length];
         using (var ms = new MemoryStream(tmp))
         {
@@ -41,12 +46,10 @@ public abstract class Entry
         s.Write(tmp, 0, tmp.Length);
     }
 
-    private static byte[] Decrypt(byte[] entryBytes, byte[] keySeed, MetaEntry meta)
+    private static byte[] Decrypt(byte[] entryBytes, byte[] keySeed, MetaEntry meta, bool publisherProfile)
     {
-        var iv_key = Crypto.Sha256(
-               meta.GetBytes()
-               .Concat(keySeed)
-               .ToArray());
+        byte[] keyMaterial = meta.GetBytes().Concat(keySeed).ToArray();
+        byte[] iv_key = publisherProfile ? Crypto.Sha3_256(keyMaterial) : Crypto.Sha256(keyMaterial);
         var tmp = new byte[entryBytes.Length];
         Crypto.AesCbcCfb128Decrypt(tmp, entryBytes, tmp.Length, iv_key.Skip(16).Take(16).ToArray(), iv_key.Take(16).ToArray());
         return tmp;
@@ -56,8 +59,15 @@ public abstract class Entry
     /// Decrypts the given bytes using the entry encryption.
     /// </summary>
     public static byte[] Decrypt(byte[] entryBytes, string contentId, string passcode, MetaEntry meta)
+        => Decrypt(entryBytes, contentId, passcode, meta, publisherProfile: false);
+
+    /// <summary>
+    /// Decrypts an entry using either the legacy SHA-256 or publisher PS5 SHA3 profile.
+    /// </summary>
+    public static byte[] Decrypt(byte[] entryBytes, string contentId, string passcode, MetaEntry meta, bool publisherProfile)
     {
-        return Decrypt(entryBytes, Crypto.ComputeKeys(contentId, passcode, meta.KeyIndex), meta);
+        byte[] keySeed = Crypto.ComputeKeys(contentId, passcode, meta.KeyIndex, useSha3: publisherProfile);
+        return Decrypt(entryBytes, keySeed, meta, publisherProfile);
     }
 
     /// <summary>
@@ -70,7 +80,7 @@ public abstract class Entry
         {
             throw new Exception("We only have the key for encryption key 3");
         }
-        return Decrypt(entryBytes, Crypto.RSA2048Decrypt(pkg.EntryKeys.Keys[3].key, RSAKeyset.PkgDerivedKey3Keyset), meta);
+        return Decrypt(entryBytes, Crypto.RSA2048Decrypt(pkg.EntryKeys.Keys[3].key, RSAKeyset.PkgDerivedKey3Keyset), meta, publisherProfile: false);
     }
 }
 
@@ -209,7 +219,7 @@ public class KeysEntry : Entry
     {
     }
 
-    public KeysEntry(string contentId, string passcode, bool publisherProfile)
+    public KeysEntry(string contentId, string passcode, bool publisherProfile, bool deterministic = false)
     {
         this.publisherProfile = publisherProfile;
         const int keyCount = 7;
@@ -227,7 +237,7 @@ public class KeysEntry : Entry
                 Keys[i] = new PkgEntryKey
                 {
                     digest = Crypto.Sha3_256(passcodeKey).Xor(passcodeKey),
-                    key = Crypto.RsaPkcs1EncryptKey(modulus, passcodeKey),
+                    key = Crypto.RsaPkcs1EncryptKey(modulus, passcodeKey, deterministic),
                 };
             }
             else
@@ -243,7 +253,7 @@ public class KeysEntry : Entry
         Keys[0].key = publisherProfile
             ? Crypto.RsaPkcs1EncryptKey(
                 LibProsperoPkg.Keys.ProsperoKeys.PasscodeKey.Slice(0, 384).ToArray(),
-                Encoding.ASCII.GetBytes(passcode))
+                Encoding.ASCII.GetBytes(passcode), deterministic)
             : Crypto.RSA2048EncryptKey(Util.CryptoKeys.PkgPublicKeys[0], Encoding.ASCII.GetBytes(passcode));
     }
     public byte[] seedDigest;

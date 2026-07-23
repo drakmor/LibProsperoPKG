@@ -14,12 +14,13 @@ public class PkgWriter : Util.WriterBase
 
     public void WriteBody(Pkg pkg, string contentId, string passcode)
     {
+        bool publisherProfile = pkg.EntryKeys.Keys.Length != 0 && pkg.EntryKeys.Keys[0].key.Length == 384;
         foreach (var entry in pkg.Entries)
         {
             s.Position = entry.meta.DataOffset;
             if (entry.meta.Encrypted)
             {
-                entry.WriteEncrypted(s, contentId, passcode);
+                entry.WriteEncrypted(s, contentId, passcode, publisherProfile);
             }
             else
             {

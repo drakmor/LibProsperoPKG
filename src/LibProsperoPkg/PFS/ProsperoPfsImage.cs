@@ -59,6 +59,12 @@ public sealed class ProsperoPfsImageOptions
     public byte[]? Seed { get; set; }
 
     /// <summary>
+    /// When encryption needs a new seed and <see cref="Seed"/> is null, derive it reproducibly
+    /// from EKPFS instead of using the operating-system RNG.
+    /// </summary>
+    public bool DeterministicSeed { get; set; }
+
+    /// <summary>
     /// When true, derive the encryption key from <c>HMAC(EKPFS, seed)</c> first (the
     /// <c>new_crypt</c> path / the <c>newCrypt</c> scheme). Defaults to the classic path.
     /// </summary>
@@ -239,7 +245,12 @@ public static class ProsperoPfsImage
 
         // Decide on the seed: caller-provided > header-resident > freshly generated.
         byte[] headerSeed = hdr.Seed ?? new byte[16];
-        byte[] seed = options.Seed ?? (IsAllZero(headerSeed) && encrypt ? RandomNumberGenerator.GetBytes(16) : headerSeed);
+        byte[] seed = options.Seed ?? (IsAllZero(headerSeed) && encrypt
+            ? options.DeterministicSeed
+                ? HMACSHA256.HashData(ekpfs, "LibProsperoPkg deterministic PFS seed"u8)
+                    .AsSpan(0, 16).ToArray()
+                : RandomNumberGenerator.GetBytes(16)
+            : headerSeed);
         if (seed.Length != 16)
             throw new ArgumentException("PFS header seed must be exactly 16 bytes.", nameof(options));
 

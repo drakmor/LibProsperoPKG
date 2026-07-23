@@ -187,7 +187,9 @@ public abstract class Inode
 
     public Inode()
     {
-        SetTime((long)DateTime.UtcNow.Subtract(new DateTime(1970, 1, 1)).TotalSeconds);
+        // Builders overwrite this from their explicit FileTime. Epoch is a deterministic safety
+        // default for standalone inode construction and for any future path that forgets to do so.
+        SetTime(0);
     }
     /// <summary>
     /// The index of this inode in the block of inodes.

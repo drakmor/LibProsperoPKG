@@ -22,7 +22,10 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Text.Encodings.Web;
 using System.Text.Json;
+using System.Text.Json.Nodes;
+using System.Xml.Linq;
 
 namespace LibProsperoPkg.PKG;
 
@@ -45,7 +48,7 @@ internal sealed class ProsperoSiBuildInputs
     /// Block-aligned stored size of the inner <c>pfs_image.dat</c> (<c>alignUp(storedSize, 0x10000)</c>) — the
     /// value the FIH records at <see cref="ProsperoPkgLayout.FihInnerImageSizeField"/> (0xA0) in the reference
     /// data-first layout. The SI's <c>naps_meta_300/301/302/308.dat</c> records derive from it as
-    /// <c>R = InnerImageSize - 0x10000</c> via <see cref="ProsperoNapsMeta.BuildMeta300FromInnerImageSize"/>.
+    /// <c>R = InnerImageSize - 0x20000</c> via <see cref="ProsperoNapsMeta.BuildMeta300FromInnerImageSize"/>.
     /// It is captured here at build time because our superblock-first outer PFS leaves FIH[0xA0] at 0
     /// (that field is only populated for the data-first layout), so it cannot be read back from the mount image.
     /// </summary>
@@ -54,8 +57,27 @@ internal sealed class ProsperoSiBuildInputs
     /// <summary>Unpadded byte size of <c>naps_pkg_layout.dat</c>, written to FIH offset 0xA8.</summary>
     public ulong NapsLayoutSize { get; init; }
 
-    /// <summary>FIH +0x94/+0x98 inner inode count for the publisher PPR profile.</summary>
-    public uint FihInnerInodeCount { get; init; }
+    /// <summary>FIH +0x94/+0x98 nonterminal NAPS FIDX/file count (<c>NumFiles - 1</c>).</summary>
+    public uint FihNapsFileCount { get; init; }
+
+    /// <summary>Protected publisher metric blob copied verbatim into the SI, when supplied.</summary>
+    public byte[]? NapsMeta18 { get; init; }
+
+    /// <summary>Protected NAPS table provider used when <see cref="NapsMeta18"/> is not supplied.</summary>
+    public IProsperoNapsIntegrityProvider? NapsIntegrityProvider { get; init; }
+
+    /// <summary>Whether this package profile carries pfsimage.xml in the debug SI.</summary>
+    public bool IncludePfsImageXml { get; init; } = true;
+
+    /// <summary>Inner content files used to construct the naps_meta_18 file/fstr records.</summary>
+    public IReadOnlyList<(string Path, long Size)> ContentFiles { get; init; } = [];
+
+    /// <summary>Exact assembled data-first inner image used to build the NAPS block map.</summary>
+    public ProsperoPs5InnerImageResult? InnerImage { get; init; }
+
+    public long NestedMetaBaseBlocks { get; init; }
+    public uint ContentVersionHigh { get; init; }
+    public int AppFileCount { get; init; }
 }
 
 /// <summary>The PS5 volume kind, which selects the content-type code stamped into the header.</summary>
@@ -145,6 +167,33 @@ public sealed class ProsperoPkgBuildProperties
 
     /// <summary>Optional 16-byte key for publisher NAPS outer-block CMAC tags.</summary>
     public byte[]? NapsOuterBlockCmacKey { get; init; }
+
+    /// <summary>Optional publisher-authored AC SI metric record, preserved verbatim.</summary>
+    public byte[]? NapsMeta18 { get; init; }
+
+    /// <summary>
+    /// Optional provider for the protected <c>ihsh/rhsh/obcc</c> tables generated inside
+    /// <c>naps_meta_18.dat</c>.
+    /// </summary>
+    public IProsperoNapsIntegrityProvider? NapsIntegrityProvider { get; init; }
+
+    /// <summary>
+    /// Optional fixed 16-byte outer-PFS seed. When omitted, the seed is derived in
+    /// <see cref="DeterministicBuild"/> mode and generated with a cryptographic RNG otherwise.
+    /// </summary>
+    public byte[]? OuterPfsSeed { get; init; }
+
+    /// <summary>
+    /// Uses stable RSA PKCS#1 wrapping and derives a stable outer seed when one is not supplied.
+    /// Intended for byte-for-byte regression builds; normal builds retain randomized RSA padding.
+    /// </summary>
+    public bool DeterministicBuild { get; init; }
+
+    /// <summary>
+    /// Metadata signing provider for CNT+0x1000. When null, the embedded research signer is used;
+    /// current publisher tools require their matching trusted RSA-3072 profile.
+    /// </summary>
+    public IProsperoMetadataSigner? MetadataSigner { get; init; }
 }
 
 /// <summary>
@@ -190,8 +239,11 @@ public static class ProsperoPkgBuilder
 
     private static ContentFlags ContentFlagsFor(ProsperoVolumeType type) => type switch
     {
-        ProsperoVolumeType.AdditionalContentNoData => 0,
-        _ => ContentFlags.Unk_x8000000 | ContentFlags.GD_AC,
+        // PSAL carries no PFS image, but its direct metadata CNT uses this profile bit.
+        ProsperoVolumeType.AdditionalContentNoData => ContentFlags.Unk_x8000000,
+        ProsperoVolumeType.AdditionalContentData =>
+            ContentFlags.Unk_x8000000 | ContentFlags.GD_AC,
+        _ => ContentFlags.GD_AC,
     };
 
     /// <summary>
@@ -204,9 +256,8 @@ public static class ProsperoPkgBuilder
         => Build(props, outputPath, out _, out _, logger);
 
     /// <summary>
-    /// CNT-build overload that also surfaces the FIH 0xB0 nested-image-content digest — SHA3-256 of the
-    /// UNCOMPRESSED inner PFS image. The plaintext
-    /// inner image exists only during this build pass, so the digest is threaded out here for the caller
+    /// CNT-build overload that also surfaces the FIH 0xB0 publisher nested-layout digest. In the
+    /// PPR/NAPS path this is SHA3-256(<c>naps_pkg_layout.dat</c>), threaded out here for the caller
     /// that finalizes the CNT into a debug (FIH) image (<see cref="ProsperoFihBuilder.BuildFromCnt"/>),
     /// which would otherwise only have the encrypted CNT and fall back to a best-effort outer-image hash.
     /// Also surfaces the reproducible <see cref="ProsperoSiBuildInputs"/> so the finalizer can assemble the
@@ -231,8 +282,8 @@ public static class ProsperoPkgBuilder
 
         string sourceFolder = Path.GetFullPath(props.SourceFolder);
 
-        // EKPFS (index 1) from content id + passcode.
-        byte[] ekpfs = Crypto.ComputeKeys(props.ContentId, props.Passcode, 1);
+        // Publisher EKPFS is the SHA3 KDF result at index 1.
+        byte[] ekpfs = ProsperoPfsKeys.DeriveEkpfs(props.ContentId, props.Passcode);
 
         var directory = Path.GetDirectoryName(Path.GetFullPath(outputPath));
         if (!string.IsNullOrEmpty(directory)) Directory.CreateDirectory(directory);
@@ -257,8 +308,16 @@ public static class ProsperoPkgBuilder
         // Builds (and writes to outputPath) one complete package.
         void BuildImageOnce()
         {
+            if (props.VolumeType == ProsperoVolumeType.AdditionalContentNoData)
+            {
+                BuildAdditionalContentNoData(props, ekpfs, sourceFolder, outputPath, log);
+                capturedNestedDigest = null;
+                capturedSi = null;
+                return;
+            }
+
             log("Preparing PS5 inner PFS (superblock version 2)...");
-            var innerRoot = BuildInnerTree(sourceFolder, props.Passcode);
+            var innerRoot = BuildInnerTree(sourceFolder, props.Passcode, props.VolumeType);
             // PlayGo file/inode count of the inner image: drives playgo-ficm.dat (count) and
             // playgo-hash-table.dat (count / 2), matching reference samples. The total
             // inner content size drives the playgo-chunk.dat size words (self-consistent layout).
@@ -268,7 +327,7 @@ public static class ProsperoPkgBuilder
             if (props.UsePublisherPprNaps)
             {
                 BuildPublisherImage(
-                    props, sourceFolder, outputPath, playgoFileCount, chunkDataSize, log,
+                    props, sourceFolder, outputPath, innerRoot, log,
                     out capturedNestedDigest, out capturedSi);
                 return;
             }
@@ -406,91 +465,181 @@ public static class ProsperoPkgBuilder
         }
     }
 
+    /// <summary>
+    /// Builds PSAL as a direct CNT followed by SI. It has no FIH, outer/nested PFS,
+    /// IMAGE_KEY, PlayGo descriptor, or NAPS layout.
+    /// </summary>
+    private static void BuildAdditionalContentNoData(
+        ProsperoPkgBuildProperties props, byte[] ekpfs, string sourceFolder, string outputPath,
+        Action<string> log)
+    {
+        log("Preparing PS5 Additional Content (PSAL) metadata-only CNT...");
+        Pkg pkg = BuildContainer(
+            props, ekpfs, sourceFolder,
+            pfsSize: 0, imagedigsSize: 0, playgoFileCount: 0,
+            mchunk0Size: 0, mchunk1Size: 0);
+
+        long cntSize = checked((long)(pkg.Header.body_offset + pkg.Header.body_size));
+        using var fs = new FileStream(outputPath, FileMode.Create, FileAccess.ReadWrite, FileShare.None);
+        fs.SetLength(cntSize);
+        FinishAdditionalContentNoDataContainer(pkg, fs, props);
+
+        // Publishing Tools also puts verify.log into SI. It is diagnostic, so only the reproducible
+        // per-64-KiB CRC table is emitted here.
+        fs.Position = 0;
+        byte[] cnt = new byte[cntSize];
+        fs.ReadExactly(cnt);
+        byte[] si = ProsperoSiArchive.WriteZip(ProsperoSiArchive.BuildMembers(
+            props.ContentId, pfsImageXml: null, finalizedMountImage: cnt));
+        fs.Position = cntSize;
+        fs.Write(si);
+        log($"Appended PSAL SI segment: 0x{si.Length:X} bytes.");
+    }
+
     private static void BuildPublisherImage(
         ProsperoPkgBuildProperties props, string sourceFolder, string outputPath,
-        uint playgoFileCount, ulong chunkDataSize, Action<string> log,
+        FSDir innerRoot, Action<string> log,
         out byte[] nestedImageDigest, out ProsperoSiBuildInputs? siInputs)
     {
-        string workspace = Path.Combine(
-            Path.GetTempPath(), "libprospero-publisher-pkg-" + Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(workspace);
-        try
-        {
-            log("Preparing publisher direct-offset PPR-PFS and NAPS image...");
-            var publisher = ProsperoPublisherPprBuilder.Build(
-                new ProsperoPublisherPprBuildOptions
-                {
-                    SourceFolder = sourceFolder,
-                    OutputDirectory = workspace,
-                    ContentId = props.ContentId,
-                    Passcode = props.Passcode,
-                    TimeStamp = props.TimeStamp,
-                    // A fixed seed preserves the previous builder's reproducible output. Call the
-                    // lower-level artifact API directly when a randomized/publisher-supplied seed is wanted.
-                    OuterSeed = new byte[16],
-                    NapsOptions = new ProsperoNapsBuildOptions
-                    {
-                        Compress = true,
-                        CompressionLevel = 7,
-                        VerifyRoundTrip = true,
-                        OuterBlockCmacKey = props.NapsOuterBlockCmacKey,
-                    },
-                },
-                s => log($" [publisher] {s}"));
+        log("Preparing publisher data-first PPR-PFS and NAPS image...");
+        long fileTime = ToUnixSeconds(props.TimeStamp);
+        ProsperoPs5InnerImageResult inner =
+            new ProsperoPs5InnerImageAssembler(fileTime, 0).BuildFromFsTree(innerRoot);
+        byte[] napsLayout = ProsperoNwonlyNapsGenerator.Generate(
+            inner,
+            outerBlockCmacKey: props.NapsOuterBlockCmacKey);
 
-            byte[] outerImage = File.ReadAllBytes(publisher.OuterPfsPath);
-            // FIH+0xA8 is the NAPS layout length and FIH+0xB0 is SHA3-256 of
-            // that exact naps_pkg_layout.dat blob. The reference DLC confirms
-            // both fields byte-for-byte; the logical PPR stream is not this preimage.
-            nestedImageDigest = ProsperoImageDigests.Sha3_256(publisher.Naps.LayoutBytes);
-            int imagedigsSize = publisher.ImageDigests.Length;
-            if (imagedigsSize != checked(outerImage.Length / BlockSize * 32))
-                throw new InvalidDataException("Publisher imagedigs table does not match the outer-PFS block count.");
+        // FIH+0xA8 is the exact NAPS layout length; +0xB0 is SHA3-256 of those bytes.
+        nestedImageDigest = ProsperoImageDigests.Sha3_256(napsLayout);
+        // Publisher PlayGo's FLT hash table has one path hash per real afid file. FICM uses two map
+        // bytes per such file, hence its count is twice the path count.
+        List<string> playgoPaths = inner.Nodes
+            .Where(n => !n.IsDirectory && n.ParentInode >= 0)
+            .OrderBy(n => n.Afid)
+            .Select(n => n.FullPath)
+            .ToList();
+        uint playgoFileCount = checked((uint)playgoPaths.Count * 2u);
+        // NAPS FIDX contains every AFID payload, the block-info/hole boundary, the metadata
+        // boundary, and a terminal mount boundary.  FIH +0x94/+0x98 and afid_to_ino_table[0]
+        // store the nonterminal count, therefore AFID count + 2.
+        uint napsFileCount = checked((uint)inner.AfidLogicalOffsets.Count + 2u);
+        int appFileCount = inner.Nodes.Count(
+            n => !n.IsDirectory && n.ParentInode >= 0 && n.Mode == 0x816D);
+        uint contentVersionHigh = ContentVersionHigh(ReadParamJsonInfo(sourceFolder).ContentVersion);
+        long nestedMetaBaseBlocks = inner.MetaBaseLogical / BlockSize;
 
-            ulong packedAlignedSize = Align((ulong)publisher.Naps.PackedImage.Length, BlockSize);
-            ulong mchunkTotal = checked((ulong)ProsperoImageDigests.FihRelativeImageOffset + (ulong)outerImage.Length);
-            ulong mchunk0Size = Math.Min(packedAlignedSize, mchunkTotal);
-            ulong mchunk1Size = mchunkTotal - mchunk0Size;
-            var pkg = BuildContainer(
-                props, ProsperoPfsKeys.DeriveEkpfs(props.ContentId, props.Passcode), sourceFolder,
-                (ulong)outerImage.Length, imagedigsSize, playgoFileCount, mchunk0Size, mchunk1Size);
-            var imagedigsEntry = (GenericEntry)pkg.Entries.First(e => (uint)e.Id == ImagedigsEntryId);
-            imagedigsEntry.FileData = publisher.ImageDigests;
-
-            long totalSize = checked((long)(pkg.Header.body_offset + pkg.Header.body_size + pkg.Header.pfs_image_size));
-            using var fs = new FileStream(outputPath, FileMode.Create, FileAccess.ReadWrite, FileShare.None);
-            fs.SetLength(totalSize);
-            fs.Position = (long)pkg.Header.pfs_image_offset;
-            fs.Write(outerImage);
-            log($"Writing publisher outer PFS at 0x{pkg.Header.pfs_image_offset:X} ({outerImage.Length:N0} bytes)...");
-
-            ProsperoPfsImageXmlOptions siXml = FinishContainer(
-                pkg, fs, props, nestedImageDigest, log,
-                (ulong)publisher.Naps.LayoutBytes.Length, (uint)publisher.InnerInodeCount);
-            byte[]? playGoChunkDat =
-                (pkg.Entries.FirstOrDefault(e => (uint)e.Id == PlayGoChunkDatEntryId) as GenericEntry)?.FileData;
-            long packedSize = publisher.Naps.PackedImage.Length;
-            long mountImageTotal = siXml.PfsImageOffset + siXml.PfsImageSize;
-            siXml.ChunkInfo = new ProsperoChunkInfoModel
+        ProsperoOuterFile[] outerFiles =
+        [
+            new ProsperoOuterFile
             {
-                PlayGoChunkDatSize = playGoChunkDat?.Length ?? 0,
-                TotalSize = mountImageTotal,
-                Outer0Size = packedSize,
-                Outer1Size = mountImageTotal - packedSize,
-            };
-            siInputs = new ProsperoSiBuildInputs
+                Name = "pfs_image.dat",
+                Data = inner.Image,
+                SizeCompressed = inner.Ndblock * BlockSize,
+                Signed = false,
+            },
+            new ProsperoOuterFile
             {
-                Xml = siXml,
-                PlayGoChunkDat = playGoChunkDat,
-                InnerImageSize = packedSize,
-                NapsLayoutSize = (ulong)publisher.Naps.LayoutBytes.Length,
-                FihInnerInodeCount = (uint)publisher.InnerInodeCount,
-            };
-        }
-        finally
+                Name = ProsperoNapsLayout.FileName,
+                Data = napsLayout,
+                Signed = true,
+            },
+        ];
+
+        if (props.OuterPfsSeed is { Length: not 16 })
+            throw new ArgumentException("Outer PFS seed must contain exactly 16 bytes.", nameof(props));
+        byte[] outerSeed = props.OuterPfsSeed?.AsSpan().ToArray()
+            ?? (props.DeterministicBuild
+                ? DeriveDeterministicOuterSeed(props.ContentId, props.Passcode)
+                : System.Security.Cryptography.RandomNumberGenerator.GetBytes(16));
+        byte[] ekpfs = ProsperoPfsKeys.DeriveEkpfs(props.ContentId, props.Passcode);
+        ProsperoOuterPackageImage outer = ProsperoOuterPfsBuilder.BuildForPackage(
+            outerFiles,
+            new ProsperoOuterPfsBuildParameters { TimestampSeconds = fileTime, Seed = outerSeed },
+            ekpfs);
+
+        long packedSize = inner.Image.Length;
+        ulong packedAlignedSize = Align((ulong)packedSize, BlockSize);
+        ulong mchunkTotal = checked((ulong)ProsperoImageDigests.FihRelativeImageOffset + (ulong)outer.PfsSize);
+        // Publisher nwonly splits PlayGo at the inner pfs_image.dat data extent:
+        // mchunk0 = stored inner image minus its final 64-KiB block; mchunk1 reaches the CNT.
+        // Verified values: APP 0x40000+0x80000, AC 0x20000+0x80000.
+        ulong mchunk0Size = Math.Min(
+            packedAlignedSize >= BlockSize ? packedAlignedSize - BlockSize : 0,
+            mchunkTotal);
+        ulong mchunk1Size = mchunkTotal - mchunk0Size;
+        var pkg = BuildContainer(
+            props, ekpfs, sourceFolder, (ulong)outer.PfsSize, outer.ImageDigests.Length,
+            playgoFileCount, mchunk0Size, mchunk1Size, playgoPaths, publisherNwonly: true);
+        var imagedigsEntry = (GenericEntry)pkg.Entries.First(e => (uint)e.Id == ImagedigsEntryId);
+
+        // imagedigs stores each SHA3 digest with its byte order reversed.
+        byte[] reversedDigests = (byte[])outer.ImageDigests.Clone();
+        for (int off = 0; off < reversedDigests.Length; off += ProsperoImageDigests.DigestSize)
+            Array.Reverse(reversedDigests, off, ProsperoImageDigests.DigestSize);
+        imagedigsEntry.FileData = reversedDigests;
+
+        long totalSize = checked((long)(pkg.Header.body_offset + pkg.Header.body_size + pkg.Header.pfs_image_size));
+        using var fs = new FileStream(outputPath, FileMode.Create, FileAccess.ReadWrite, FileShare.None);
+        fs.SetLength(totalSize);
+        fs.Position = (long)pkg.Header.pfs_image_offset;
+        fs.Write(outer.Ciphertext);
+        log($"Writing publisher outer PFS at 0x{pkg.Header.pfs_image_offset:X} ({outer.PfsSize:N0} bytes)...");
+
+        ProsperoPfsImageXmlOptions siXml = FinishContainer(
+            pkg, fs, props, nestedImageDigest, log, napsLayout.Length, nestedMetaBaseBlocks,
+            contentVersionHigh, (int)napsFileCount, appFileCount);
+        byte[]? playGoChunkDat =
+            (pkg.Entries.FirstOrDefault(e => (uint)e.Id == PlayGoChunkDatEntryId) as GenericEntry)?.FileData;
+        long mountImageTotal = siXml.PfsImageOffset + siXml.PfsImageSize;
+        siXml.OuterPfsTree = outer.Tree;
+        siXml.ChunkInfo = new ProsperoChunkInfoModel
         {
-            TryDeleteTempDirectory(workspace);
-        }
+            PlayGoChunkDatSize = playGoChunkDat?.Length ?? 0,
+            TotalSize = mountImageTotal,
+            Outer0Size = checked((long)packedAlignedSize),
+            Outer1Size = mountImageTotal - (long)packedAlignedSize,
+        };
+
+        var contentFiles = inner.Nodes
+            .Where(n => !n.IsDirectory && n.ParentInode >= 0)
+            .OrderBy(n => n.Afid)
+            .Select(n => (Path: n.FullPath.TrimStart('/'), Size: n.Size))
+            .ToList();
+        contentFiles.Add(("*PFSmetadata", outer.PfsSize));
+
+        siInputs = new ProsperoSiBuildInputs
+        {
+            Xml = siXml,
+            PlayGoChunkDat = playGoChunkDat,
+            InnerImageSize = (long)packedAlignedSize,
+            NapsLayoutSize = (ulong)napsLayout.Length,
+            FihNapsFileCount = napsFileCount,
+            NapsMeta18 = props.NapsMeta18,
+            NapsIntegrityProvider = props.NapsIntegrityProvider,
+            // Verified prospero-pub-cmd 2.79 APP and AC nwonly SI profiles both contain the
+            // seven NAPS/PlayGo records and no common/etc/pfsimage.xml.
+            IncludePfsImageXml = false,
+            ContentFiles = contentFiles,
+            InnerImage = inner,
+            NestedMetaBaseBlocks = nestedMetaBaseBlocks,
+            ContentVersionHigh = contentVersionHigh,
+            AppFileCount = appFileCount,
+        };
+    }
+
+    private static IReadOnlyList<(string Path, long Size)> ReadPfsContentFiles(string imagePath)
+    {
+        using var stream = File.OpenRead(imagePath);
+        using var source = new LibProsperoPkg.Util.StreamReader(stream);
+        var pfs = new PfsReader(source, encryptedDataAlreadyDecrypted: true);
+        return pfs.GetAllFiles()
+            .Select(file =>
+            {
+                string path = file.FullName.Replace('\\', '/').TrimStart('/');
+                if (path.StartsWith("uroot/", StringComparison.Ordinal)) path = path[6..];
+                return (Path: path, Size: file.size);
+            })
+            .ToList();
     }
 
     // Resolves the effective inner-image codec, honouring the legacy CompressInnerImage flag when the
@@ -641,24 +790,65 @@ public static class ProsperoPkgBuilder
 
     // Builds the FSDir tree from the source folder, injecting the inner-only auxiliary sce_sys files
     // that the publishing pipeline generates during PKG building (these are NOT part of the loose
-    // input): sce_sys/keystone and sce_sys/about/right.sprx. imagedigs.dat and the PlayGo descriptors
+    // input): sce_sys/pfs-version.dat and, for GD, sce_sys/keystone + sce_sys/about/right.sprx.
+    // imagedigs.dat and the PlayGo descriptors
     // are OUTER CNT entries (see BuildContainer), not inner-PFS files.
-    private static FSDir BuildInnerTree(string sourceFolder, string passcode)
+    private static FSDir BuildInnerTree(string sourceFolder, string passcode, ProsperoVolumeType volumeType)
     {
         var root = new FSDir();
-        Populate(root, sourceFolder);
+        string? project = Directory.EnumerateFiles(sourceFolder, "*.gp5", SearchOption.TopDirectoryOnly)
+            .OrderBy(path => Path.GetFileName(path), StringComparer.OrdinalIgnoreCase)
+            .FirstOrDefault();
+        if (project is null)
+        {
+            Populate(root, sourceFolder);
+        }
+        else
+        {
+            // A GP5 project is an explicit file manifest. Loose files beside it are build inputs or
+            // backups, not implicit package members. Preserve each declared destination path and resolve
+            // the source path relative to the project file, matching prospero-pub-cmd.
+            XDocument document = XDocument.Load(project, LoadOptions.None);
+            string projectDirectory = Path.GetDirectoryName(project)!;
+            foreach (XElement file in document.Descendants("file"))
+            {
+                string? destination = (string?)file.Attribute("dst_path");
+                string? source = (string?)file.Attribute("src_path");
+                if (string.IsNullOrWhiteSpace(destination))
+                    continue;
+                // Publishing Tools omits src_path when the host path is identical to dst_path
+                // relative to the GP5 directory.
+                source = string.IsNullOrWhiteSpace(source) ? destination : source;
+                string sourcePath = Path.GetFullPath(Path.Combine(
+                    projectDirectory, source.Replace('\\', Path.DirectorySeparatorChar)));
+                if (!File.Exists(sourcePath))
+                    throw new FileNotFoundException($"GP5 source file was not found for '{destination}'.", sourcePath);
+                AddMappedFile(root, destination, sourcePath);
+            }
+        }
 
         var sceSys = root.Dirs.FirstOrDefault(d => d.name == "sce_sys");
         if (sceSys != null)
         {
-            // sce_sys/keystone — generated from the passcode if the project did not supply one.
-            if (!sceSys.Files.Any(f => f.name == "keystone"))
+            // Publisher inner PFS always carries the ten-byte content-version marker. In AC reference
+            // output this is the first afid and the first fidx extent: 0 .. 0xA for "01.000.000".
+            if (!sceSys.Files.Any(f => f.name == "pfs-version.dat"))
+            {
+                byte[] version = Encoding.ASCII.GetBytes(ReadParamJsonInfo(sourceFolder).ContentVersion);
+                AddFile(sceSys, "pfs-version.dat", version);
+            }
+
+            // The DRM keystone belongs to application/GD images. Publisher AC does not synthesize it.
+            if (volumeType == ProsperoVolumeType.Application &&
+                !sceSys.Files.Any(f => f.name == "keystone"))
             {
                 var keystone = Crypto.CreateKeystone(passcode, 3); // PS5 keystone header version
                 AddFile(sceSys, "keystone", keystone);
             }
 
-            EnsureAboutRightSprx(sceSys);
+            // The about entitlement module is part of the application/GD profile.
+            if (volumeType == ProsperoVolumeType.Application)
+                EnsureAboutRightSprx(sceSys);
             EnsureUcpArchives(sceSys);
 
             // NOTE: imagedigs.dat and the PlayGo descriptors (playgo-chunk.dat, playgo-hash-table.dat,
@@ -671,6 +861,27 @@ public static class ProsperoPkgBuilder
 
         static void AddFile(FSDir dir, string name, byte[] data) =>
             dir.Files.Add(new FSFile(s => s.Write(data, 0, data.Length), name, data.Length) { Parent = dir });
+
+        static void AddMappedFile(FSDir rootDir, string destination, string sourcePath)
+        {
+            string[] parts = destination.Replace('\\', '/').Trim('/').Split('/', StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length == 0) return;
+            FSDir dir = rootDir;
+            for (int i = 0; i < parts.Length - 1; i++)
+            {
+                FSDir? next = dir.Dirs.FirstOrDefault(d => d.name == parts[i]);
+                if (next is null)
+                {
+                    next = new FSDir { name = parts[i], Parent = dir };
+                    dir.Dirs.Add(next);
+                }
+                dir = next;
+            }
+            string name = parts[^1];
+            if (dir.Files.Any(f => string.Equals(f.name, name, StringComparison.Ordinal)))
+                throw new InvalidDataException($"GP5 declares destination '{destination}' more than once.");
+            dir.Files.Add(new FSFile(sourcePath) { name = name, Parent = dir });
+        }
 
         static void Populate(FSDir node, string path)
         {
@@ -752,8 +963,10 @@ public static class ProsperoPkgBuilder
     private static Pkg BuildContainer(
         ProsperoPkgBuildProperties props, byte[] ekpfs, string sourceFolder,
         ulong pfsSize, int imagedigsSize, uint playgoFileCount,
-        ulong mchunk0Size, ulong mchunk1Size)
+        ulong mchunk0Size, ulong mchunk1Size,
+        IReadOnlyList<string>? playgoPaths = null, bool publisherNwonly = false)
     {
+        bool noData = props.VolumeType == ProsperoVolumeType.AdditionalContentNoData;
         uint contentType = ContentTypeFor(props.VolumeType);
         var pkg = new Pkg
         {
@@ -764,37 +977,38 @@ public static class ProsperoPkgBuilder
                 unk_0x08 = 0x80000000,
                 unk_0x0C = Unk0CPs5,
                 entry_count = 0,
-                sc_entry_count = 6,
+                sc_entry_count = (ushort)(noData ? 5 : 6),
                 entry_count_2 = 0,
                 entry_table_offset = 0,
                 main_ent_data_size = 0,
                 body_offset = BodyOffset,
                 body_size = 0,
                 content_id = props.ContentId,
-                drm_type = DrmTypePs5,
+                drm_type = props.VolumeType == ProsperoVolumeType.Application ? 0u : DrmTypePs5,
                 content_type = contentType,
                 content_flags = ContentFlagsFor(props.VolumeType) |
-                    (props.UsePublisherPprNaps ? (ContentFlags)0x00020000 : 0),
+                    (props.UsePublisherPprNaps && !noData ? (ContentFlags)0x00020000 : 0),
                 promote_size = 0,
                 // prospero-pub-cmd 2.79 producer identity used by the current publisher corpus.
                 version_date = 0x20240508,
                 version_hash = 0x090FBFC1,
                 iro_tag = IROTag.None,
-                ekc_version = 1,
+                ekc_version = props.VolumeType is ProsperoVolumeType.Application
+                    or ProsperoVolumeType.AdditionalContentNoData ? 0u : 1u,
                 sc_entries1_hash = new byte[32],
                 sc_entries2_hash = new byte[32],
                 digest_table_hash = new byte[32],
                 body_digest = new byte[32],
-                unk_0x400 = 1,
-                pfs_image_count = 1,
-                pfs_flags = props.UsePublisherPprNaps ? PublisherPfsFlags : LegacyPfsFlags,
-                pfs_image_offset = PfsImageOffset,
+                unk_0x400 = noData ? 0u : 1u,
+                pfs_image_count = noData ? 0u : 1u,
+                pfs_flags = noData ? 0 : props.UsePublisherPprNaps ? PublisherPfsFlags : LegacyPfsFlags,
+                pfs_image_offset = noData ? 0 : PfsImageOffset,
                 pfs_image_size = pfsSize,
                 mount_image_offset = 0,
                 mount_image_size = 0,
-                package_size = PfsImageOffset + pfsSize,
-                pfs_signed_size = BlockSize,
-                pfs_cache_size = props.UsePublisherPprNaps ? 0u : 0xD0000u,
+                package_size = noData ? 0 : PfsImageOffset + pfsSize,
+                pfs_signed_size = noData ? 0u : BlockSize,
+                pfs_cache_size = noData ? 0u : props.UsePublisherPprNaps ? 0u : 0xD0000u,
                 pfs_image_digest = new byte[32],
                 pfs_signed_digest = new byte[32],
                 pfs_split_size_nth_0 = 0,
@@ -809,43 +1023,50 @@ public static class ProsperoPkgBuilder
         };
 
         // System-container entries (the 6 SC entries), ids 0x1/0x10/0x20/0x80/0x100/0x200.
-        pkg.EntryKeys = new KeysEntry(props.ContentId, props.Passcode, props.UsePublisherPprNaps);
-        byte[] imageKeyBody;
-        if (props.UsePublisherPprNaps)
+        pkg.EntryKeys = new KeysEntry(
+            props.ContentId, props.Passcode, props.UsePublisherPprNaps, props.DeterministicBuild);
+        byte[]? imageKeyBody = null;
+        if (!noData && props.UsePublisherPprNaps)
         {
-            imageKeyBody = BuildPublisherImageKeyEntry(ekpfs);
+            imageKeyBody = BuildPublisherImageKeyEntry(ekpfs, props.DeterministicBuild);
         }
-        else
+        else if (!noData)
         {
             imageKeyBody = Crypto.RSA2048EncryptKey(
                 LibProsperoPkg.Util.RSAKeyset.FakeKeyset.Modulus, ekpfs);
         }
-        pkg.ImageKey = new GenericEntry(EntryId.IMAGE_KEY)
+        if (imageKeyBody is not null)
         {
-            FileData = imageKeyBody,
-        };
+            pkg.ImageKey = new GenericEntry(EntryId.IMAGE_KEY)
+            {
+                FileData = imageKeyBody,
+            };
+        }
         pkg.GeneralDigests = new GeneralDigestsEntry { type = ProsperoImageDigests.GeneralDigestsTypeFull };
         pkg.Metas = new MetasEntry();
         pkg.Digests = new GenericEntry(EntryId.DIGESTS);
         pkg.EntryNames = new NameTableEntry();
 
-        // param.json (PS5 entry id 0x2000).
-        byte[] paramJson = ReadParamJson(sourceFolder);
+        // param.json (PS5 entry id 0x2000).  The publishing tool does not copy the project
+        // file verbatim: it stamps pubtools metadata, fills profile-specific defaults, pads the
+        // version URI to its fixed 255-character field, orders properties, and emits CRLF JSON.
+        byte[] paramJson = BuildPublisherParamJson(sourceFolder, props);
         var paramEntry = new GenericEntry((EntryId)0x2000, "param.json") { FileData = paramJson };
 
         pkg.Entries = new List<Entry>
         {
             pkg.EntryKeys,
-            pkg.ImageKey,
             pkg.GeneralDigests,
             pkg.Metas,
             pkg.Digests,
             pkg.EntryNames,
             paramEntry,
         };
+        if (pkg.ImageKey is not null)
+            pkg.Entries.Insert(1, pkg.ImageKey);
 
         // sce_sys media entries (icon0.png, pic0.png, pic1.png, snd0.at9, ...) present in the folder.
-        foreach (var media in CollectMediaEntries(sourceFolder))
+        foreach (var media in CollectMediaEntries(sourceFolder, generateDds: !noData))
             pkg.Entries.Add(media);
 
         // PS5 image-digest + PlayGo descriptor CNT entries. Reference package layout shows
@@ -856,16 +1077,24 @@ public static class ProsperoPkgBuilder
         // written. The PlayGo file/inode count drives playgo-ficm.dat (count) and playgo-hash-table.dat
         // (count / 2), matching reference samples. Any entry the source folder already
         // supplied (e.g. a hand-authored playgo-chunk.dat) is respected and not regenerated.
-        foreach (var (id, name, data) in new (uint Id, string? Name, byte[] Data)[]
+        if (!noData)
         {
-            (ImagedigsEntryId, null, new byte[imagedigsSize]),
-            (0x1001u, "playgo-chunk.dat", LibProsperoPkg.PlayGo.ProsperoPlayGo.BuildChunkDat(props.ContentId, mchunk0Size, mchunk1Size)),
-            (0x2010u, "playgo-hash-table.dat", LibProsperoPkg.PlayGo.ProsperoPlayGo.BuildHashTable(playgoFileCount / 2)),
-            (0x2011u, "playgo-ficm.dat", LibProsperoPkg.PlayGo.ProsperoPlayGo.BuildFicm(playgoFileCount)),
-        })
-        {
-            if (!pkg.Entries.Any(e => (uint)e.Id == id))
-                pkg.Entries.Add(new GenericEntry((EntryId)id, name) { FileData = data });
+            foreach (var (id, name, data) in new (uint Id, string? Name, byte[] Data)[]
+            {
+                (ImagedigsEntryId, null, new byte[imagedigsSize]),
+                (0x1001u, "playgo-chunk.dat", LibProsperoPkg.PlayGo.ProsperoPlayGo.BuildChunkDat(
+                    props.ContentId, mchunk0Size, mchunk1Size, publisherNwonly,
+                    includePublisherLabels:
+                        publisherNwonly && props.VolumeType == ProsperoVolumeType.Application)),
+                (0x2010u, "playgo-hash-table.dat", playgoPaths is not null
+                    ? LibProsperoPkg.PlayGo.ProsperoPlayGo.BuildHashTable(playgoPaths)
+                    : LibProsperoPkg.PlayGo.ProsperoPlayGo.BuildHashTable(playgoFileCount / 2)),
+                (0x2011u, "playgo-ficm.dat", LibProsperoPkg.PlayGo.ProsperoPlayGo.BuildFicm(playgoFileCount)),
+            })
+            {
+                if (!pkg.Entries.Any(e => (uint)e.Id == id))
+                    pkg.Entries.Add(new GenericEntry((EntryId)id, name) { FileData = data });
+            }
         }
 
         // Publisher CNT bodies use a semantic storage order which is independent of the sorted
@@ -899,7 +1128,7 @@ public static class ProsperoPkgBuilder
     /// repeated RSA-3072 PKCS#1-v1_5 wraps of EKPFS under mount_image.bin; the
     /// final ciphertext is truncated at the fixed field boundary.
     /// </summary>
-    private static byte[] BuildPublisherImageKeyEntry(byte[] ekpfs)
+    private static byte[] BuildPublisherImageKeyEntry(byte[] ekpfs, bool deterministic)
     {
         const int imageKeySize = 0x800;
         const int rsa3072Size = 384;
@@ -910,7 +1139,7 @@ public static class ProsperoPkgBuilder
         byte[] result = new byte[imageKeySize];
         for (int offset = 0; offset < result.Length; offset += rsa3072Size)
         {
-            byte[] wrapped = Crypto.RsaPkcs1EncryptKey(modulus, ekpfs);
+            byte[] wrapped = Crypto.RsaPkcs1EncryptKey(modulus, ekpfs, deterministic);
             wrapped.AsSpan(0, Math.Min(wrapped.Length, result.Length - offset))
                 .CopyTo(result.AsSpan(offset));
         }
@@ -926,17 +1155,26 @@ public static class ProsperoPkgBuilder
         (uint)EntryId.GENERAL_DIGESTS => 0x60000000,
         (uint)EntryId.METAS => 0x60000000,
         (uint)EntryId.ENTRY_NAMES => 0x40000000,
+        (uint)EntryId.LICENSE_DAT => 0x80000000,
+        (uint)EntryId.LICENSE_INFO => 0x80000000,
         0x2000 => 0x00000000,                          // param.json
         _ => 0x08000000,                               // media / data entries
     };
 
-    // No CNT entries in this package class are entry-encrypted, so Flags2 is always zero.
-    private static uint Flags2For(uint id) => 0u;
+    private static uint Flags2For(uint id) => id switch
+    {
+        (uint)EntryId.LICENSE_DAT => 0x00003000,       // derived key index 3
+        (uint)EntryId.LICENSE_INFO => 0x00004000,      // derived key index 4
+        _ => 0u,
+    };
 
     private static void LayOutEntries(Pkg pkg, byte[] paramJson)
     {
-        // 1st pass: register every entry name so the name-table offsets are stable.
-        foreach (var entry in pkg.Entries.OrderBy(e => e.Name, StringComparer.Ordinal))
+        // Publisher ENTRY_NAMES follows the sorted MetaEntry table, not lexical filename order.
+        // The table therefore starts with playgo-chunk.dat (id 0x1001), followed by presentation
+        // media and the 0x2000/0x2010/0x2011 records in id order. NameTableOffset values are assigned
+        // against this canonical sequence before the independent semantic body layout is calculated.
+        foreach (var entry in pkg.Entries.OrderBy(e => (uint)e.Id))
             pkg.EntryNames.GetOffset(entry.Name);
 
         // 2nd pass: assign 16-byte-aligned data offsets and build the meta table.
@@ -970,19 +1208,33 @@ public static class ProsperoPkgBuilder
         // 0xC0000 to 0x100000 and changed every finalized-image locator.
         ulong bodyAlignment = pkg.EntryKeys.Length == 0xB80 ? 0x10000UL : 0x80000UL;
         pkg.Header.body_size = Align(pkg.Header.body_offset + bodySize, bodyAlignment) - pkg.Header.body_offset;
-        pkg.Header.main_ent_data_size = (uint)(new Entry[]
-        {
-            pkg.EntryKeys, pkg.ImageKey, pkg.GeneralDigests, pkg.Metas, pkg.Digests,
-        }).Sum(x => x.Length);
+        if (pkg.Header.content_type == ContentTypeAl)
+            pkg.Header.body_size = Math.Max(pkg.Header.body_size, 0x1E000);
+        pkg.Header.main_ent_data_size = checked((uint)pkg.Entries
+            .Take(pkg.Header.sc_entry_count - 1)
+            .Sum(x => x.Length));
 
-        pkg.Header.pfs_image_offset = pkg.Header.body_offset + pkg.Header.body_size;
+        bool noData = pkg.Header.content_type == ContentTypeAl;
+        pkg.Header.pfs_image_offset = noData ? 0 : pkg.Header.body_offset + pkg.Header.body_size;
         ulong containerSize = pkg.Header.pfs_image_offset;
+        if (pkg.Header.content_type == ContentTypeGd)
+            pkg.Header.promote_size = checked((uint)containerSize);
         bool publisherProfile = pkg.EntryKeys.Length == 0xB80;
         ulong leadingFihSize = publisherProfile ? ProsperoImageDigests.FihRelativeImageOffset : 0;
-        pkg.Header.package_size = pkg.Header.mount_image_size =
-            leadingFihSize + pkg.Header.pfs_image_size + containerSize;
+        pkg.Header.package_size = pkg.Header.mount_image_size = noData
+            ? 0
+            : leadingFihSize + pkg.Header.pfs_image_size + containerSize;
 
-        if (publisherProfile)
+        if (noData)
+        {
+            pkg.Header.mandatory_size = pkg.Metas.Metas
+                .Where(m => (uint)m.id is >= 0x1000 and < 0x2000)
+                .OrderBy(m => m.DataOffset)
+                .Select(m => (ulong)m.DataOffset)
+                .DefaultIfEmpty(pkg.Header.body_offset + pkg.Header.body_size)
+                .First();
+        }
+        else if (publisherProfile)
         {
             MetaEntry mandatory = pkg.Metas.Metas.First(m => (uint)m.id == ImagedigsEntryId);
             pkg.Header.mandatory_size = mandatory.DataOffset;
@@ -996,9 +1248,45 @@ public static class ProsperoPkgBuilder
         }
     }
 
+    private static void FinishAdditionalContentNoDataContainer(
+        Pkg pkg, Stream stream, ProsperoPkgBuildProperties props)
+    {
+        foreach (var kv in ComputeGeneralDigests(pkg))
+            pkg.GeneralDigests.Set(kv.Key, kv.Value);
+
+        var writer = new PkgWriter(stream);
+        writer.WriteBody(pkg, props.ContentId, props.Passcode);
+        CalcBodyDigests(pkg, stream);
+
+        stream.Position = 0;
+        writer.WriteHeader(pkg.Header);
+        stream.Position = 0;
+        byte[] cntHead = new byte[ProsperoImageDigests.PackageDigestRegionSize];
+        stream.ReadExactly(cntHead);
+        pkg.HeaderDigest = ProsperoImageDigests.ComputePackageDigest(cntHead);
+        stream.Position = ProsperoImageDigests.PackageDigestStoredOffset;
+        stream.Write(pkg.HeaderDigest);
+
+        stream.Position = 0;
+        byte[] signaturePreimage = new byte[0x1000];
+        stream.ReadExactly(signaturePreimage);
+        byte[] headerSha = Crypto.Sha256(signaturePreimage);
+        IProsperoMetadataSigner metadataSigner =
+            props.MetadataSigner ?? ProsperoPkgSigner.EmbeddedMetadataSigner;
+        pkg.HeaderSignature = metadataSigner.SignSha256(headerSha);
+        if (pkg.HeaderSignature.Length != ProsperoPkgSigner.SignatureSize)
+            throw new InvalidDataException(
+                $"Metadata signer '{metadataSigner.ProfileName}' returned " +
+                $"{pkg.HeaderSignature.Length} bytes; expected {ProsperoPkgSigner.SignatureSize}.");
+        stream.Position = 0x1000;
+        stream.Write(pkg.HeaderSignature);
+    }
+
     private static ProsperoPfsImageXmlOptions FinishContainer(
         Pkg pkg, Stream s, ProsperoPkgBuildProperties props, byte[]? nestedImageDigest,
-        Action<string> log, ulong napsLayoutSize = 0, uint innerInodeCount = 0)
+        Action<string> log, long nestedImageSize = 0, long nestedMetaBaseBlocks = 0,
+        uint nwonlyContentVersionHi = 0, int nwonlyNapsFileCount = 0,
+        int nwonlyAppFileCount = 0)
     {
         // Read the outer PFS image (encrypted blocks + plaintext superblock) so the PS5 mount digests can be
         // computed for the mount image — both are SHA3-256, NOT SHA-256:
@@ -1018,8 +1306,11 @@ public static class ProsperoPkgBuilder
         byte[] fihBlock = ProsperoFihBuilder.BuildFihHeaderBlock(
             ProsperoFihVariant.Debug, pkg.Header.pfs_image_size,
             ProsperoImageDigests.FihRelativeImageOffset + pkg.Header.pfs_image_size, image,
-            warnings: null, nestedImageDigest: nestedImageDigest, napsLayoutSize: napsLayoutSize,
-            innerInodeCount: innerInodeCount);
+            warnings: null, nestedImageDigest: nestedImageDigest, nestedImageSize: nestedImageSize,
+            nestedMetaBaseBlocks: nestedMetaBaseBlocks,
+            nwonlyContentVersionHi: nwonlyContentVersionHi,
+            nwonlyNapsFileCount: nwonlyNapsFileCount,
+            nwonlyAppFileCount: nwonlyAppFileCount);
         pkg.Header.pfs_signed_digest = ProsperoImageDigests.ComputeFixedInfoDigest(fihBlock);
 
         // General digests (PS5 nwonly scheme: type 0x102 [set at creation so the layout reserves 0x1E0],
@@ -1052,9 +1343,22 @@ public static class ProsperoPkgBuilder
         pkg.HeaderDigest = ProsperoImageDigests.ComputePackageDigest(cntHead);
         s.Position = ProsperoImageDigests.PackageDigestStoredOffset;
         s.Write(pkg.HeaderDigest, 0, pkg.HeaderDigest.Length);
-        byte[] headerSha = Crypto.Sha256(s, 0, 0x1000);
+        // Sign the bytes exactly as they will appear in the finalized FIH. BuildFromCnt changes
+        // CNT+0x410 from the standalone physical image offset to the shared FIH offset 0x10000;
+        // signing the pre-finalized value makes the embedded signature invalid after that rewrite.
+        s.Position = 0;
+        byte[] signaturePreimage = new byte[0x1000];
+        s.ReadExactly(signaturePreimage);
+        BinaryPrimitives.WriteUInt64BigEndian(
+            signaturePreimage.AsSpan(ProsperoImageDigests.CntPfsImageOffsetField, 8),
+            ProsperoImageDigests.FihRelativeImageOffset);
+        byte[] headerSha = Crypto.Sha256(signaturePreimage);
         s.Position = 0x1000;
-        pkg.HeaderSignature = ProsperoPkgSigner.SignDigest(headerSha);
+        IProsperoMetadataSigner metadataSigner = props.MetadataSigner ?? ProsperoPkgSigner.EmbeddedMetadataSigner;
+        pkg.HeaderSignature = metadataSigner.SignSha256(headerSha);
+        if (pkg.HeaderSignature.Length != ProsperoPkgSigner.SignatureSize)
+            throw new InvalidDataException(
+                $"Metadata signer '{metadataSigner.ProfileName}' returned {pkg.HeaderSignature.Length} bytes; expected {ProsperoPkgSigner.SignatureSize}.");
         s.Write(pkg.HeaderSignature, 0, pkg.HeaderSignature.Length);
 
         // Every digest, the geometry and the entry table are now finalized on this CNT, so the reproducible
@@ -1173,6 +1477,18 @@ public static class ProsperoPkgBuilder
     private readonly record struct ParamJsonInfo(
         string ContentVersion, string MasterVersion, string SdkVersion,
         string RequiredSystemSoftwareVersion, string ApplicationDrmType, string TitleName);
+
+    private static uint ContentVersionHigh(string contentVersion)
+    {
+        if (string.IsNullOrWhiteSpace(contentVersion)) return 0;
+        string major = contentVersion.Split('.')[0].Trim();
+        if (major.Length is 0 or > 2 || !byte.TryParse(
+                major, System.Globalization.NumberStyles.None,
+                System.Globalization.CultureInfo.InvariantCulture, out byte value))
+            return 0;
+        uint bcd = (uint)(((value / 10) << 4) | (value % 10));
+        return bcd << 24;
+    }
 
     // Best-effort param.json reader for the pfsimage.xml string fields. Any parse failure falls back to
     // the neutral defaults (the produced XML stays structurally valid and self-consistent).
@@ -1331,12 +1647,12 @@ public static class ProsperoPkgBuilder
         pkg.Header.digest_table_hash = Crypto.Sha3_256(pkg.Digests.FileData);
 
         using var ms = new MemoryStream();
-        foreach (var entry in new Entry[] { pkg.EntryKeys, pkg.ImageKey, pkg.GeneralDigests, pkg.Metas, pkg.Digests })
+        foreach (var entry in pkg.Entries.Take(pkg.Header.sc_entry_count - 1))
             new SubStream(s, entry.meta.DataOffset, entry.meta.DataSize).CopyTo(ms);
         pkg.Header.sc_entries1_hash = Crypto.Sha3_256(ms);
 
         ms.SetLength(0);
-        foreach (var entry in new Entry[] { pkg.EntryKeys, pkg.ImageKey, pkg.GeneralDigests, pkg.Metas })
+        foreach (var entry in pkg.Entries.Take(pkg.Header.sc_entry_count - 2))
         {
             long size = entry.Id == EntryId.METAS ? pkg.Header.sc_entry_count * 0x20 : entry.meta.DataSize;
             new SubStream(s, entry.meta.DataOffset, size).CopyTo(ms);
@@ -1346,10 +1662,206 @@ public static class ProsperoPkgBuilder
 
     private static byte[] ReadParamJson(string sourceFolder)
     {
-        var path = Path.Combine(sourceFolder, "sce_sys", "param.json");
-        if (!File.Exists(path))
-            throw new FileNotFoundException("sce_sys/param.json is required to build a PS5 package.", path);
+        string? path = ResolveSourceFile(sourceFolder, "sce_sys/param.json");
+        if (path is null)
+            throw new FileNotFoundException(
+                "sce_sys/param.json is required to build a PS5 package (either as a loose file or a GP5 mapping).");
         return File.ReadAllBytes(path);
+    }
+
+    private static byte[] BuildPublisherParamJson(
+        string sourceFolder,
+        ProsperoPkgBuildProperties props)
+    {
+        byte[] source = ReadParamJson(sourceFolder);
+        JsonNode? parsed;
+        try
+        {
+            parsed = JsonNode.Parse(source);
+        }
+        catch (JsonException ex)
+        {
+            throw new InvalidDataException("sce_sys/param.json is not valid JSON.", ex);
+        }
+
+        if (parsed is not JsonObject root)
+            throw new InvalidDataException("sce_sys/param.json must contain a JSON object.");
+
+        if (props.VolumeType != ProsperoVolumeType.AdditionalContentNoData)
+        {
+            string versionFileUri = root["versionFileUri"]?.GetValue<string>() ?? string.Empty;
+            if (versionFileUri.Length > 255)
+                throw new InvalidDataException(
+                    $"param.json versionFileUri is {versionFileUri.Length} characters; the publisher field is limited to 255.");
+            root["versionFileUri"] = versionFileUri.PadRight(255, ' ');
+        }
+
+        DateTime timestampUtc = props.TimeStamp.Kind switch
+        {
+            DateTimeKind.Utc => props.TimeStamp,
+            DateTimeKind.Local => props.TimeStamp.ToUniversalTime(),
+            _ => DateTime.SpecifyKind(props.TimeStamp, DateTimeKind.Utc),
+        };
+        root["pubtools"] = new JsonObject
+        {
+            ["creationDate"] = timestampUtc.ToString(
+                "yyyy-MM-dd HH:mm:ss",
+                System.Globalization.CultureInfo.InvariantCulture),
+            ["toolVersion"] = "2.79",
+        };
+
+        if (props.VolumeType == ProsperoVolumeType.AdditionalContentNoData)
+        {
+            // Publishing Tools reject these data/application-only properties in a PSAL param.
+            root.Remove("applicationCategoryType");
+            root.Remove("contentVersion");
+            root.Remove("versionFileUri");
+            root["conceptId"] ??= "10000000";
+            root["requiredSystemSoftwareVersion"] ??= "0x0500000000000000";
+            ((JsonObject)root["pubtools"]!)["submission"] = true;
+        }
+        else if (props.VolumeType == ProsperoVolumeType.Application)
+        {
+            root["sdkVersion"] ??= "0x0000000000000000";
+            root["addcont"] ??= new JsonObject
+            {
+                ["serviceIdForSharing"] = new JsonArray(
+                    Enumerable.Range(0, 7)
+                        .Select(_ => (JsonNode?)JsonValue.Create(new string(' ', 19)))
+                        .ToArray()),
+            };
+        }
+
+        JsonNode canonical = SortJsonNode(root)!;
+        string json = canonical.ToJsonString(new JsonSerializerOptions
+        {
+            WriteIndented = true,
+            Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+        });
+        // prospero-pub-cmd writes CRLF and a final line terminator regardless of the source JSON.
+        json = json.Replace("\r\n", "\n", StringComparison.Ordinal)
+            .Replace("\n", "\r\n", StringComparison.Ordinal) + "\r\n";
+        return new UTF8Encoding(false).GetBytes(json);
+    }
+
+    private static JsonNode? SortJsonNode(JsonNode? node)
+    {
+        if (node is JsonObject obj)
+        {
+            var sorted = new JsonObject();
+            foreach (KeyValuePair<string, JsonNode?> property in
+                     obj.OrderBy(p => p.Key, StringComparer.Ordinal))
+            {
+                sorted[property.Key] = SortJsonNode(property.Value);
+            }
+            return sorted;
+        }
+
+        if (node is JsonArray array)
+        {
+            var sorted = new JsonArray();
+            foreach (JsonNode? item in array)
+                sorted.Add(SortJsonNode(item));
+            return sorted;
+        }
+
+        return node?.DeepClone();
+    }
+
+    /// <summary>
+    /// Resolves a package-relative source path. When a GP5 exists it is the authoritative manifest,
+    /// matching <see cref="BuildInnerTree"/>; otherwise the loose source tree is used.
+    /// </summary>
+    internal static string? ResolveSourceFile(string sourceFolder, string packagePath)
+    {
+        string normalized = packagePath.Replace('\\', '/').Trim('/');
+        string? project = Directory.EnumerateFiles(sourceFolder, "*.gp5", SearchOption.TopDirectoryOnly)
+            .OrderBy(path => Path.GetFileName(path), StringComparer.OrdinalIgnoreCase)
+            .FirstOrDefault();
+        if (project is null)
+        {
+            string loose = Path.Combine(
+                sourceFolder, normalized.Replace('/', Path.DirectorySeparatorChar));
+            return File.Exists(loose) ? Path.GetFullPath(loose) : null;
+        }
+
+        XDocument document = XDocument.Load(project, LoadOptions.None);
+        string projectDirectory = Path.GetDirectoryName(project)!;
+        string? resolved = null;
+        foreach (XElement file in document.Descendants("file"))
+        {
+            string? destination = (string?)file.Attribute("dst_path");
+            if (string.IsNullOrWhiteSpace(destination)
+                || !string.Equals(
+                    destination.Replace('\\', '/').Trim('/'),
+                    normalized,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            string? source = (string?)file.Attribute("src_path");
+            source = string.IsNullOrWhiteSpace(source) ? destination : source;
+            string candidate = Path.GetFullPath(Path.Combine(
+                projectDirectory, source.Replace('\\', Path.DirectorySeparatorChar)));
+            if (!File.Exists(candidate))
+                throw new FileNotFoundException(
+                    $"GP5 source file was not found for '{destination}'.", candidate);
+            if (resolved is not null)
+                throw new InvalidDataException($"GP5 contains duplicate destination '{normalized}'.");
+            resolved = candidate;
+        }
+        return resolved;
+    }
+
+    private static IReadOnlyDictionary<string, string> ResolveSceSysFiles(string sourceFolder)
+    {
+        var result = new SortedDictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        string? project = Directory.EnumerateFiles(sourceFolder, "*.gp5", SearchOption.TopDirectoryOnly)
+            .OrderBy(path => Path.GetFileName(path), StringComparer.OrdinalIgnoreCase)
+            .FirstOrDefault();
+        if (project is null)
+        {
+            string sceSys = Path.Combine(sourceFolder, "sce_sys");
+            if (!Directory.Exists(sceSys))
+                return result;
+            foreach (string file in Directory.EnumerateFiles(sceSys, "*", SearchOption.AllDirectories))
+            {
+                string relative = Path.GetRelativePath(sceSys, file).Replace('\\', '/');
+                result.Add(relative, Path.GetFullPath(file));
+            }
+            return result;
+        }
+
+        XDocument document = XDocument.Load(project, LoadOptions.None);
+        string projectDirectory = Path.GetDirectoryName(project)!;
+        foreach (XElement file in document.Descendants("file"))
+        {
+            string? destination = (string?)file.Attribute("dst_path");
+            string? source = (string?)file.Attribute("src_path");
+            if (string.IsNullOrWhiteSpace(destination))
+                continue;
+            source = string.IsNullOrWhiteSpace(source) ? destination : source;
+            string normalized = destination.Replace('\\', '/').Trim('/');
+            if (!normalized.StartsWith("sce_sys/", StringComparison.OrdinalIgnoreCase))
+                continue;
+            string relative = normalized["sce_sys/".Length..];
+            string candidate = Path.GetFullPath(Path.Combine(
+                projectDirectory, source.Replace('\\', Path.DirectorySeparatorChar)));
+            if (!File.Exists(candidate))
+                throw new FileNotFoundException(
+                    $"GP5 source file was not found for '{destination}'.", candidate);
+            if (!result.TryAdd(relative, candidate))
+                throw new InvalidDataException($"GP5 contains duplicate destination '{normalized}'.");
+        }
+        return result;
+    }
+
+    private static byte[] DeriveDeterministicOuterSeed(string contentId, string passcode)
+    {
+        byte[] material = Encoding.ASCII.GetBytes(
+            "LibProsperoPkg deterministic outer seed\0" + contentId + "\0" + passcode);
+        return ProsperoImageDigests.Sha3_256(material).AsSpan(0, 16).ToArray();
     }
 
     // Known sce_sys media files and their PS5 entry ids (the inspection-relevant subset).
@@ -1381,15 +1893,14 @@ public static class ProsperoPkgBuilder
     // which is regenerated when absent.
     private static readonly HashSet<uint> GeneratedEntryIds = [0x1000];
 
-    private static IEnumerable<Entry> CollectMediaEntries(string sourceFolder)
+    private static IEnumerable<Entry> CollectMediaEntries(string sourceFolder, bool generateDds = true)
     {
-        var sceSys = Path.Combine(sourceFolder, "sce_sys");
+        IReadOnlyDictionary<string, string> sceSysFiles = ResolveSceSysFiles(sourceFolder);
         var emitted = new HashSet<uint>();
 
         foreach (var (name, id) in MediaFiles)
         {
-            var path = Path.Combine(sceSys, name);
-            if (!File.Exists(path)) continue;
+            if (!sceSysFiles.TryGetValue(name, out string? path)) continue;
             emitted.Add(id);
             var data = File.ReadAllBytes(path);
             yield return new GenericEntry((EntryId)id, name) { FileData = data };
@@ -1397,18 +1908,16 @@ public static class ProsperoPkgBuilder
 
         // DDS re-encodes of the icon/pic images: use an on-disk *.dds if the caller already supplied
         // one (e.g. extracted from a package); otherwise generate it from the *.png.
-        foreach (var (png, dds, id) in DdsMedia)
+        foreach (var (png, dds, id) in generateDds ? DdsMedia : [])
         {
-            var ddsPath = Path.Combine(sceSys, dds);
             byte[]? data = null;
-            if (File.Exists(ddsPath))
+            if (sceSysFiles.TryGetValue(dds, out string? ddsPath))
             {
                 data = File.ReadAllBytes(ddsPath);
             }
             else
             {
-                var pngPath = Path.Combine(sceSys, png);
-                if (!File.Exists(pngPath)) continue;
+                if (!sceSysFiles.TryGetValue(png, out string? pngPath)) continue;
                 try
                 {
                     data = ProsperoDdsEncoder.EncodePngToDds(File.ReadAllBytes(pngPath));
@@ -1429,11 +1938,8 @@ public static class ProsperoPkgBuilder
         // must be carried in the outer container instead. Covers the backend-authored license,
         // network-platform, self-info, delta-info, keymap_rp, changeinfo, pronunciation and trophy
         // files. These blobs are packed as supplied; the library never fabricates them.
-        if (!Directory.Exists(sceSys)) yield break;
-        foreach (var file in Directory.EnumerateFiles(sceSys, "*", SearchOption.AllDirectories)
-                                      .OrderBy(p => p, StringComparer.Ordinal))
+        foreach ((string rel, string file) in sceSysFiles)
         {
-            var rel = Path.GetRelativePath(sceSys, file).Replace('\\', '/');
             if (!EntryNames.NameToId.TryGetValue(rel, out var id)) continue;
             var idv = (uint)id;
             if (rel.EndsWith(".dds", StringComparison.Ordinal)) continue; // handled by the DDS pass
@@ -1442,7 +1948,11 @@ public static class ProsperoPkgBuilder
             var data = File.ReadAllBytes(file);
             if (!ProsperoSystemFiles.Validate(rel, data, out var error))
                 throw new InvalidDataException($"sce_sys/{rel}: {error}");
-            yield return new GenericEntry(id, rel) { FileData = data };
+            // Publisher AC license records are identified exclusively by id. Reference packages
+            // keep NameTableOffset at zero for 0x0400/0x0401; adding their friendly names grows
+            // ENTRY_NAMES by 0x19 bytes and shifts the semantic CNT body layout.
+            string? entryName = id is EntryId.LICENSE_DAT or EntryId.LICENSE_INFO ? null : rel;
+            yield return new GenericEntry(id, entryName) { FileData = data };
         }
     }
 

@@ -21,10 +21,48 @@ public static class Crypto
     /// moduli, so the returned ciphertext has the same length as
     /// <paramref name="modulus"/>.
     /// </summary>
-    public static byte[] RsaPkcs1EncryptKey(byte[] modulus, byte[] data)
+    public static byte[] RsaPkcs1EncryptKey(byte[] modulus, byte[] data, bool deterministic = false)
     {
         ArgumentNullException.ThrowIfNull(modulus);
         ArgumentNullException.ThrowIfNull(data);
+        if (data.Length > modulus.Length - 11)
+            throw new ArgumentException("RSA PKCS#1 v1.5 input is too large for the modulus.", nameof(data));
+
+        if (deterministic)
+        {
+            // Explicit reproducible-build profile. The encoded message is still valid
+            // EME-PKCS1-v1_5, but its non-zero PS bytes come from a stable SHA-256 stream.
+            byte[] encoded = new byte[modulus.Length];
+            encoded[1] = 2;
+            int paddingLength = encoded.Length - data.Length - 3;
+            byte[] seed = SHA256.HashData(
+                Encoding.ASCII.GetBytes("LibProsperoPkg deterministic RSA wrap\0")
+                    .Concat(modulus)
+                    .Concat(data)
+                    .ToArray());
+            int cursor = 2;
+            uint counter = 0;
+            while (cursor < 2 + paddingLength)
+            {
+                byte[] input = new byte[seed.Length + 4];
+                seed.CopyTo(input, 0);
+                input[^4] = (byte)(counter >> 24);
+                input[^3] = (byte)(counter >> 16);
+                input[^2] = (byte)(counter >> 8);
+                input[^1] = (byte)counter;
+                counter++;
+                foreach (byte value in SHA256.HashData(input))
+                {
+                    if (value == 0) continue;
+                    encoded[cursor++] = value;
+                    if (cursor == 2 + paddingLength) break;
+                }
+            }
+            encoded[2 + paddingLength] = 0;
+            data.CopyTo(encoded, 3 + paddingLength);
+            return RsaPublicModExp(encoded, modulus, 65537);
+        }
+
         using var rsa = RSA.Create();
         rsa.ImportParameters(new RSAParameters
         {
@@ -32,6 +70,22 @@ public static class Crypto
             Exponent = new byte[] { 0x01, 0x00, 0x01 },
         });
         return rsa.Encrypt(data, RSAEncryptionPadding.Pkcs1);
+    }
+
+    private static byte[] RsaPublicModExp(byte[] value, byte[] modulusBytes, int exponentValue)
+    {
+        var message = new BigInteger(value, isUnsigned: true, isBigEndian: true);
+        var modulus = new BigInteger(modulusBytes, isUnsigned: true, isBigEndian: true);
+        var exponent = new BigInteger(exponentValue);
+        byte[] result = BigInteger.ModPow(message, exponent, modulus)
+            .ToByteArray(isUnsigned: true, isBigEndian: true);
+        if (result.Length > modulusBytes.Length)
+            throw new CryptographicException("RSA result exceeds the modulus size.");
+        if (result.Length == modulusBytes.Length)
+            return result;
+        byte[] padded = new byte[modulusBytes.Length];
+        result.CopyTo(padded, padded.Length - result.Length);
+        return padded;
     }
 
     /// <summary>

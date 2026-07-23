@@ -46,7 +46,6 @@ using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
-using System.IO.Compression;
 using System.Text;
 
 namespace LibProsperoPkg.PKG;
@@ -278,7 +277,7 @@ public static class ProsperoSiArchive
     /// </summary>
     public static IReadOnlyList<ProsperoSiMember> BuildMembers(
         string contentId,
-        byte[] pfsImageXml,
+        byte[]? pfsImageXml,
         byte[]? playGoChunkDat = null,
         byte[]? napsMeta18 = null,
         byte[]? napsMeta300 = null,
@@ -286,7 +285,6 @@ public static class ProsperoSiArchive
         byte[]? finalizedMountImage = null)
     {
         ArgumentException.ThrowIfNullOrEmpty(contentId);
-        ArgumentNullException.ThrowIfNull(pfsImageXml);
 
         // When the caller passes the finalized mount image but not an explicit CRC blob, compute
         // playgo-chunk.crc reproducibly (CRC-32C of each 64KiB block). An explicitly supplied blob
@@ -307,7 +305,8 @@ public static class ProsperoSiArchive
                 members.Add(new($"common/etc/naps_meta_{id}.dat", napsMeta300));
         }
 
-        members.Add(new(PfsImageXmlPath, pfsImageXml));
+        if (pfsImageXml is not null)
+            members.Add(new(PfsImageXmlPath, pfsImageXml));
 
         if (playGoChunkDat is not null)
             members.Add(new(PlayGoChunkDatPath, playGoChunkDat));
@@ -335,8 +334,8 @@ public static class ProsperoSiArchive
     ///   <item><c>config/&lt;content-id&gt;/playgo-chunk.crc</c> computed by CRC-32C over the finalized
     ///   mount image.</item>
     /// </list>
-    /// The keyed/encrypted <c>naps_meta_18.dat</c> metric blob has no off-console producer and is never
-    /// fabricated — it is omitted.
+    /// A caller-supplied publisher <c>naps_meta_18.dat</c> can be preserved verbatim; when omitted,
+    /// the reproducible serializer output is used where the selected profile supports it.
     /// </summary>
     /// <param name="pfsImageXml">Fully-populated reproducible pfsimage.xml options from the builder.</param>
     /// <param name="playGoChunkDat">CNT PlayGo chunk descriptor bytes (entry 0x1001), or null.</param>
@@ -348,17 +347,30 @@ public static class ProsperoSiArchive
     /// which is only populated for the reference data-first layout.
     /// </param>
     /// <param name="warnings">Optional sink for any all-zero-placeholder notices from the XML builder.</param>
+    /// <param name="napsMeta18">Optional publisher-authored type-18 NAPS metric payload.</param>
+    /// <param name="includePfsImageXml">Whether to include <c>common/etc/pfsimage.xml</c>.</param>
+    /// <param name="contentFiles">Optional inner content-file list used by the metric serializers.</param>
+    /// <param name="innerImage">Optional completed inner-image model used for exact geometry metadata.</param>
+    /// <param name="integrityProvider">
+    /// Optional override for <c>ihsh/rhsh</c> and provider for the AES-XTS-derived
+    /// <c>obcc</c> table inside <c>naps_meta_18.dat</c>.
+    /// </param>
     public static byte[] BuildDebugSiSegment(
         ProsperoPfsImageXmlOptions pfsImageXml, byte[]? playGoChunkDat, byte[] mountImage,
-        long innerImageSize = 0, ICollection<string>? warnings = null)
+        long innerImageSize = 0, ICollection<string>? warnings = null,
+        byte[]? napsMeta18 = null, bool includePfsImageXml = true,
+        IReadOnlyList<(string Path, long Size)>? contentFiles = null,
+        LibProsperoPkg.PFS.ProsperoPs5InnerImageResult? innerImage = null,
+        IProsperoNapsIntegrityProvider? integrityProvider = null)
     {
         ArgumentNullException.ThrowIfNull(pfsImageXml);
         ArgumentNullException.ThrowIfNull(mountImage);
 
-        // naps_meta_300 R = InnerImageSize - 0x10000 (block-aligned inner-image size minus one FIH block).
+        // naps_meta_300 R = InnerImageSize - 0x20000; the final field is the fixed 0x20000
+        // publisher trailing extent.
         // Prefer the builder-captured InnerImageSize; when it is not supplied (standalone callers), read
         // FIH[0xA0] out of the mount image, which is only populated for the reference data-first layout.
-        // Below one block the record cannot be derived, so it is simply omitted (never faked).
+        // Below that trailing extent the record cannot be derived, so it is simply omitted.
         byte[]? napsMeta300 = null;
         ulong innerSize = innerImageSize > 0 ? (ulong)innerImageSize : 0;
         if (innerSize == 0)
@@ -367,16 +379,29 @@ public static class ProsperoSiArchive
             if (mountImage.Length >= sizeField + 8)
                 innerSize = BinaryPrimitives.ReadUInt64LittleEndian(mountImage.AsSpan(sizeField, 8));
         }
-        if (innerSize >= ProsperoNapsMeta.PfsBlockSize)
+        if (innerSize >= ProsperoNapsMeta.Meta300TrailingExtentSize)
             napsMeta300 = ProsperoNapsMeta.BuildMeta300FromInnerImageSize(innerSize);
 
-        byte[] xmlBytes = Encoding.UTF8.GetBytes(BuildPfsImageXml(pfsImageXml, warnings));
+        if (napsMeta18 is null && innerSize >= ProsperoNapsMeta.Meta300TrailingExtentSize)
+        {
+            byte[] generated = ProsperoNapsMeta.BuildMeta18(
+                innerSize,
+                mountImage,
+                contentFiles ?? Array.Empty<(string Path, long Size)>(),
+                innerImage,
+                integrityProvider);
+            if (generated.Length != 0) napsMeta18 = generated;
+        }
+
+        byte[]? xmlBytes = includePfsImageXml
+            ? Encoding.UTF8.GetBytes(BuildPfsImageXml(pfsImageXml, warnings))
+            : null;
 
         IReadOnlyList<ProsperoSiMember> members = BuildMembers(
             pfsImageXml.ContentId,
             xmlBytes,
             playGoChunkDat: playGoChunkDat,
-            napsMeta18: null,                 // keyed per-package metric blob — never fabricated.
+            napsMeta18: napsMeta18,           // protected per-package metric blob: preserve only.
             napsMeta300: napsMeta300,
             playGoChunkCrc: null,
             finalizedMountImage: mountImage); // computes playgo-chunk.crc reproducibly (CRC-32C).
@@ -385,23 +410,92 @@ public static class ProsperoSiArchive
     }
 
     /// <summary>
-    /// Serialises <paramref name="members"/> into a ZIP using <see cref="CompressionLevel.NoCompression"/>
-    /// (the reference SI uses STORED entries) and returns the raw segment bytes.
+    /// Serialises <paramref name="members"/> into the publisher SI ZIP framing: STORED entries,
+    /// no extra fields, central-directory <c>version made by = 0</c>, and deterministic DOS time.
     /// </summary>
     public static byte[] WriteZip(IReadOnlyList<ProsperoSiMember> members)
     {
         ArgumentNullException.ThrowIfNull(members);
+        const ushort versionNeeded = 20;
+        const ushort dosTime = 0;
+        const ushort dosDate = 0x0021; // 1980-01-01, the earliest valid DOS date.
+
         using var ms = new MemoryStream();
-        using (var zip = new ZipArchive(ms, ZipArchiveMode.Create, leaveOpen: true))
+        using var writer = new BinaryWriter(ms, Encoding.ASCII, leaveOpen: true);
+        var local = new (uint Crc, int Size, long Offset)[members.Count];
+
+        for (int i = 0; i < members.Count; i++)
         {
-            foreach (ProsperoSiMember m in members)
-            {
-                ZipArchiveEntry entry = zip.CreateEntry(m.Path, CompressionLevel.NoCompression);
-                using Stream es = entry.Open();
-                es.Write(m.Content, 0, m.Content.Length);
-            }
+            ProsperoSiMember member = members[i];
+            byte[] name = Encoding.ASCII.GetBytes(member.Path);
+            uint crc = ZipCrc32(member.Content);
+            local[i] = (crc, member.Content.Length, ms.Position);
+
+            writer.Write(0x04034b50u);
+            writer.Write(versionNeeded);
+            writer.Write((ushort)0); // flags
+            writer.Write((ushort)0); // STORED
+            writer.Write(dosTime);
+            writer.Write(dosDate);
+            writer.Write(crc);
+            writer.Write((uint)member.Content.Length);
+            writer.Write((uint)member.Content.Length);
+            writer.Write((ushort)name.Length);
+            writer.Write((ushort)0); // extra length
+            writer.Write(name);
+            writer.Write(member.Content);
         }
+
+        long centralOffset = ms.Position;
+        for (int i = 0; i < members.Count; i++)
+        {
+            byte[] name = Encoding.ASCII.GetBytes(members[i].Path);
+            writer.Write(0x02014b50u);
+            writer.Write((ushort)0); // publisher SI: version made by
+            writer.Write(versionNeeded);
+            writer.Write((ushort)0); // flags
+            writer.Write((ushort)0); // STORED
+            writer.Write(dosTime);
+            writer.Write(dosDate);
+            writer.Write(local[i].Crc);
+            writer.Write((uint)local[i].Size);
+            writer.Write((uint)local[i].Size);
+            writer.Write((ushort)name.Length);
+            writer.Write((ushort)0); // extra length
+            writer.Write((ushort)0); // comment length
+            writer.Write((ushort)0); // disk start
+            writer.Write((ushort)0); // internal attributes
+            writer.Write(0u);        // external attributes
+            writer.Write((uint)local[i].Offset);
+            writer.Write(name);
+        }
+
+        long centralSize = ms.Position - centralOffset;
+        if (members.Count > ushort.MaxValue || centralOffset > uint.MaxValue || centralSize > uint.MaxValue)
+            throw new InvalidDataException("SI ZIP exceeds the non-Zip64 publisher layout.");
+
+        writer.Write(0x06054b50u);
+        writer.Write((ushort)0);
+        writer.Write((ushort)0);
+        writer.Write((ushort)members.Count);
+        writer.Write((ushort)members.Count);
+        writer.Write((uint)centralSize);
+        writer.Write((uint)centralOffset);
+        writer.Write((ushort)0);
+        writer.Flush();
         return ms.ToArray();
+    }
+
+    private static uint ZipCrc32(ReadOnlySpan<byte> data)
+    {
+        uint crc = 0xffffffffu;
+        foreach (byte value in data)
+        {
+            crc ^= value;
+            for (int bit = 0; bit < 8; bit++)
+                crc = (crc >> 1) ^ (0xedb88320u & (uint)-(int)(crc & 1));
+        }
+        return crc ^ 0xffffffffu;
     }
 
     /// <summary>

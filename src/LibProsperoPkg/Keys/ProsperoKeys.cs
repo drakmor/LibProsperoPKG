@@ -1,10 +1,9 @@
 // LibProsperoPkg - A library for building and inspecting PS5 packages.
 // Copyright (C) 2026 SvenGDK
 //
-// Wired-in PS5 publishing key material, embedded as resources so the build is
-// self-contained. None of these are secret retail keys: they are the published PKG-metadata
-// RSA-3072 private key (used by the system software to verify a package's metadata) and the
-// Prospero publishing passcode / mount-image keys.
+// Embedded research/test material retained for self-contained builds. The RSA profile is
+// self-consistent but is not the trust key used by current prospero-pub-cmd builds. Production
+// compatibility is supplied through the external signer/sidecar path.
 
 using System;
 using System.IO;
@@ -14,9 +13,8 @@ using System.Security.Cryptography;
 namespace LibProsperoPkg.Keys;
 
 /// <summary>
-/// Provides access to the published PS5 publishing key material required by the package
-/// pipeline. Keys are embedded resources; <see cref="IsAvailable"/> reports whether they could
-/// be loaded.
+/// Provides access to the embedded research/test key material used by the package pipeline.
+/// <see cref="IsAvailable"/> reports whether every embedded resource could be loaded.
 /// </summary>
 public static class ProsperoKeys
 {
@@ -28,7 +26,7 @@ public static class ProsperoKeys
     private static readonly Lazy<byte[]?> _passcodeKey = new(() => TryLoadBytes(PasscodeResource));
     private static readonly Lazy<byte[]?> _mountImageKey = new(() => TryLoadBytes(MountImageResource));
 
-    /// <summary>True when every required PS5 publishing key was loaded successfully.</summary>
+    /// <summary>True when every embedded research/test resource was loaded successfully.</summary>
     public static bool IsAvailable =>
         _metadataRsa.Value is not null
         && _passcodeKey.Value is { Length: > 0 }

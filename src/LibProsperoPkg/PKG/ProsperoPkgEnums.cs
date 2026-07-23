@@ -70,6 +70,8 @@ public static class ProsperoPkgLayout
     /// <summary>FIH header offset of the embedded CNT container offset (little-endian u64).</summary>
     public const int FihEmbeddedCntOffsetField = 0x58;
 
+    public const int FihDataRegionBlockCountField = 0x50;
+
     // ---- Outer-PFS accounting fields (little-endian; validated from the FIH writer output
     // and cross-checked against three reference debug packages). These describe
     // the inner pfs_image.dat / metadata block split of the shared outer-PFS image, not the
@@ -90,6 +92,13 @@ public static class ProsperoPkgLayout
     /// (little-endian u64) - equals <see cref="FihInnerImageBlockCountField"/> * <see cref="FihHeaderRegionSize"/>.
     /// </summary>
     public const int FihInnerImageSizeField = 0xA0;
+
+    public const int FihInnerImageLogicalSizeField = 0xA8;
+    public const int FihContentVersionField = 0x9C;
+    public const int FihOuterFileCountField = 0xF0;
+    public const int FihFlatPathTableBlockCountField = 0xF8;
+    public const uint FihOuterFileCount = 1;
+    public const uint FihFlatPathTableBlockCount = 2;
 }
 
 /// <summary>

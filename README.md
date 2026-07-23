@@ -18,7 +18,11 @@ application.
   RSA-3072 metadata signing and the finalized debug image are produced by the library itself.
 - **Reader and writer.** Parse and inspect existing PS5 packages (`\x7FCNT` / `\x7FFIH`) and
   build new ones.
-- **Texture generation.** The `sce_sys` icon/picture DDS (BC7) re-encoder is backed by Magick.NET.
+- **Texture generation.** The `sce_sys` icon/picture DDS (BC7) re-encoder uses the Publishing
+  Tools `p2d --high --st` profile when available for byte-exact output, with a portable
+  deterministic BCnEncoder.NET fallback.
+- **Reproducible builds.** `ProsperoBuildOptions.DeterministicBuild` makes repeated PSAL and
+  APP/PPR-NAPS builds byte-identical, including outer-PFS seeds and RSA-wrapped metadata.
 
 ---
 
@@ -28,7 +32,8 @@ application.
 |---|---|
 | Toolchain | .NET 9 SDK or newer |
 | Language | C# 13 |
-| Dependency | `Magick.NET-Q8-AnyCPU` |
+| Dependencies | `Magick.NET-Q8-AnyCPU`, `BCnEncoder.Net` |
+| Optional exact DDS backend | Publishing Tools `ext/p2d.exe`, or `LIBPROSPERO_P2D_PATH` |
 
 ---
 
@@ -108,6 +113,8 @@ var options = new ProsperoBuildOptions
     TitleId      = "PPSA00000",
     Title        = "My PS5 Application",
     Version      = "01.00",
+    // Optional reproducible debug/regression build:
+    // DeterministicBuild = true,
     // Default: publisher data-first outer PFS + NAPS + direct-offset PPR-PFS.
     UsePublisherPprNaps = true,
     // Optional when the publishing environment supplies the separate 16-byte NAPS CMAC key:
@@ -163,13 +170,13 @@ See **[docs/](docs/)** for the full feature status and the PS5 package technical
 
 ## Limitations
 
-LibProsperoPkg produces a complete, self-consistent package whose structure and embedded
-metadata container round-trip through the reader. Two parts of a finalized image depend on
-console-side finalization material and are filled best-effort rather than reproduced exactly:
-the finalized-image digest table and the trailing install-metadata archive. A console running
-in **debug mode**, which relaxes finalized-image verification, is the intended target.
-On-console acceptance depends on the console's mode and firmware. See [docs/implementation-status.md](docs/implementation-status.md)
-for the precise breakdown.
+LibProsperoPkg produces a complete, self-consistent package whose CNT/FIH digests, outer PFS,
+NAPS mapping, inner PPR-PFS, and debug install metadata round-trip through the reader. Exact
+publisher acceptance still depends on external protected inputs: a trusted RSA-3072 metadata
+signer, the separate NAPS CMAC/`obcc` material, and (for AC/AL) a backend-authored license.
+Retail finalization and retail encrypted install metadata are not generated. A console running
+in **debug mode** is the intended target; acceptance still depends on console mode and firmware.
+See [docs/implementation-status.md](docs/implementation-status.md) for the precise breakdown.
 
 ---
 

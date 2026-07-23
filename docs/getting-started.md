@@ -145,6 +145,8 @@ var options = new ProsperoBuildOptions
     TitleId      = "PPSA00000",
     Title        = "My PS5 Application",
     Version      = "01.00",
+    // Enable for byte-identical debug/regression builds:
+    // DeterministicBuild = true,
 };
 
 var result = ProsperoPackageBuilder.Build(options, Console.WriteLine);

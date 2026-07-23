@@ -6,6 +6,7 @@
 
 using System;
 using System.IO;
+using System.Linq;
 
 namespace LibProsperoPkg.GP5;
 
@@ -47,6 +48,7 @@ public static class Gp5Creator
             throw new DirectoryNotFoundException($"Source folder does not exist: {sourceFolder}");
 
         var project = Gp5Project.Create(type, passcode);
+        project.FilesSpecified = false;
         project.RootDir = new Gp5RootDir
         {
             SourcePath = rootDirPathOverride ?? sourceFolder,
@@ -74,8 +76,10 @@ public static class Gp5Creator
 
         var root = Path.GetFullPath(sourceFolder);
         var project = Gp5Project.Create(type, passcode);
+        project.FilesSpecified = true;
 
-        foreach (var file in Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories))
+        foreach (var file in Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories)
+                     .OrderBy(path => Path.GetRelativePath(root, path), StringComparer.Ordinal))
         {
             var relative = Path.GetRelativePath(root, file);
             // Prospero destination paths use backslash separators (e.g. sce_sys\param.json).

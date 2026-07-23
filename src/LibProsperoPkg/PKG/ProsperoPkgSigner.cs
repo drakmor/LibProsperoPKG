@@ -1,47 +1,135 @@
 // LibProsperoPkg - A library for building and inspecting PS5 packages.
 // Copyright (C) 2026 SvenGDK
 //
-// PS5 PKG signing primitives. This makes the wired-in PS5 key material
-// (RSA-3072 PKG-metadata key, passcode blob, mount-image blob) actually used by the package
-// pipeline.
+// PS5 PKG signing primitives and pluggable metadata-signing profiles.
 //
 // Checks and derivations:
 // * The PKG-metadata signature primitive the system software checks: RSA-3072 PKCS#1 v1.5
-// over a SHA-256 digest, using the embedded PKG-metadata private key. On a console that
-// accepts non-retail packages this metadata-signature check is the gate a package must
-// pass, so signing it with the published key satisfies that check.
+// over a SHA-256 digest. The embedded key is a research/self-test profile; an external
+// provider or PEM sidecar supplies the trust profile required by a particular publisher tool.
 // * EKPFS / PFS key derivation from content id + passcode
 // (LibProsperoPkg.Util.Crypto.ComputeKeys / PfsGenEncKey) for the PS5 inner image.
-// * Self-consistency checks: the public modulus recovered from the embedded private key is
-// compared against the published modulus, and a sign -> verify round-trip proves the key
-// is usable.
-//
-// What is not done here: a fully accepted retail image additionally depends on
-// reference-only secrets that cannot be reproduced here. This class supplies the signing/key
-// primitives the write path consumes, and is fully self-validated in isolation.
+// * Self-consistency checks for the embedded profile: expected modulus fingerprint and a
+// sign -> verify round-trip.
 
 using LibProsperoPkg.Keys;
 using System;
+using System.IO;
 using System.Security.Cryptography;
 using System.Text;
 
 namespace LibProsperoPkg.PKG;
 
 /// <summary>
-/// PS5 PKG-metadata signing and PFS key-derivation primitives backed by the embedded
-/// PS5 key material. See the file header for the boundary between what is
-/// verifiable here and what additionally depends on reference-only secrets.
+/// Provider for the final publisher metadata signature stored at CNT+0x1000. Implementations receive
+/// SHA-256(CNT[0:0x1000]) and must return a 384-byte RSA-3072 PKCS#1 v1.5 signature.
+/// </summary>
+public interface IProsperoMetadataSigner
+{
+    /// <summary>Human-readable signing profile used in diagnostics.</summary>
+    string ProfileName { get; }
+
+    /// <summary>Signs an exact 32-byte SHA-256 digest.</summary>
+    byte[] SignSha256(ReadOnlySpan<byte> sha256Digest);
+}
+
+/// <summary>
+/// Optional companion contract for signers that can verify their own output. Hardware or remote
+/// signers may implement only <see cref="IProsperoMetadataSigner"/>.
+/// </summary>
+public interface IProsperoMetadataSignatureVerifier
+{
+    /// <summary>Verifies a signature over an exact 32-byte SHA-256 digest.</summary>
+    bool VerifySha256(ReadOnlySpan<byte> sha256Digest, ReadOnlySpan<byte> signature);
+}
+
+/// <summary>RSA-3072 PKCS#1 metadata signer loaded from a caller-supplied PEM private key.</summary>
+public sealed class ProsperoRsaMetadataSigner :
+    IProsperoMetadataSigner, IProsperoMetadataSignatureVerifier, IDisposable
+{
+    private readonly RSA rsa;
+
+    private ProsperoRsaMetadataSigner(RSA rsa, string profileName)
+    {
+        this.rsa = rsa;
+        ProfileName = profileName;
+        if (rsa.KeySize != 3072)
+            throw new ArgumentException($"Publisher metadata key must be RSA-3072, not RSA-{rsa.KeySize}.");
+    }
+
+    /// <inheritdoc />
+    public string ProfileName { get; }
+
+    /// <summary>Loads an unencrypted PKCS#1 or PKCS#8 RSA private key from PEM.</summary>
+    public static ProsperoRsaMetadataSigner LoadPem(string path, string? profileName = null)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(path);
+        RSA rsa = RSA.Create();
+        try
+        {
+            rsa.ImportFromPem(File.ReadAllText(path));
+            return new ProsperoRsaMetadataSigner(rsa, profileName ?? Path.GetFileName(path));
+        }
+        catch
+        {
+            rsa.Dispose();
+            throw;
+        }
+    }
+
+    /// <inheritdoc />
+    public byte[] SignSha256(ReadOnlySpan<byte> sha256Digest)
+    {
+        if (sha256Digest.Length != 32)
+            throw new ArgumentException("A SHA-256 digest is exactly 32 bytes.", nameof(sha256Digest));
+        byte[] signature = rsa.SignHash(sha256Digest, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+        if (signature.Length != ProsperoPkgSigner.SignatureSize)
+            throw new CryptographicException("Publisher metadata signer returned a non-RSA-3072 signature.");
+        return signature;
+    }
+
+    /// <inheritdoc />
+    public bool VerifySha256(ReadOnlySpan<byte> sha256Digest, ReadOnlySpan<byte> signature)
+    {
+        if (sha256Digest.Length != 32 || signature.Length != ProsperoPkgSigner.SignatureSize)
+            return false;
+        return rsa.VerifyHash(
+            sha256Digest, signature, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+    }
+
+    /// <inheritdoc />
+    public void Dispose() => rsa.Dispose();
+}
+
+/// <summary>
+/// PS5 PKG-metadata self-test signing and PFS key-derivation primitives backed by the
+/// embedded research material.
 /// </summary>
 public static class ProsperoPkgSigner
 {
+    private sealed class EmbeddedSigner :
+        IProsperoMetadataSigner, IProsperoMetadataSignatureVerifier
+    {
+        public string ProfileName => "embedded research RSA-3072";
+        public byte[] SignSha256(ReadOnlySpan<byte> sha256Digest) => SignDigest(sha256Digest.ToArray());
+        public bool VerifySha256(ReadOnlySpan<byte> sha256Digest, ReadOnlySpan<byte> signature) =>
+            VerifyDigest(sha256Digest.ToArray(), signature.ToArray());
+    }
+
+    /// <summary>
+    /// Embedded research signing profile. Its signatures are self-consistent, but current
+    /// prospero-pub-cmd publisher builds use a different trust key; use a caller-supplied provider
+    /// when publisher acceptance is required.
+    /// </summary>
+    public static IProsperoMetadataSigner EmbeddedMetadataSigner { get; } = new EmbeddedSigner();
     /// <summary>Size in bytes of an RSA-3072 signature (the PKG-metadata key width).</summary>
     public const int SignatureSize = 384;
 
     /// <summary>
-    /// The first 16 bytes of the published PKG-metadata RSA-3072 modulus. Used only as a
-    /// fingerprint to confirm the embedded private key is the documented PKG-metadata key.
+    /// The first 16 bytes of the expected embedded RSA-3072 modulus. Used only as a
+    /// corruption/regression fingerprint for the research profile.
     /// </summary>
-    private static readonly byte[] PublishedModulusPrefix =
+    private static readonly byte[] EmbeddedModulusPrefix =
     [
         0xAB, 0x1D, 0xBD, 0x43, 0x39, 0x49, 0x33, 0x16,
         0xA3, 0x5C, 0x40, 0x4E, 0x2C, 0x22, 0x97, 0xB8,
@@ -108,10 +196,8 @@ public static class ProsperoPkgSigner
     }
 
     /// <summary>
-    /// Confirms the embedded private key is the documented PKG-metadata key, by matching the
-    /// published modulus fingerprint and proving the
-    /// key signs and verifies. This is the self-check that replaces on-hardware testing
-    /// for the key material itself.
+    /// Confirms that the embedded research profile has the expected modulus fingerprint and
+    /// can complete a sign/verify round-trip. This does not establish publisher trust.
     /// </summary>
     public static bool VerifyKeyMaterial()
     {
@@ -121,9 +207,9 @@ public static class ProsperoPkgSigner
         var modulus = MetadataModulus();
         if (modulus.Length != SignatureSize)
             return false;
-        for (int i = 0; i < PublishedModulusPrefix.Length; i++)
+        for (int i = 0; i < EmbeddedModulusPrefix.Length; i++)
         {
-            if (modulus[i] != PublishedModulusPrefix[i])
+            if (modulus[i] != EmbeddedModulusPrefix[i])
                 return false;
         }
 

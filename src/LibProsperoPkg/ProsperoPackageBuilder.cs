@@ -115,6 +115,12 @@ public sealed class ProsperoBuildOptions
     /// <summary>Content/master version, formatted <c>NN.NN</c>.</summary>
     public string Version { get; set; } = "01.00";
 
+    /// <summary>
+    /// UTC package creation time used consistently by PFS timestamps and the publisher
+    /// <c>param.json/pubtools/creationDate</c> field.
+    /// </summary>
+    public DateTime TimeStamp { get; set; } = DateTime.UnixEpoch;
+
     /// <summary>When true a minimal <c>param.json</c> is generated if the source folder lacks one.</summary>
     public bool GenerateParamJsonIfMissing { get; set; } = true;
 
@@ -151,6 +157,38 @@ public sealed class ProsperoBuildOptions
     /// package remains readable without it, but strict publisher integrity verification requires it.
     /// </summary>
     public byte[]? NapsOuterBlockCmacKey { get; set; }
+
+    /// <summary>
+    /// Optional publisher-authored <c>common/etc/naps_meta_18.dat</c> SI payload. Publisher AC
+    /// packages require this protected metric record; the library preserves it verbatim.
+    /// </summary>
+    public byte[]? NapsMeta18 { get; set; }
+
+    /// <summary>
+    /// Optional override for <c>ihsh/rhsh</c> and provider for the AES-XTS-derived
+    /// <c>obcc</c> table inside <c>naps_meta_18.dat</c>. Ignored when
+    /// <see cref="NapsMeta18"/> is supplied verbatim.
+    /// </summary>
+    public IProsperoNapsIntegrityProvider? NapsIntegrityProvider { get; set; }
+
+    /// <summary>
+    /// Optional fixed 16-byte outer-PFS seed. When omitted, the seed is derived in
+    /// <see cref="DeterministicBuild"/> mode and generated with a cryptographic RNG otherwise.
+    /// </summary>
+    public byte[]? OuterPfsSeed { get; set; }
+
+    /// <summary>
+    /// Enables byte-reproducible package generation: stable RSA wrapping and a content-derived
+    /// outer-PFS seed when <see cref="OuterPfsSeed"/> is omitted. The timestamp remains the explicit
+    /// <see cref="TimeStamp"/> value (Unix epoch by default).
+    /// </summary>
+    public bool DeterministicBuild { get; set; }
+
+    /// <summary>
+    /// Optional publisher RSA-3072 metadata signer. The provider signs SHA-256(CNT[0:0x1000]);
+    /// when omitted, the embedded research profile is used and remains suitable only for self-tests.
+    /// </summary>
+    public IProsperoMetadataSigner? MetadataSigner { get; set; }
 }
 
 /// <summary>The result of a build: the output path plus any non-fatal warnings.</summary>
@@ -303,7 +341,7 @@ public static class ProsperoPackageBuilder
     public static Gp5VolumeType VolumeTypeForMode(ProsperoPackageMode mode) => mode switch
     {
         ProsperoPackageMode.AdditionalContentData => Gp5VolumeType.prospero_ac,
-        ProsperoPackageMode.AdditionalContentNoData => Gp5VolumeType.prospero_ac_nodata,
+        ProsperoPackageMode.AdditionalContentNoData => Gp5VolumeType.prospero_al,
         _ => Gp5VolumeType.prospero_app,
     };
 
@@ -348,6 +386,8 @@ public static class ProsperoPackageBuilder
             throw new ArgumentException("Passcode must be exactly 32 characters.", nameof(options));
         if (!IsValidContentId(options.ContentId))
             throw new ArgumentException("Content ID is not in the format XXYYYY-XXXXYYYYY_00-ZZZZZZZZZZZZZZZZ.", nameof(options));
+        if (options.OuterPfsSeed is { Length: not 16 })
+            throw new ArgumentException("Outer PFS seed must contain exactly 16 bytes.", nameof(options));
 
         Directory.CreateDirectory(options.OutputFolder);
         var sourceFolder = Path.GetFullPath(options.SourceFolder);
@@ -375,8 +415,22 @@ public static class ProsperoPackageBuilder
     private static ProsperoBuildResult BuildCore(
         ProsperoBuildOptions options, string sourceFolder, Action<string> log, List<string> warnings)
     {
+        using ProsperoRsaMetadataSigner? sidecarSigner = options.MetadataSigner is null
+            ? ProsperoPublishingSidecar.TryLoadMetadataSigner()
+            : null;
+        IProsperoMetadataSigner? metadataSigner = options.MetadataSigner ?? sidecarSigner;
+        byte[]? napsCmacKey = options.NapsOuterBlockCmacKey
+            ?? ProsperoPublishingSidecar.TryLoadNapsCmacKey();
+
+        if (sidecarSigner is not null)
+            log($"Loaded publisher metadata signer {sidecarSigner.ProfileName} from {ProsperoPublishingSidecar.DefaultDirectory}.");
+        if (options.NapsOuterBlockCmacKey is null && napsCmacKey is not null)
+            log($"Loaded {ProsperoPublishingSidecar.NapsCmacKeyFileName} from {ProsperoPublishingSidecar.DefaultDirectory}.");
+
         string finalPath = Path.Combine(options.OutputFolder, ComposePkgFileName(options.ContentId, options.Version));
-        bool wantsFih = options.OutputFormat == ProsperoOutputFormat.DebugImage;
+        // PSAL is already a complete direct CNT+SI package and has no FIH/PFS layer.
+        bool wantsFih = options.OutputFormat == ProsperoOutputFormat.DebugImage &&
+                        options.Mode != ProsperoPackageMode.AdditionalContentNoData;
 
         // A CNT package holds only metadata and is NOT a full, installable package: only a finalized
         // \x7FFIH image is. So for the debug-image path the CNT is an intermediate that must NOT survive
@@ -392,15 +446,32 @@ public static class ProsperoPackageBuilder
             ContentId = options.ContentId,
             Passcode = options.Passcode,
             VolumeType = ProsperoVolumeTypeForMode(options.Mode),
+            TimeStamp = options.TimeStamp,
             CompressInnerImage = options.CompressInnerImage,
             InnerCompression = options.InnerCompression,
             UsePublisherPprNaps = options.UsePublisherPprNaps,
-            NapsOuterBlockCmacKey = options.NapsOuterBlockCmacKey,
+            NapsOuterBlockCmacKey = napsCmacKey,
+            NapsMeta18 = options.NapsMeta18,
+            NapsIntegrityProvider = options.NapsIntegrityProvider,
+            OuterPfsSeed = options.OuterPfsSeed,
+            DeterministicBuild = options.DeterministicBuild,
+            MetadataSigner = metadataSigner,
         };
 
-        if (options.UsePublisherPprNaps && options.NapsOuterBlockCmacKey is null)
+        bool usesNaps = options.UsePublisherPprNaps &&
+                        options.Mode != ProsperoPackageMode.AdditionalContentNoData;
+        if (usesNaps && napsCmacKey is null)
             warnings.Add("NAPS outer-block CMAC key was not supplied; its eight-byte integrity tags are zero.");
-
+        if (usesNaps && metadataSigner is null)
+            warnings.Add(
+                "Publisher metadata signer was not supplied; the embedded research RSA-3072 profile is not trusted by current prospero-pub-cmd builds.");
+        if (usesNaps &&
+            options.NapsMeta18 is null &&
+            options.NapsIntegrityProvider is null)
+        {
+            warnings.Add(
+                "NAPS obcc provider was not supplied; ihsh/rhsh are generated exactly, while the AES-XTS-derived obcc table remains zero.");
+        }
         log("Building the PS5 package...");
         LibProsperoPkg.PKG.ProsperoPkgBuilder.Build(buildProps, cntPath, out byte[]? nestedImageDigest, out var siInputs, log);
 
@@ -422,14 +493,16 @@ public static class ProsperoPackageBuilder
         }
 
         // PKG-metadata signing pass using the wired-in publishing key material.
-        SignPackage(cntPath, options, log, warnings);
+        SignPackage(cntPath, options, metadataSigner, log, warnings);
 
         // A CNT alone is metadata only, so unless the caller explicitly asked for the metadata
         // container we finalize it into a debug (FIH) image — the only form a debug-mode console
         // can install — and keep ONLY that final package.
         if (!wantsFih)
         {
-            log("Done (CNT metadata container).");
+            log(options.Mode == ProsperoPackageMode.AdditionalContentNoData
+                ? "Done (PSAL CNT+SI package; no PFS/FIH layer)."
+                : "Done (CNT metadata container).");
             return new ProsperoBuildResult { OutputPath = cntPath, Warnings = warnings };
         }
 
@@ -443,14 +516,19 @@ public static class ProsperoPackageBuilder
             Func<byte[], byte[]>? siFactory = siInputs is null
                 ? null
                 : mountImage => LibProsperoPkg.PKG.ProsperoSiArchive.BuildDebugSiSegment(
-                    siInputs.Xml, siInputs.PlayGoChunkDat, mountImage, siInputs.InnerImageSize, warnings);
+                    siInputs.Xml, siInputs.PlayGoChunkDat, mountImage, siInputs.InnerImageSize, warnings,
+                    siInputs.NapsMeta18, siInputs.IncludePfsImageXml, siInputs.ContentFiles,
+                    siInputs.InnerImage, siInputs.NapsIntegrityProvider);
 
             var fihWarnings = LibProsperoPkg.PKG.ProsperoFihBuilder.BuildFromCnt(
                 cntPath, finalPath, LibProsperoPkg.PKG.ProsperoFihVariant.Debug, log,
                 siArchiveFactory: siFactory,
                 nestedImageDigest: nestedImageDigest,
-                napsLayoutSize: siInputs?.NapsLayoutSize ?? 0,
-                innerInodeCount: siInputs?.FihInnerInodeCount ?? 0);
+                nestedImageSize: checked((long)(siInputs?.NapsLayoutSize ?? 0)),
+                nestedMetaBaseBlocks: siInputs?.NestedMetaBaseBlocks ?? 0,
+                nwonlyContentVersionHi: siInputs?.ContentVersionHigh ?? 0,
+                nwonlyNapsFileCount: checked((int)(siInputs?.FihNapsFileCount ?? 0)),
+                nwonlyAppFileCount: siInputs?.AppFileCount ?? 0);
             warnings.AddRange(fihWarnings);
 
             var fihType = ProsperoPkgReader.DetectType(finalPath);
@@ -489,9 +567,14 @@ public static class ProsperoPackageBuilder
     /// retail image additionally requires reference-controlled secrets.
     /// </remarks>
     private static void SignPackage(
-        string pkgPath, ProsperoBuildOptions options, Action<string> log, List<string> warnings)
+        string pkgPath,
+        ProsperoBuildOptions options,
+        IProsperoMetadataSigner? metadataSigner,
+        Action<string> log,
+        List<string> warnings)
     {
-        if (!ProsperoPkgSigner.IsAvailable)
+        IProsperoMetadataSigner signer = metadataSigner ?? ProsperoPkgSigner.EmbeddedMetadataSigner;
+        if (metadataSigner is null && !ProsperoPkgSigner.IsAvailable)
         {
             warnings.Add("PS5 PKG-metadata key unavailable; signature skipped.");
             return;
@@ -499,7 +582,7 @@ public static class ProsperoPackageBuilder
 
         try
         {
-            if (!ProsperoPkgSigner.VerifyKeyMaterial())
+            if (metadataSigner is null && !ProsperoPkgSigner.VerifyKeyMaterial())
             {
                 warnings.Add("PS5 PKG-metadata key self-check failed; signature skipped.");
                 return;
@@ -531,14 +614,17 @@ public static class ProsperoPackageBuilder
                 digest = sha.ComputeHash(region, 0, read);
             }
 
-            byte[] signature = ProsperoPkgSigner.SignDigest(digest);
-            bool verified = ProsperoPkgSigner.VerifyDigest(digest, signature);
+            byte[] signature = signer.SignSha256(digest);
+            bool? verified = signer is IProsperoMetadataSignatureVerifier verifier
+                ? verifier.VerifySha256(digest, signature)
+                : null;
 
             string sigPath = pkgPath + ".metasig";
             File.WriteAllBytes(sigPath, signature);
             log($"PKG-metadata signature written to {Path.GetFileName(sigPath)} " +
-                $"({signature.Length} bytes, RSA-3072 PKCS#1 SHA-256), valid={verified}.");
-            if (!verified)
+                $"({signature.Length} bytes, RSA-3072 PKCS#1 SHA-256, provider={signer.ProfileName}), " +
+                $"valid={verified?.ToString() ?? "not checked"}.");
+            if (verified == false)
                 warnings.Add("PKG-metadata signature failed self-verification.");
         }
         catch (Exception ex)
@@ -584,17 +670,22 @@ public static class ProsperoPackageBuilder
     private static void EnsureParamJson(
         ProsperoBuildOptions options, string sourceFolder, Action<string> log, List<string> warnings)
     {
-        var sceSys = Path.Combine(sourceFolder, "sce_sys");
-        var paramPath = Path.Combine(sceSys, "param.json");
-        if (File.Exists(paramPath))
+        string? resolvedParam = LibProsperoPkg.PKG.ProsperoPkgBuilder.ResolveSourceFile(
+            sourceFolder, "sce_sys/param.json");
+        if (resolvedParam is not null)
         {
-            log("Using existing sce_sys/param.json.");
+            string looseParam = Path.GetFullPath(Path.Combine(sourceFolder, "sce_sys", "param.json"));
+            log(string.Equals(Path.GetFullPath(resolvedParam), looseParam, StringComparison.OrdinalIgnoreCase)
+                ? "Using existing sce_sys/param.json."
+                : $"Using GP5-mapped sce_sys/param.json from {resolvedParam}.");
             return;
         }
 
         if (!options.GenerateParamJsonIfMissing)
             throw new InvalidOperationException("sce_sys/param.json is missing and auto-generation is disabled.");
 
+        var sceSys = Path.Combine(sourceFolder, "sce_sys");
+        var paramPath = Path.Combine(sceSys, "param.json");
         Directory.CreateDirectory(sceSys);
         log("sce_sys/param.json not found - generating a minimal one from the supplied metadata.");
         File.WriteAllText(paramPath, BuildMinimalParamJson(options), new UTF8Encoding(false));
@@ -609,9 +700,8 @@ public static class ProsperoPackageBuilder
 
         var root = new JsonObject
         {
-            ["applicationCategoryType"] = CategoryTypeForMode(options.Mode),
+            ["conceptId"] = "10000000",
             ["contentId"] = options.ContentId,
-            ["contentVersion"] = version,
             ["masterVersion"] = version,
             ["requiredSystemSoftwareVersion"] = "00.00.00.00",
             ["titleId"] = titleId,
@@ -621,6 +711,12 @@ public static class ProsperoPackageBuilder
                 ["en-US"] = new JsonObject { ["titleName"] = title },
             },
         };
+
+        if (options.Mode != ProsperoPackageMode.AdditionalContentNoData)
+        {
+            root["applicationCategoryType"] = CategoryTypeForMode(options.Mode);
+            root["contentVersion"] = version;
+        }
 
         return root.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
     }

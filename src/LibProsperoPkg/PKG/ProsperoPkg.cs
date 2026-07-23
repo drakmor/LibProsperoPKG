@@ -106,7 +106,10 @@ public sealed class ProsperoFihHeader
     /// <summary>Number of complete 64 KiB blocks occupied by <c>pfs_image.dat</c> (FIH +0x90).</summary>
     public uint InnerImageBlockCount { get; init; }
 
-    /// <summary>Publisher metadata-block count (FIH +0x94).</summary>
+    /// <summary>
+    /// FIH +0x94 value: publisher PPR uses the nonterminal NAPS FIDX/file count
+    /// (<c>NumFiles - 1</c>); legacy images may use an outer metadata-block count.
+    /// </summary>
     public uint MetadataBlockCount { get; init; }
 
     /// <summary>Serialized <c>naps_pkg_layout.dat</c> size (FIH +0xA8).</summary>

@@ -27,6 +27,9 @@ public sealed class ProsperoPublisherPprBuildOptions
     /// <summary>Outer-PFS seed. A random 16-byte seed is generated when omitted.</summary>
     public byte[]? OuterSeed { get; init; }
 
+    /// <summary>Derive a stable content-specific outer seed when <see cref="OuterSeed"/> is omitted.</summary>
+    public bool DeterministicBuild { get; init; }
+
     public DateTime TimeStamp { get; init; } = DateTime.UnixEpoch;
 }
 
@@ -127,7 +130,12 @@ public static class ProsperoPublisherPprBuilder
         File.WriteAllBytes(packedPath, naps.PackedImage);
         File.WriteAllBytes(layoutPath, naps.LayoutBytes);
 
-        byte[] seed = options.OuterSeed?.AsSpan().ToArray() ?? RandomNumberGenerator.GetBytes(16);
+        byte[] seed = options.OuterSeed?.AsSpan().ToArray()
+            ?? (options.DeterministicBuild
+                ? ProsperoImageDigests.Sha3_256(Encoding.ASCII.GetBytes(
+                    "LibProsperoPkg deterministic outer seed\0" +
+                    options.ContentId + "\0" + options.Passcode)).AsSpan(0, 16).ToArray()
+                : RandomNumberGenerator.GetBytes(16));
         long unixSeconds = new DateTimeOffset(options.TimeStamp.ToUniversalTime()).ToUnixTimeSeconds();
         var parameters = new ProsperoOuterPfsBuildParameters
         {

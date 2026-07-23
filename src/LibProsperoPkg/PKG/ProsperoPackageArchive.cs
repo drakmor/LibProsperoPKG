@@ -7,6 +7,7 @@ using System;
 using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.IO;
+using System.IO.Compression;
 using System.Linq;
 
 namespace LibProsperoPkg.PKG;
@@ -26,6 +27,18 @@ public static class ProsperoPackageArchive
 {
     public const int OuterBlockSize = 0x10000;
 
+    /// <summary>Verifies the embedded CNT RSA-3072 metadata signature at CNT+0x1000.</summary>
+    public static bool VerifyCntMetadataSignature(string packagePath)
+    {
+        using var input = File.OpenRead(packagePath);
+        ProsperoPkg package = ProsperoPkgReader.Read(input);
+        long cntBase = package.Fih is null ? 0 : checked((long)package.Fih.EmbeddedCntOffset);
+        const int signedHeaderSize = 0x1000;
+        byte[] header = ReadRange(input, cntBase, signedHeaderSize);
+        byte[] signature = ReadRange(input, checked(cntBase + signedHeaderSize), ProsperoPkgSigner.SignatureSize);
+        return ProsperoPkgSigner.VerifyDigest(Crypto.Sha256(header), signature);
+    }
+
     public static ProsperoPackageMap Inspect(string path)
     {
         using var input = File.OpenRead(path);
@@ -37,7 +50,31 @@ public static class ProsperoPackageArchive
         ArgumentNullException.ThrowIfNull(input);
         if (!input.CanRead || !input.CanSeek) throw new ArgumentException("Package stream must be readable and seekable.", nameof(input));
         ProsperoPkg package = ProsperoPkgReader.Read(input);
-        ProsperoFihHeader fih = package.Fih ?? throw new InvalidDataException("A finalized FIH package is required.");
+        ProsperoPkgHeader cnt = package.Header ?? throw new InvalidDataException("CNT header is unavailable.");
+
+        long cntEnd = ProsperoPkgLayout.HeaderSize;
+        cntEnd = Math.Max(cntEnd, checked((long)cnt.EntryTableOffset + package.Entries.Count * ProsperoPkgLayout.EntryMetaSize));
+        if (cnt.BodyOffset > long.MaxValue || cnt.BodySize > long.MaxValue)
+            throw new InvalidDataException("CNT body range exceeds Int64.");
+        cntEnd = Math.Max(cntEnd, checked((long)cnt.BodyOffset + (long)cnt.BodySize));
+        foreach (ProsperoPkgEntry entry in package.Entries)
+            cntEnd = Math.Max(cntEnd, checked((long)entry.DataOffset + entry.DataSize));
+        cntEnd = AlignUp(cntEnd, 16);
+
+        // Entitlement-only PSAL packages are bare CNT containers followed directly by their SI ZIP:
+        // [CNT/SC padded through BodyOffset+BodySize][SI]. They intentionally have no FIH or PFS.
+        if (package.Fih is null)
+        {
+            RequireRange(input.Length, 0, cntEnd, "CNT");
+            return new ProsperoPackageMap(
+                0, 0,
+                0, 0,
+                0, cntEnd,
+                cntEnd, input.Length - cntEnd,
+                -1);
+        }
+
+        ProsperoFihHeader fih = package.Fih;
         if (fih.PfsImageOffset > long.MaxValue || fih.PfsImageSize > long.MaxValue || fih.EmbeddedCntOffset > long.MaxValue)
             throw new InvalidDataException("Package ranges exceed Int64.");
         long pfsOffset = (long)fih.PfsImageOffset;
@@ -47,14 +84,6 @@ public static class ProsperoPackageArchive
         if (cntOffset != checked(pfsOffset + pfsSize))
             throw new InvalidDataException("FIH CNT offset does not immediately follow the outer PFS image.");
 
-        long cntEnd = ProsperoPkgLayout.HeaderSize;
-        ProsperoPkgHeader cnt = package.Header ?? throw new InvalidDataException("Embedded CNT header is unavailable.");
-        cntEnd = Math.Max(cntEnd, checked((long)cnt.EntryTableOffset + package.Entries.Count * ProsperoPkgLayout.EntryMetaSize));
-        if (cnt.BodyOffset > long.MaxValue || cnt.BodySize > long.MaxValue) throw new InvalidDataException("CNT body range exceeds Int64.");
-        cntEnd = Math.Max(cntEnd, checked((long)cnt.BodyOffset + (long)cnt.BodySize));
-        foreach (ProsperoPkgEntry entry in package.Entries)
-            cntEnd = Math.Max(cntEnd, checked((long)entry.DataOffset + entry.DataSize));
-        cntEnd = AlignUp(cntEnd, 16);
         RequireRange(input.Length, cntOffset, cntEnd, "CNT");
 
         long supplement = checked(cntOffset + cntEnd);
@@ -167,21 +196,88 @@ public static class ProsperoPackageArchive
     }
 
     public static IReadOnlyList<string> ExtractCntEntries(string packagePath, string outputDirectory, bool includeEncrypted = true)
+        => ExtractCntEntriesCore(packagePath, outputDirectory, passcode: null, includeEncrypted);
+
+    /// <summary>
+    /// Extracts CNT entries and decrypts protected entries with the supplied package passcode.
+    /// Publisher containers are detected from the 0xB80-byte RSA-3072 ENTRY_KEYS record.
+    /// </summary>
+    public static IReadOnlyList<string> ExtractCntEntries(
+        string packagePath, string outputDirectory, string passcode, bool includeEncrypted = true)
+    {
+        if (passcode is not { Length: 32 })
+            throw new ArgumentException("Passcode must be exactly 32 characters.", nameof(passcode));
+        return ExtractCntEntriesCore(packagePath, outputDirectory, passcode, includeEncrypted);
+    }
+
+    private static IReadOnlyList<string> ExtractCntEntriesCore(
+        string packagePath, string outputDirectory, string? passcode, bool includeEncrypted)
     {
         using var input = File.OpenRead(packagePath);
         ProsperoPkg package = ProsperoPkgReader.Read(input);
+        ProsperoPkgHeader header = package.Header ?? throw new InvalidDataException("Package has no CNT header.");
         long cntBase = package.Fih is null ? 0 : checked((long)package.Fih.EmbeddedCntOffset);
+        bool publisherProfile = package.Entries.Any(e =>
+            e.RawId == (uint)EntryId.ENTRY_KEYS && e.DataSize >= 0xB80);
         Directory.CreateDirectory(outputDirectory);
         var written = new List<string>();
         foreach (ProsperoPkgEntry entry in package.Entries)
         {
             if (!includeEncrypted && entry.Encrypted) continue;
-            string name = string.IsNullOrWhiteSpace(entry.Name) ? $"entry-{entry.RawId:x8}.bin" : NormalizeRelativePath(entry.Name!);
+            string? knownName = null;
+            if (entry.Encrypted && passcode is not null)
+                EntryNames.IdToName.TryGetValue((EntryId)entry.RawId, out knownName);
+            string name = !string.IsNullOrWhiteSpace(entry.Name)
+                ? NormalizeRelativePath(entry.Name!)
+                : !string.IsNullOrWhiteSpace(knownName)
+                    ? NormalizeRelativePath(knownName!)
+                    : $"entry-{entry.RawId:x8}.bin";
             string target = SafeTarget(outputDirectory, name);
             Directory.CreateDirectory(Path.GetDirectoryName(target)!);
             byte[] data = ReadRange(input, checked(cntBase + entry.DataOffset), checked((int)entry.DataSize));
+            if (entry.Encrypted && passcode is not null)
+            {
+                var meta = new MetaEntry
+                {
+                    id = (EntryId)entry.RawId,
+                    NameTableOffset = entry.NameTableOffset,
+                    Flags1 = entry.Flags1,
+                    Flags2 = entry.Flags2,
+                    DataOffset = entry.DataOffset,
+                    DataSize = entry.DataSize,
+                };
+                data = Entry.Decrypt(data, header.ContentId, passcode, meta, publisherProfile);
+            }
             File.WriteAllBytes(target, data);
             written.Add(name);
+        }
+        return written;
+    }
+
+    /// <summary>Extracts the trailing debug SI ZIP while preserving its publisher member paths.</summary>
+    public static IReadOnlyList<string> ExtractSiEntries(string packagePath, string outputDirectory)
+    {
+        using var input = File.OpenRead(packagePath);
+        ProsperoPackageMap map = Inspect(input);
+        if (map.SupplementSize <= 0)
+            return Array.Empty<string>();
+        if (map.SupplementSize > int.MaxValue)
+            throw new InvalidDataException("SI segment is too large for the in-memory ZIP reader.");
+        byte[] bytes = ReadRange(input, map.SupplementOffset, checked((int)map.SupplementSize));
+        using var memory = new MemoryStream(bytes, writable: false);
+        using var zip = new ZipArchive(memory, ZipArchiveMode.Read, leaveOpen: false);
+        Directory.CreateDirectory(outputDirectory);
+        var written = new List<string>();
+        foreach (ZipArchiveEntry entry in zip.Entries)
+        {
+            if (string.IsNullOrEmpty(entry.Name)) continue;
+            string relative = NormalizeRelativePath(entry.FullName);
+            string target = SafeTarget(outputDirectory, relative);
+            Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+            using Stream source = entry.Open();
+            using var destination = new FileStream(target, FileMode.Create, FileAccess.Write, FileShare.None);
+            source.CopyTo(destination);
+            written.Add(relative);
         }
         return written;
     }

@@ -571,6 +571,9 @@ public static class ProsperoNapsImage
         KrakenDecodeStatus status = KrakenDecoder.DecodeBlock(payload, flags, firstChunk, output);
         if (status != KrakenDecodeStatus.Success)
             throw new InvalidDataException(
-                $"NAPS span {span.Index} Kraken decode failed ({status}, modes {span.Even}/{span.Odd}).");
+                $"NAPS span {span.Index} (CBI {span.CblockInfoIndex}, stored=0x{span.StoredOffset:x}, " +
+                $"compressed=0x{span.CompressedLength:x}, first=0x{firstChunk:x}, " +
+                $"uncompressed=0x{span.UncompressedLength:x}) Kraken decode failed " +
+                $"({status}, modes {span.Even}/{span.Odd}, payload={Convert.ToHexString(payload.AsSpan(0, Math.Min(16, payload.Length)))}).");
     }
 }

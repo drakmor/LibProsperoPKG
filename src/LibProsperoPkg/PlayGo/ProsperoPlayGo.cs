@@ -13,9 +13,12 @@
 
 #nullable enable
 using LibProsperoPkg.Util;
+using LibProsperoPkg.PFS;
 using System;
 using System.Buffers.Binary;
+using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Reflection;
 using System.Text;
 
@@ -79,8 +82,17 @@ public static class ProsperoPlayGo
     /// <param name="chunkTailSize">
     /// The size of chunk #0's secondary mchunk region (word at 0x158). When unknown, pass 0.
     /// </param>
+    /// <param name="publisherNwonly">
+    /// Selects the publisher nwonly labels and mount-range convention used by PPR/NAPS packages.
+    /// </param>
+    /// <param name="includePublisherLabels">
+    /// Keeps the standard <c>Chunk #0</c>/<c>Scenario #0</c> labels for publisher APP. Publisher
+    /// AC uses one-byte empty label tables.
+    /// </param>
     /// <returns>The 416-byte <c>playgo-chunk.dat</c> payload.</returns>
-    public static byte[] BuildChunkDat(string contentId, ulong chunkDataSize = 0, ulong chunkTailSize = 0)
+    public static byte[] BuildChunkDat(
+        string contentId, ulong chunkDataSize = 0, ulong chunkTailSize = 0,
+        bool publisherNwonly = false, bool includePublisherLabels = false)
     {
         ArgumentException.ThrowIfNullOrEmpty(contentId);
         if (contentId.Length != 36)
@@ -115,11 +127,12 @@ public static class ProsperoPlayGo
         // ---- Section pointer table (0xC0): (offset, size) pairs. ----
         WritePtr(s, 0xC0, 0x100, 0x20); // chunk_attrs
         WritePtr(s, 0xC8, 0x120, 0x08); // chunk_mchunks
-        WritePtr(s, 0xD0, 0x130, 0x09); // chunk_labels ("Chunk #0\0")
+        bool emptyLabels = publisherNwonly && !includePublisherLabels;
+        WritePtr(s, 0xD0, 0x130, emptyLabels ? 0x01u : 0x09u); // empty label or "Chunk #0\0"
         WritePtr(s, 0xD8, 0x140, 0x20); // mchunk_attrs
         WritePtr(s, 0xE0, 0x160, 0x20); // inner mchunk_attrs
         WritePtr(s, 0xE8, 0x180, 0x02); // scenario_attrs
-        WritePtr(s, 0xF0, 0x190, 0x0C); // scenario_labels ("Scenario #0\0")
+        WritePtr(s, 0xF0, 0x190, emptyLabels ? 0x01u : 0x0Cu); // empty label or "Scenario #0\0"
 
         // ---- Chunk attribute (0x100). ----
         s[0x100] = 0x80; // flag
@@ -133,7 +146,8 @@ public static class ProsperoPlayGo
         BinaryPrimitives.WriteUInt32LittleEndian(s[0x124..], 1);
 
         // ---- chunk_labels (0x130). ----
-        Encoding.ASCII.GetBytes("Chunk #0").CopyTo(s[0x130..]);
+        if (!emptyLabels)
+            Encoding.ASCII.GetBytes("Chunk #0").CopyTo(s[0x130..]);
 
         // ---- mchunk_attrs (0x140): two 16-byte {offset, size} entries. ----
         // entry0 = {0, chunkDataSize}; entry1 = {chunkDataSize, chunkTailSize}.
@@ -148,7 +162,8 @@ public static class ProsperoPlayGo
         s[0x176] = 0x01;
 
         // ---- scenario_labels (0x190). ----
-        Encoding.ASCII.GetBytes("Scenario #0").CopyTo(s[0x190..]);
+        if (!emptyLabels)
+            Encoding.ASCII.GetBytes("Scenario #0").CopyTo(s[0x190..]);
 
         return d;
     }
@@ -225,6 +240,35 @@ public static class ProsperoPlayGo
             byte[] entry = HashTableEntries[Math.Min(i, HashTableEntries.Length - 1)];
             entry.CopyTo(s[(HashTableTableOffset + i * HashTableEntrySize)..]);
         }
+        return d;
+    }
+
+    /// <summary>
+    /// Builds the publisher PPR/NAPS FLT hash table from the actual inner-file paths. Each table item is
+    /// the PS5 flat-path hash written little-endian; publisher output sorts the hashes numerically.
+    /// </summary>
+    public static byte[] BuildHashTable(IReadOnlyList<string> innerPaths)
+    {
+        ArgumentNullException.ThrowIfNull(innerPaths);
+        ulong[] hashes = innerPaths
+            .Select(ProsperoPs5FlatPathTable.HashPath)
+            .OrderBy(value => value)
+            .ToArray();
+        if (hashes.Length > 0x10000)
+            throw new ArgumentOutOfRangeException(nameof(innerPaths), "PlayGo FLT hash-table count is implausibly large.");
+
+        int tableSize = checked(hashes.Length * HashTableEntrySize);
+        byte[] d = new byte[HashTableTableOffset + tableSize];
+        Span<byte> s = d;
+        BinaryPrimitives.WriteUInt32LittleEndian(s[0x00..], 1);
+        BinaryPrimitives.WriteUInt32LittleEndian(s[0x04..], 0x08000000);
+        BinaryPrimitives.WriteUInt32LittleEndian(s[0x08..], HashTableTableOffset);
+        BinaryPrimitives.WriteUInt32LittleEndian(s[0x0C..], (uint)tableSize);
+        new byte[] { 0x7F, (byte)'F', (byte)'L', (byte)'T' }.CopyTo(s[0x18..]);
+        BinaryPrimitives.WriteUInt32LittleEndian(s[0x24..], (uint)hashes.Length);
+        HashTablePrefix.CopyTo(s[0x28..]);
+        for (int i = 0; i < hashes.Length; i++)
+            BinaryPrimitives.WriteUInt64LittleEndian(s[(HashTableTableOffset + i * HashTableEntrySize)..], hashes[i]);
         return d;
     }
 
