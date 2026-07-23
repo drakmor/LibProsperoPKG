@@ -355,13 +355,17 @@ public static class ProsperoSiArchive
     /// Optional override for <c>ihsh/rhsh</c> and provider for the AES-XTS-derived
     /// <c>obcc</c> table inside <c>naps_meta_18.dat</c>.
     /// </param>
+    /// <param name="pfsImageKey">Optional raw 32-byte publisher PFS image key for exact obcc.</param>
+    /// <param name="pfsImageSeed">Optional raw 16-byte publisher PFS image seed for exact obcc.</param>
     public static byte[] BuildDebugSiSegment(
         ProsperoPfsImageXmlOptions pfsImageXml, byte[]? playGoChunkDat, byte[] mountImage,
         long innerImageSize = 0, ICollection<string>? warnings = null,
         byte[]? napsMeta18 = null, bool includePfsImageXml = true,
         IReadOnlyList<(string Path, long Size)>? contentFiles = null,
         LibProsperoPkg.PFS.ProsperoPs5InnerImageResult? innerImage = null,
-        IProsperoNapsIntegrityProvider? integrityProvider = null)
+        IProsperoNapsIntegrityProvider? integrityProvider = null,
+        byte[]? pfsImageKey = null,
+        byte[]? pfsImageSeed = null)
     {
         ArgumentNullException.ThrowIfNull(pfsImageXml);
         ArgumentNullException.ThrowIfNull(mountImage);
@@ -389,7 +393,9 @@ public static class ProsperoSiArchive
                 mountImage,
                 contentFiles ?? Array.Empty<(string Path, long Size)>(),
                 innerImage,
-                integrityProvider);
+                integrityProvider,
+                pfsImageKey,
+                pfsImageSeed);
             if (generated.Length != 0) napsMeta18 = generated;
         }
 

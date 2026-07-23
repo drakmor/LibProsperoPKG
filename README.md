@@ -124,8 +124,12 @@ var options = new ProsperoBuildOptions
     // DeterministicBuild = true,
     // Default: publisher data-first outer PFS + NAPS + direct-offset PPR-PFS.
     UsePublisherPprNaps = true,
-    // Optional when the publishing environment supplies the separate 16-byte NAPS CMAC key:
+    // Optional only for a profile that explicitly enables keyed NAPS outer-block CMAC.
+    // Publishing Tools 2.79 debug/AC leaves these tags zero by default:
     // NapsOuterBlockCmacKey = Convert.FromHexString("00112233445566778899AABBCCDDEEFF"),
+    // Optional sc2 estimate outputs for exact naps_meta_18 obcc generation:
+    // NapsPfsImageKey  = File.ReadAllBytes("pfs_image_key.bin"),  // exactly 32 bytes
+    // NapsPfsImageSeed = File.ReadAllBytes("pfs_image_seed.bin"), // exactly 16 bytes
 };
 
 ProsperoBuildResult result = ProsperoPackageBuilder.Build(options, Console.WriteLine);
@@ -180,7 +184,14 @@ See **[docs/](docs/)** for the full feature status and the PS5 package technical
 LibProsperoPkg produces a complete, self-consistent package whose CNT/FIH digests, outer PFS,
 NAPS mapping, inner PPR-PFS, and debug install metadata round-trip through the reader. Exact
 publisher acceptance still depends on external protected inputs: a trusted RSA-3072 metadata
-signer, the separate NAPS CMAC/`obcc` material, and (for AC/AL) a backend-authored license.
+signer, the `sc2 estimate` PFS image key/seed pair, and (for AC/AL) a backend-authored license.
+The `obcc` transform itself is implemented exactly as the recovered HMAC-SHA256 +
+AES-128-XTS-encrypt + CRC32C pipeline; callers may pass the pair through
+`NapsPfsImageKey`/`NapsPfsImageSeed` or place raw `pfs_image_key.bin`/
+`pfs_image_seed.bin` sidecars next to the host executable. The image seed is also written to
+the outer-PFS superblock at `+0x370`; a separately supplied `OuterPfsSeed` must match it.
+The verified Publishing Tools 2.79 debug/AC profile disables keyed NAPS outer-block CMAC and
+stores zero tags; `NapsOuterBlockCmacKey` remains available for other explicitly keyed profiles.
 Retail finalization and retail encrypted install metadata are not generated. A console running
 in **debug mode** is the intended target; acceptance still depends on console mode and firmware.
 See [docs/implementation-status.md](docs/implementation-status.md) for the precise breakdown.

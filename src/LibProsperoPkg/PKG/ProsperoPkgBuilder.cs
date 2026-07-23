@@ -66,6 +66,12 @@ internal sealed class ProsperoSiBuildInputs
     /// <summary>Protected NAPS table provider used when <see cref="NapsMeta18"/> is not supplied.</summary>
     public IProsperoNapsIntegrityProvider? NapsIntegrityProvider { get; init; }
 
+    /// <summary>Raw 32-byte publisher PFS image key used by the built-in obcc generator.</summary>
+    public byte[]? NapsPfsImageKey { get; init; }
+
+    /// <summary>Raw 16-byte publisher PFS image seed used by the built-in obcc generator.</summary>
+    public byte[]? NapsPfsImageSeed { get; init; }
+
     /// <summary>Whether this package profile carries pfsimage.xml in the debug SI.</summary>
     public bool IncludePfsImageXml { get; init; } = true;
 
@@ -180,6 +186,15 @@ public sealed class ProsperoPkgBuildProperties
     /// </summary>
     public IProsperoNapsIntegrityProvider? NapsIntegrityProvider { get; init; }
 
+    /// <summary>Optional raw 32-byte publisher <c>pfs-image-key</c> for exact NAPS obcc.</summary>
+    public byte[]? NapsPfsImageKey { get; init; }
+
+    /// <summary>
+    /// Optional raw 16-byte publisher <c>pfs-image-seed</c> paired with the image key. This is
+    /// also the outer-PFS superblock seed; if <see cref="OuterPfsSeed"/> is supplied, it must match.
+    /// </summary>
+    public byte[]? NapsPfsImageSeed { get; init; }
+
     /// <summary>
     /// Optional fixed 16-byte outer-PFS seed. When omitted, the seed is derived in
     /// <see cref="DeterministicBuild"/> mode and generated with a cryptographic RNG otherwise.
@@ -282,6 +297,21 @@ public static class ProsperoPkgBuilder
             throw new ArgumentException("Passcode must be exactly 32 characters.", nameof(props));
         if (props.NapsOuterBlockCmacKey is { Length: not 16 })
             throw new ArgumentException("NAPS outer-block CMAC key must be exactly 16 bytes.", nameof(props));
+        if ((props.NapsPfsImageKey is null) != (props.NapsPfsImageSeed is null))
+            throw new ArgumentException(
+                "NAPS pfs-image-key and pfs-image-seed must be supplied together.", nameof(props));
+        if (props.NapsPfsImageKey is { Length: not 32 })
+            throw new ArgumentException("NAPS pfs-image-key must contain exactly 32 bytes.", nameof(props));
+        if (props.NapsPfsImageSeed is { Length: not 16 })
+            throw new ArgumentException("NAPS pfs-image-seed must contain exactly 16 bytes.", nameof(props));
+        if (props.OuterPfsSeed is not null &&
+            props.NapsPfsImageSeed is not null &&
+            !props.OuterPfsSeed.AsSpan().SequenceEqual(props.NapsPfsImageSeed))
+        {
+            throw new ArgumentException(
+                "OuterPfsSeed and NapsPfsImageSeed identify the same publisher superblock seed and must match.",
+                nameof(props));
+        }
 
         string sourceFolder = Path.GetFullPath(props.SourceFolder);
 
@@ -539,7 +569,8 @@ public static class ProsperoPkgBuilder
 
         if (props.OuterPfsSeed is { Length: not 16 })
             throw new ArgumentException("Outer PFS seed must contain exactly 16 bytes.", nameof(props));
-        byte[] outerSeed = props.OuterPfsSeed?.AsSpan().ToArray()
+        byte[] outerSeed = props.NapsPfsImageSeed?.AsSpan().ToArray()
+            ?? props.OuterPfsSeed?.AsSpan().ToArray()
             ?? (props.DeterministicBuild
                 ? DeriveDeterministicOuterSeed(props.ContentId, props.Passcode)
                 : System.Security.Cryptography.RandomNumberGenerator.GetBytes(16));
@@ -651,6 +682,8 @@ public static class ProsperoPkgBuilder
                 FihNapsFileCount = napsFileCount,
                 NapsMeta18 = props.NapsMeta18,
                 NapsIntegrityProvider = props.NapsIntegrityProvider,
+                NapsPfsImageKey = props.NapsPfsImageKey,
+                NapsPfsImageSeed = props.NapsPfsImageSeed,
                 // Verified prospero-pub-cmd 2.79 APP and AC nwonly SI profiles both contain the
                 // seven NAPS/PlayGo records and no common/etc/pfsimage.xml.
                 IncludePfsImageXml = false,

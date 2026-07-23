@@ -34,6 +34,7 @@ using System.IO;
 using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
+using LibProsperoPkg.Util;
 
 namespace LibProsperoPkg.PKG;
 
@@ -78,6 +79,15 @@ public sealed class ProsperoNapsIntegrityContext
     /// </summary>
     public string? PhysicalInnerImagePath { get; init; }
 
+    /// <summary>
+    /// Publisher <c>pfs-image-key</c> returned by <c>sc2 estimate</c> (32 bytes). This is distinct
+    /// from the passcode/content-id EKPFS used by the ordinary inner PFS key schedule.
+    /// </summary>
+    public ReadOnlyMemory<byte> PfsImageKey { get; init; }
+
+    /// <summary>Publisher <c>pfs-image-seed</c> paired with <see cref="PfsImageKey"/> (16 bytes).</summary>
+    public ReadOnlyMemory<byte> PfsImageSeed { get; init; }
+
     /// <summary>Mapping blocks in the exact order used by <c>i2ob/i2op/ihsh/rhsh</c>.</summary>
     public required IReadOnlyList<ProsperoNapsIntegrityBlock> MappingBlocks { get; init; }
 
@@ -87,11 +97,11 @@ public sealed class ProsperoNapsIntegrityContext
 
 /// <summary>
 /// Optional publisher-profile override for integrity reductions inside <c>naps_meta_18.dat</c>.
-/// The library emits the standard APP/AC weak checksums and rolling hashes itself. The provider is
-/// still required for exact <c>obcc</c>, whose CRC32C input is the temporary publisher AES-XTS
-/// representation rather than the stored <c>pfs_image.dat</c>. Returned arrays are raw table
-/// payloads and must have the exact lengths documented by each method. Returning
-/// <see langword="null"/> keeps the built-in value (zero for <c>obcc</c>).
+/// The library emits the standard APP/AC weak checksums and rolling hashes itself. The provider
+/// may override exact <c>obcc</c>; the built-in implementation produces it when the context carries
+/// the 32-byte publisher PFS image key and 16-byte seed. Returned arrays are raw table payloads and
+/// must have the exact lengths documented by each method. Returning <see langword="null"/> keeps
+/// the built-in value.
 /// </summary>
 public interface IProsperoNapsIntegrityProvider
 {
@@ -209,11 +219,18 @@ public static class ProsperoNapsMeta
     /// Optional publisher-profile implementation for the protected <c>ihsh</c> prefixes,
     /// <c>rhsh</c> reductions and <c>obcc</c> check codes.
     /// </param>
+    /// <param name="pfsImageKey">
+    /// Optional 32-byte publisher PFS image key. Supply together with
+    /// <paramref name="pfsImageSeed"/> to generate exact <c>obcc</c> values in-process.
+    /// </param>
+    /// <param name="pfsImageSeed">Optional 16-byte publisher PFS image seed.</param>
     /// <returns>The encrypted blob (length a multiple of 16), or an empty array when inputs are insufficient.</returns>
     public static byte[] BuildMeta18(
         ulong innerImageSize, byte[] mountImage, IReadOnlyList<(string Path, long Size)> contentFiles,
         LibProsperoPkg.PFS.ProsperoPs5InnerImageResult? inner = null,
-        IProsperoNapsIntegrityProvider? integrityProvider = null)
+        IProsperoNapsIntegrityProvider? integrityProvider = null,
+        byte[]? pfsImageKey = null,
+        byte[]? pfsImageSeed = null)
     {
         ArgumentNullException.ThrowIfNull(mountImage);
         ArgumentNullException.ThrowIfNull(contentFiles);
@@ -229,11 +246,11 @@ public static class ProsperoNapsMeta
         List<Meta18Block>? blocks = inner is not null ? BuildInnerBlocks(inner) : null;
         int metaFirstBlockIndex = blocks is null ? -1 : blocks.FindIndex(b => b.Tail == Meta300KindId);
         ProsperoNapsIntegrityContext integrityContext =
-            BuildIntegrityContext(innerImageSize, mountImage, inner, blocks);
+            BuildIntegrityContext(
+                innerImageSize, mountImage, inner, blocks, pfsImageKey, pfsImageSeed);
         byte[] ihshPrefixes = BuildIhshPrefixes(integrityContext);
         byte[] rollingHashes = BuildRollingHashes(integrityContext);
-        byte[] outerBlockCheckCodes =
-            new byte[checked(integrityContext.PhysicalInnerBlockCount * 4)];
+        byte[] outerBlockCheckCodes = BuildOuterBlockCheckCodes(integrityContext);
         byte[]? providerIhshPrefixes = integrityProvider?.BuildIhshPrefixes(integrityContext);
         byte[]? providerRollingHashes = integrityProvider?.BuildRollingHashes(integrityContext);
         byte[]? providerOuterBlockCheckCodes = integrityProvider?.BuildOuterBlockCheckCodes(integrityContext);
@@ -493,8 +510,8 @@ public static class ProsperoNapsMeta
         }
 
         // obcc: CRC32C (Castagnoli) of each block after the publisher's temporary AES-XTS
-        // transform. It is not CRC32C of the stored pfs_image.dat bytes. Without a provider that
-        // supplies the XTS profile, keep the table zero-filled instead of fabricating a checksum.
+        // transform. It is not CRC32C of the stored pfs_image.dat bytes. The built-in path uses
+        // the sc2 pfs-image-key/seed pair; without that pair it intentionally remains zero.
         WriteRecord(
             plain,
             "obcc",
@@ -793,7 +810,9 @@ public static class ProsperoNapsMeta
         ulong innerImageSize,
         byte[] mountImage,
         LibProsperoPkg.PFS.ProsperoPs5InnerImageResult? inner,
-        IReadOnlyList<Meta18Block>? blocks)
+        IReadOnlyList<Meta18Block>? blocks,
+        byte[]? pfsImageKey,
+        byte[]? pfsImageSeed)
     {
         var mapped = new List<ProsperoNapsIntegrityBlock>();
         if (blocks is not null)
@@ -844,6 +863,8 @@ public static class ProsperoNapsMeta
             MountImage = mountImage,
             PhysicalInnerImage = inner?.Image ?? ReadOnlyMemory<byte>.Empty,
             PhysicalInnerImagePath = inner?.ImagePath,
+            PfsImageKey = pfsImageKey ?? ReadOnlyMemory<byte>.Empty,
+            PfsImageSeed = pfsImageSeed ?? ReadOnlyMemory<byte>.Empty,
             MappingBlocks = mapped,
         };
     }
@@ -868,6 +889,73 @@ public static class ProsperoNapsMeta
             BinaryPrimitives.WriteUInt64LittleEndian(result.AsSpan(i * 8, 8), hash);
         }
         return result;
+    }
+
+    /// <summary>
+    /// Builds the publisher <c>obcc</c> table for a fresh NAPS image. The native 2.79 path derives
+    /// the XTS keys as
+    /// <c>D = HMAC-SHA256(pfs-image-key, LE32(1) || pfs-image-seed)</c>, then encrypts every
+    /// 64-KiB physical block with <c>dataKey=D[16..31]</c>,
+    /// <c>tweakKey=D[0..15]</c>, and data-unit number equal to the physical block index.
+    /// Each table entry is CRC32C of that temporary encrypted block in little-endian order.
+    /// When no key pair is present, returns the correctly-sized all-zero table so a caller-supplied
+    /// integrity provider can still override it.
+    /// </summary>
+    public static byte[] BuildOuterBlockCheckCodes(ProsperoNapsIntegrityContext context)
+    {
+        ArgumentNullException.ThrowIfNull(context);
+        int count = context.PhysicalInnerBlockCount;
+        var result = new byte[checked(count * 4)];
+        if (context.PfsImageKey.IsEmpty && context.PfsImageSeed.IsEmpty)
+            return result;
+        if (context.PfsImageKey.Length != 32 || context.PfsImageSeed.Length != 16)
+            throw new InvalidDataException(
+                "NAPS pfs-image-key and pfs-image-seed must contain exactly 32 and 16 bytes.");
+
+        Span<byte> label = stackalloc byte[20];
+        BinaryPrimitives.WriteUInt32LittleEndian(label[..4], 1);
+        context.PfsImageSeed.Span.CopyTo(label[4..]);
+        byte[] digest = HMACSHA256.HashData(context.PfsImageKey.Span, label);
+
+        using var xts = new XtsBlockTransform(
+            digest.AsSpan(16, 16).ToArray(),
+            digest.AsSpan(0, 16).ToArray());
+        using Stream image = OpenPhysicalInnerImage(context);
+        var block = new byte[Meta18BlockSize];
+        for (int i = 0; i < count; i++)
+        {
+            Array.Clear(block);
+            int read = 0;
+            while (read < block.Length)
+            {
+                int got = image.Read(block, read, block.Length - read);
+                if (got == 0) break;
+                read += got;
+            }
+            if (read != block.Length)
+                throw new EndOfStreamException(
+                    $"Physical pfs_image.dat ended in block {i}: read 0x{read:X} of 0x{block.Length:X} bytes.");
+            xts.CryptSector(block, (ulong)i, encrypt: true);
+            BinaryPrimitives.WriteUInt32LittleEndian(
+                result.AsSpan(i * 4, 4), ProsperoCrc32C.Compute(block));
+        }
+        return result;
+    }
+
+    private static Stream OpenPhysicalInnerImage(ProsperoNapsIntegrityContext context)
+    {
+        if (!string.IsNullOrWhiteSpace(context.PhysicalInnerImagePath))
+            return new FileStream(
+                context.PhysicalInnerImagePath,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.Read,
+                bufferSize: 1 << 20,
+                FileOptions.SequentialScan);
+        if (!context.PhysicalInnerImage.IsEmpty)
+            return new MemoryStream(context.PhysicalInnerImage.ToArray(), writable: false);
+        throw new InvalidDataException(
+            "NAPS obcc generation requires the physical pfs_image.dat bytes or file path.");
     }
 
     /// <summary>

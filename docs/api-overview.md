@@ -28,7 +28,13 @@ The primary entry point.
 - **`ProsperoBuildOptions`** — the build description: `Mode`, `OutputFormat`, `SourceFolder`,
   `OutputFolder`, `ContentId`, `Passcode`, `Title`, `TitleId`, `Version`,
   `GenerateParamJsonIfMissing`, `CompressInnerImage`, `InnerCompression`, `UsePublisherPprNaps`
-  (default true), and optional 16-byte `NapsOuterBlockCmacKey`.
+  (default true), and optional 16-byte `NapsOuterBlockCmacKey` for profiles that explicitly
+  enable keyed outer-block CMAC. Publishing Tools 2.79 debug/AC leaves it disabled by default.
+  `NapsPfsImageKey` (32 bytes) and `NapsPfsImageSeed` (16 bytes) accept the paired
+  `sc2 estimate` outputs used to generate exact `naps_meta_18` `obcc` entries. When the
+  options are omitted, raw `pfs_image_key.bin` and `pfs_image_seed.bin` sidecars next to the
+  host executable are loaded together. `NapsPfsImageSeed` also becomes the outer-PFS
+  superblock `+0x370` seed; an explicit `OuterPfsSeed` must contain the same bytes.
 - **`ProsperoBuildResult`** — `OutputPath` and a list of non-fatal `Warnings`.
 - **`ProsperoPackageMode`** — `Application`, `Homebrew`, `AdditionalContentData`,
   `AdditionalContentNoData`.
@@ -72,7 +78,11 @@ The primary entry point.
 
 - **`ProsperoPkgBuildProperties`** and **`ProsperoVolumeType`** drive the low-level builder. The
   publisher path is selected by `UsePublisherPprNaps`; `NapsOuterBlockCmacKey` supplies the separate
-  publishing CMAC input when strict NAPS outer-block tags are required. Set
+  publishing CMAC input only for a profile that explicitly enables keyed NAPS outer-block tags.
+  It is not required for the verified Publishing Tools 2.79 debug/AC profile, whose tags are zero.
+  `NapsPfsImageKey`/`NapsPfsImageSeed` drive the built-in streaming `obcc` generator; the pair is
+  distinct from the passcode-derived EKPFS.
+  Set
   `DeterministicBuild` to derive repeatable seeds and RSA padding for byte-identical debug/test
   packages; the default mode retains cryptographic randomness.
 - **`ProsperoPkgLayout`** and **`ProsperoEntryId`** describe the container layout and entry ids.

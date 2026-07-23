@@ -57,6 +57,7 @@ internal static class Program
                 "inspect-naps-meta18" => InspectNapsMeta18(args),
                 "decrypt-naps-meta18" => DecryptNapsMeta18(args),
                 "check-naps-meta18-obcc" => CheckNapsMeta18Obcc(args),
+                "probe-publisher-obcc" => ProbePublisherObcc(args),
                 "dump-naps" => DumpNaps(args),
                 "check-naps-cmac" => CheckNapsCmac(args),
                 "encode-dds" => EncodeDds(args),
@@ -214,6 +215,78 @@ internal static class Program
             $"obcc-blocks={blocks} crc32c-matches={matches} mismatches={blocks - matches} " +
             $"obdg-sha3-matches={digestMatches}");
         return matches == blocks ? 0 : 1;
+    }
+
+    private static int ProbePublisherObcc(string[] args)
+    {
+        if (args.Length is < 4 or > 6)
+            throw new ArgumentException(
+                "probe-publisher-obcc requires <package.pkg> <naps_meta_18.dat> " +
+                "<pfs_image.dat> [passcode] or " +
+                "<package.pkg> <naps_meta_18.dat> <pfs_image.dat> " +
+                "<pfs-image-key-hex> <pfs-image-seed-hex>.");
+
+        bool explicitPfsImageKey = args.Length == 6;
+        string passcode = args.Length == 5 ? args[4] : new string('0', 32);
+        ProsperoPkg package = ProsperoPkgReader.Read(args[1]);
+        string contentId = package.Header?.ContentId
+            ?? throw new InvalidDataException("Embedded CNT header is unavailable.");
+        byte[] packageBytes = File.ReadAllBytes(args[1]);
+        ulong superblockOffset =
+            BinaryPrimitives.ReadUInt64LittleEndian(packageBytes.AsSpan(0x20, 8));
+        if (superblockOffset + 0x380 > (ulong)packageBytes.Length)
+            throw new InvalidDataException("FIH superblock range is outside the package.");
+        byte[] seed = explicitPfsImageKey
+            ? Convert.FromHexString(args[5])
+            : packageBytes.AsSpan(checked((int)superblockOffset) + 0x370, 16).ToArray();
+        byte[] pfsImageKey = explicitPfsImageKey
+            ? Convert.FromHexString(args[4])
+            : ProsperoPfsKeys.DeriveEkpfs(contentId, passcode);
+        if (pfsImageKey.Length != 32 || seed.Length != 16)
+            throw new ArgumentException(
+                "The explicit PFS image key and seed must decode to 32 and 16 bytes respectively.");
+
+        byte[] kdfInput = new byte[4 + 16];
+        BinaryPrimitives.WriteUInt32LittleEndian(kdfInput.AsSpan(0, 4), 1);
+        seed.CopyTo(kdfInput, 4);
+        byte[] digest = System.Security.Cryptography.HMACSHA256.HashData(
+            pfsImageKey, kdfInput);
+
+        byte[] expected = FindMeta18Record(
+            ProsperoNapsMeta.DecryptMeta18(File.ReadAllBytes(args[2])), "obcc");
+        byte[] physical = File.ReadAllBytes(args[3]);
+        if ((physical.Length % 0x10000) != 0 || expected.Length != physical.Length / 0x10000 * 4)
+            throw new InvalidDataException("pfs_image.dat/obcc block geometry mismatch.");
+
+        for (int order = 0; order < 2; order++)
+        {
+            byte[] first = digest.AsSpan(order == 0 ? 0 : 16, 16).ToArray();
+            byte[] second = digest.AsSpan(order == 0 ? 16 : 0, 16).ToArray();
+            foreach (bool encrypt in new[] { false, true })
+            {
+                int matches = 0;
+                using var xts = new XtsBlockTransform(first, second);
+                for (int i = 0; i < physical.Length / 0x10000; i++)
+                {
+                    byte[] block = physical.AsSpan(i * 0x10000, 0x10000).ToArray();
+                    xts.CryptSector(block, (ulong)i, encrypt);
+                    uint actual = ProsperoCrc32C.Compute(block);
+                    uint wanted = BinaryPrimitives.ReadUInt32LittleEndian(
+                        expected.AsSpan(i * 4, 4));
+                    if (actual == wanted) matches++;
+                }
+                Console.WriteLine(
+                    $"data=D[{(order == 0 ? "0..15" : "16..31")}] " +
+                    $"tweak=D[{(order == 0 ? "16..31" : "0..15")}] " +
+                    $"mode={(encrypt ? "encrypt" : "decrypt")} matches={matches}/{physical.Length / 0x10000}");
+            }
+        }
+        Console.WriteLine(
+            $"{(explicitPfsImageKey ? "pfs-image-key" : "ekpfs-fallback")}=" +
+            Convert.ToHexString(pfsImageKey));
+        Console.WriteLine($"seed={Convert.ToHexString(seed)}");
+        Console.WriteLine($"digest={Convert.ToHexString(digest)}");
+        return 0;
     }
 
     private static int HashFlatPath(string[] args)
@@ -690,6 +763,22 @@ internal static class Program
             throw new InvalidDataException("CRC32C known-answer test failed.");
         Console.WriteLine("selftest: NAPS ihsh/rhsh and CRC32C primitive known-answer tests passed");
 
+        var obccKatContext = new ProsperoNapsIntegrityContext
+        {
+            InnerImageSize = 0x10000,
+            MountImage = ReadOnlyMemory<byte>.Empty,
+            PhysicalInnerImage = new byte[0x10000],
+            PfsImageKey = Convert.FromHexString(
+                "000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F"),
+            PfsImageSeed = Convert.FromHexString("000102030405060708090A0B0C0D0E0F"),
+            MappingBlocks = Array.Empty<ProsperoNapsIntegrityBlock>(),
+        };
+        byte[] obccKat = ProsperoNapsMeta.BuildOuterBlockCheckCodes(obccKatContext);
+        if (!obccKat.AsSpan().SequenceEqual(Convert.FromHexString("31E5C0F3")))
+            throw new InvalidDataException(
+                $"NAPS publisher-XTS obcc KAT failed: {Convert.ToHexString(obccKat)}");
+        Console.WriteLine("selftest: NAPS HMAC/XTS/CRC32C obcc known-answer test passed");
+
         byte[] meta18 = ProsperoNapsMeta.BuildMeta18(
             0x20000,
             new byte[0x10000],
@@ -983,6 +1072,11 @@ internal static class Program
                     "File-backed and in-memory outer-PFS writers produced different artifacts.");
             }
 
+            byte[] deterministicPfsImageKey =
+                Convert.FromHexString(
+                    "000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F");
+            byte[] deterministicPfsImageSeed =
+                Convert.FromHexString("000102030405060708090A0B0C0D0E0F");
             ProsperoBuildResult build1 = ProsperoPackageBuilder.Build(
                 new ProsperoBuildOptions
                 {
@@ -993,6 +1087,8 @@ internal static class Program
                     Mode = ProsperoPackageMode.Application,
                     Passcode = deterministicPasscode,
                     DeterministicBuild = true,
+                    NapsPfsImageKey = deterministicPfsImageKey,
+                    NapsPfsImageSeed = deterministicPfsImageSeed,
                 },
                 _ => { });
             ProsperoBuildResult build2 = ProsperoPackageBuilder.Build(
@@ -1005,6 +1101,8 @@ internal static class Program
                     Mode = ProsperoPackageMode.Application,
                     Passcode = deterministicPasscode,
                     DeterministicBuild = true,
+                    NapsPfsImageKey = deterministicPfsImageKey,
+                    NapsPfsImageSeed = deterministicPfsImageSeed,
                 },
                 _ => { });
 
@@ -1019,6 +1117,8 @@ internal static class Program
                         TitleId = "PPSA00000",
                         Mode = ProsperoPackageMode.Application,
                         Passcode = deterministicPasscode,
+                        NapsPfsImageKey = deterministicPfsImageKey,
+                        NapsPfsImageSeed = deterministicPfsImageSeed,
                         RequirePublisherCompatibility = true,
                     },
                     _ => { });
@@ -1029,6 +1129,17 @@ internal static class Program
                 ex.Message.StartsWith("Strict publisher compatibility requires", StringComparison.Ordinal))
             {
                 // Expected: strict mode must stop before emitting a package.
+                if (ex.Message.Contains("CMAC", StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidDataException(
+                        "Strict publisher mode incorrectly requires a NAPS CMAC key for the " +
+                        "Publishing Tools 2.79 debug/AC profile.", ex);
+                if (ex.Message.Contains("obcc", StringComparison.OrdinalIgnoreCase) ||
+                    ex.Message.Contains("pfs-image-key", StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new InvalidDataException(
+                        "Strict publisher mode did not accept the complete PFS image key/seed pair.",
+                        ex);
+                }
             }
 
             string artifactOutput = Path.Combine(regressionRoot, "publisher-artifacts");
@@ -1090,6 +1201,55 @@ internal static class Program
             {
                 throw new InvalidDataException(
                     "Streaming and in-memory outer-PFS decryptors produced different bytes.");
+            }
+            ProsperoPackageMap deterministicMap =
+                ProsperoPackageArchive.Inspect(build1.OutputPath);
+            byte[] streamedOuter = File.ReadAllBytes(streamedOuterPath);
+            int deterministicSuperblockOffset =
+                checked(deterministicMap.OuterSuperblockIndex * 0x10000);
+            if (!streamedOuter.AsSpan(deterministicSuperblockOffset + 0x370, 16)
+                    .SequenceEqual(deterministicPfsImageSeed))
+            {
+                throw new InvalidDataException(
+                    "NAPS pfs-image-seed was not written to outer superblock +0x370.");
+            }
+
+            string deterministicOuterFiles = Path.Combine(regressionRoot, "outer-files");
+            IReadOnlyList<string> deterministicOuterPaths =
+                ProsperoPackageArchive.ExtractOuterFiles(
+                    build1.OutputPath, deterministicOuterFiles, deterministicPasscode);
+            string physicalRelative = deterministicOuterPaths.Single(
+                path => path.EndsWith("pfs_image.dat", StringComparison.Ordinal));
+            string physicalPath = Path.Combine(
+                deterministicOuterFiles,
+                physicalRelative.Replace('/', Path.DirectorySeparatorChar));
+            string deterministicSi = Path.Combine(regressionRoot, "si");
+            IReadOnlyList<string> deterministicSiPaths =
+                ProsperoPackageArchive.ExtractSiEntries(build1.OutputPath, deterministicSi);
+            string meta18Relative = deterministicSiPaths.Single(
+                path => path.EndsWith("naps_meta_18.dat", StringComparison.Ordinal));
+            byte[] generatedObcc = FindMeta18Record(
+                ProsperoNapsMeta.DecryptMeta18(
+                    File.ReadAllBytes(Path.Combine(
+                        deterministicSi,
+                        meta18Relative.Replace('/', Path.DirectorySeparatorChar)))),
+                "obcc");
+            byte[] rebuiltObcc = ProsperoNapsMeta.BuildOuterBlockCheckCodes(
+                new ProsperoNapsIntegrityContext
+                {
+                    InnerImageSize = checked((ulong)new FileInfo(physicalPath).Length),
+                    MountImage = ReadOnlyMemory<byte>.Empty,
+                    PhysicalInnerImage = ReadOnlyMemory<byte>.Empty,
+                    PhysicalInnerImagePath = physicalPath,
+                    PfsImageKey = deterministicPfsImageKey,
+                    PfsImageSeed = deterministicPfsImageSeed,
+                    MappingBlocks = Array.Empty<ProsperoNapsIntegrityBlock>(),
+                });
+            if (!generatedObcc.AsSpan().SequenceEqual(rebuiltObcc) ||
+                generatedObcc.All(value => value == 0))
+            {
+                throw new InvalidDataException(
+                    "The finalized SI did not preserve the generated non-zero NAPS obcc table.");
             }
 
             string extracted = Path.Combine(regressionRoot, "extracted");
@@ -2290,6 +2450,8 @@ internal static class Program
         Console.WriteLine("  inspect-naps-meta18 <naps_meta_18.dat>");
         Console.WriteLine("  decrypt-naps-meta18 <naps_meta_18.dat> <plaintext-output>");
         Console.WriteLine("  check-naps-meta18-obcc <naps_meta_18.dat> <pfs_image.dat>");
+        Console.WriteLine("  probe-publisher-obcc <package.pkg> <naps_meta_18.dat> <pfs_image.dat> [passcode]");
+        Console.WriteLine("  probe-publisher-obcc <package.pkg> <naps_meta_18.dat> <pfs_image.dat> <pfs-image-key-hex> <pfs-image-seed-hex>");
         Console.WriteLine("  dump-naps <naps_pkg_layout.dat>");
         Console.WriteLine("  check-naps-cmac <naps_pkg_layout.dat> <pfs_image.dat> <16-byte-key-hex>");
         Console.WriteLine("  encode-dds <input.png> <output.dds>");

@@ -19,6 +19,12 @@ public static class ProsperoPublishingSidecar
     /// <summary>Default raw 16-byte AES-CMAC key sidecar.</summary>
     public const string NapsCmacKeyFileName = "naps_cmac_key.bin";
 
+    /// <summary>Default raw 32-byte publisher PFS image key sidecar.</summary>
+    public const string NapsPfsImageKeyFileName = "pfs_image_key.bin";
+
+    /// <summary>Default raw 16-byte publisher PFS image seed sidecar.</summary>
+    public const string NapsPfsImageSeedFileName = "pfs_image_seed.bin";
+
     /// <summary>Returns the absolute sidecar directory used by default.</summary>
     public static string DefaultDirectory => Path.GetFullPath(AppContext.BaseDirectory);
 
@@ -56,5 +62,26 @@ public static class ProsperoPublishingSidecar
             throw new InvalidDataException(
                 $"{NapsCmacKeyFileName} must contain exactly 16 raw bytes, not {key.Length}.");
         return key;
+    }
+
+    /// <summary>Loads the raw 32-byte <c>pfs_image_key.bin</c> sidecar when present.</summary>
+    public static byte[]? TryLoadNapsPfsImageKey(string? directory = null) =>
+        TryLoadRawSidecar(NapsPfsImageKeyFileName, 32, directory);
+
+    /// <summary>Loads the raw 16-byte <c>pfs_image_seed.bin</c> sidecar when present.</summary>
+    public static byte[]? TryLoadNapsPfsImageSeed(string? directory = null) =>
+        TryLoadRawSidecar(NapsPfsImageSeedFileName, 16, directory);
+
+    private static byte[]? TryLoadRawSidecar(string fileName, int expectedLength, string? directory)
+    {
+        string path = GetPath(fileName, directory);
+        if (!File.Exists(path))
+            return null;
+
+        byte[] value = File.ReadAllBytes(path);
+        if (value.Length != expectedLength)
+            throw new InvalidDataException(
+                $"{fileName} must contain exactly {expectedLength} raw bytes, not {value.Length}.");
+        return value;
     }
 }
