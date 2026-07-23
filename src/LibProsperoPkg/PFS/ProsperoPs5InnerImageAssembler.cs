@@ -174,6 +174,7 @@ public sealed class ProsperoPs5InnerImageAssembler
 
         /// <summary>The file's on-disk (data-region) byte offset in the built image (set during assembly).</summary>
         public long OnDiskOffset;
+        public long OnDiskSize;
 
         /// <summary>The file's on-disk bytes (raw when StoreRaw, else the Kraken-compressed payload). Cached to
         /// avoid recompressing: it drives both the data-region geometry and the final image assembly.</summary>
@@ -319,36 +320,73 @@ public sealed class ProsperoPs5InnerImageAssembler
 
         // ---- 3. Logical offsets (packed, in afid order) + store rule. -----------------------------
         long cursor = 0;
+        long fileBackedDataEnd = 0;
+        FileStream? fileBackedData = outputPath is null
+            ? null
+            : new FileStream(
+                outputPath, FileMode.Create, FileAccess.ReadWrite, FileShare.None,
+                bufferSize: 1 << 20, FileOptions.SequentialScan);
         var afidOffsets = new long[afidOrder.Count];
-        foreach (var f in afidOrder)
+        try
         {
-            f.LogicalOffset = cursor;
-            afidOffsets[f.Afid] = cursor;
-            cursor += f.Data.Length;
-            // Keystone and executable modules are stored raw; every other file is Kraken-compressed and
-            // packed unless the compressed result does not save at least the store threshold. Compress once
-            // and reuse it so the data-region geometry and the final image share a single compression pass.
-            if (IsKeystone(f.FullPath) || IsExecutableModule(f.Data))
+            foreach (var f in afidOrder)
             {
-                f.StoreRaw = true;
-                f.OnDiskData = f.Data;
+                f.LogicalOffset = cursor;
+                afidOffsets[f.Afid] = cursor;
+                cursor += f.Data.Length;
+                // Keystone and executable modules are stored raw; every other file is Kraken-compressed and
+                // packed unless the compressed result does not save at least the store threshold. Compress once
+                // and reuse it so the data-region geometry and the final image share a single compression pass.
+                if (IsKeystone(f.FullPath) || IsExecutableModule(f.Data))
+                {
+                    f.StoreRaw = true;
+                    f.OnDiskData = f.Data;
+                }
+                else
+                {
+                    byte[] comp = ProsperoPs5InnerImageBuilder.CompressPayload(
+                        f.Data, storeRaw: false, out ProsperoCompressedPfsFile? compressedFile);
+                    f.StoreRaw = comp.Length >= f.Data.Length; // CompressPayload returns raw when it does not help
+                    f.OnDiskData = f.StoreRaw ? f.Data : comp;
+                    if (compressedFile is not null)
+                        f.CompressionBlocks = compressedFile.Blocks.Select(b => new ProsperoInnerDataBlockChunk(
+                            b.CompressedSize, b.UncompressedSize, b.IsStored,
+                            b.IsMultiChunk, b.FirstChunkCompressedSize)).ToList();
+                }
+                f.SceSys = f.FullPath.StartsWith("/sce_sys/", StringComparison.Ordinal);
+                // Publisher places every forced-raw bootstrap payload in a complete physical extent.
+                // The following file starts at the next 64-KiB boundary; opportunistically stored
+                // (incompressible) ordinary files do not get this padding.
+                f.WholeBlockRaw = IsKeystone(f.FullPath) || IsExecutableModule(f.Data);
+
+                if (fileBackedData is not null)
+                {
+                    byte[] onDisk = f.OnDiskData!;
+                    bool alignBefore =
+                        f.WholeBlockRaw ||
+                        (f.StoreRaw && fileBackedDataEnd % BlockSize != 0 &&
+                         onDisk.LongLength > BlockSize - fileBackedDataEnd % BlockSize);
+                    if (alignBefore)
+                        fileBackedDataEnd = RoundUp(fileBackedDataEnd, BlockSize);
+                    f.OnDiskOffset = fileBackedDataEnd;
+                    f.OnDiskSize = onDisk.LongLength;
+                    fileBackedData.Position = fileBackedDataEnd;
+                    fileBackedData.Write(onDisk);
+                    fileBackedDataEnd = checked(fileBackedDataEnd + onDisk.LongLength);
+                    if (f.WholeBlockRaw)
+                        fileBackedDataEnd = RoundUp(fileBackedDataEnd, BlockSize);
+                    f.OnDiskData = null;
+                }
             }
-            else
+        }
+        finally
+        {
+            if (fileBackedData is not null)
             {
-                byte[] comp = ProsperoPs5InnerImageBuilder.CompressPayload(
-                    f.Data, storeRaw: false, out ProsperoCompressedPfsFile? compressedFile);
-                f.StoreRaw = comp.Length >= f.Data.Length; // CompressPayload returns raw when it does not help
-                f.OnDiskData = f.StoreRaw ? f.Data : comp;
-                if (compressedFile is not null)
-                    f.CompressionBlocks = compressedFile.Blocks.Select(b => new ProsperoInnerDataBlockChunk(
-                        b.CompressedSize, b.UncompressedSize, b.IsStored,
-                        b.IsMultiChunk, b.FirstChunkCompressedSize)).ToList();
+                fileBackedData.SetLength(fileBackedDataEnd);
+                fileBackedData.Flush(flushToDisk: true);
+                fileBackedData.Dispose();
             }
-            f.SceSys = f.FullPath.StartsWith("/sce_sys/", StringComparison.Ordinal);
-            // Publisher places every forced-raw bootstrap payload in a complete physical extent.
-            // The following file starts at the next 64-KiB boundary; opportunistically stored
-            // (incompressible) ordinary files do not get this padding.
-            f.WholeBlockRaw = IsKeystone(f.FullPath) || IsExecutableModule(f.Data);
         }
 
         // The metadata base belongs to the LOGICAL mount address space. It must follow the end of every
@@ -370,7 +408,7 @@ public sealed class ProsperoPs5InnerImageAssembler
 
         // ---- 7. Assemble the data-first image. ----------------------------------------------------
         byte[] image = BuildImage(
-            afidOrder, metaPlain, outputPath,
+            afidOrder, metaPlain, outputPath, fileBackedDataEnd,
             out long imageLength, out long blockInfoOnDisk, out long metadataOnDisk,
             out byte[] compressedMeta, out var metaBlocks);
 
@@ -381,7 +419,7 @@ public sealed class ProsperoPs5InnerImageAssembler
         {
             OnDiskOffset = f.OnDiskOffset,
             LogicalOffset = f.LogicalOffset,
-            OnDiskSize = f.OnDiskData!.Length,
+            OnDiskSize = f.OnDiskSize,
             UncompressedSize = f.Data.Length,
             PlainData = f.Data,
             StoreRaw = f.StoreRaw,
@@ -766,7 +804,8 @@ public sealed class ProsperoPs5InnerImageAssembler
         return RoundUp(pos, BlockSize) / BlockSize;
     }
 
-    private byte[] BuildImage(List<FileNode> afidOrder, byte[] metaPlain, string? outputPath,
+    private byte[] BuildImage(
+        List<FileNode> afidOrder, byte[] metaPlain, string? outputPath, long prewrittenDataEnd,
         out long imageLength, out long blockInfoOnDisk, out long metadataOnDisk, out byte[] compressedMeta,
         out IReadOnlyList<ProsperoInnerMetaBlockChunk> metaBlocks)
     {
@@ -783,28 +822,33 @@ public sealed class ProsperoPs5InnerImageAssembler
         //     on-disk image; metaBase/ndblock (mount size) are unchanged.
         //   - compressed app data: packs contiguously.
         var payloads = new List<ProsperoPs5InnerPayload>();
-        long pos = 0;
-        foreach (var f in afidOrder)
+        long pos = outputPath is null ? 0 : prewrittenDataEnd;
+        if (outputPath is null)
         {
-            bool alignAfter = f.WholeBlockRaw;
-            bool alignBefore =
-                f.WholeBlockRaw ||
-                (f.StoreRaw && pos % BLK != 0 && f.OnDiskData!.Length > BLK - pos % BLK);
-
-            var p = new ProsperoPs5InnerPayload
+            foreach (var f in afidOrder)
             {
-                // Pre-compressed: pass the cached on-disk bytes through as raw so the builder never recompresses.
-                Data = f.OnDiskData!,
-                StoreRaw = true,
-                BlockAligned = alignBefore,
-                BlockAlignedAfter = alignAfter,
-            };
-            payloads.Add(p);
+                bool alignAfter = f.WholeBlockRaw;
+                bool alignBefore =
+                    f.WholeBlockRaw ||
+                    (f.StoreRaw && pos % BLK != 0 &&
+                     f.OnDiskData!.Length > BLK - pos % BLK);
 
-            if (alignBefore) pos = AlignUp(pos, BLK);
-            f.OnDiskOffset = pos;
-            pos += p.Data.Length;
-            if (alignAfter) pos = AlignUp(pos, BLK);
+                var p = new ProsperoPs5InnerPayload
+                {
+                    // Pre-compressed: pass the cached on-disk bytes through as raw.
+                    Data = f.OnDiskData!,
+                    StoreRaw = true,
+                    BlockAligned = alignBefore,
+                    BlockAlignedAfter = alignAfter,
+                };
+                payloads.Add(p);
+
+                if (alignBefore) pos = AlignUp(pos, BLK);
+                f.OnDiskOffset = pos;
+                f.OnDiskSize = p.Data.LongLength;
+                pos += p.Data.Length;
+                if (alignAfter) pos = AlignUp(pos, BLK);
+            }
         }
 
         // The 256-byte block-info table sits between the data files and the metadata block,
@@ -817,7 +861,9 @@ public sealed class ProsperoPs5InnerImageAssembler
         pos = AlignUp(pos, BLK);
         blockInfoOnDisk = pos;
         pos += blockInfo.Length;
-        payloads.Add(new ProsperoPs5InnerPayload { Data = blockInfo, StoreRaw = true, BlockAligned = true });
+        if (outputPath is null)
+            payloads.Add(new ProsperoPs5InnerPayload
+            { Data = blockInfo, StoreRaw = true, BlockAligned = true });
 
         compressedMeta = ProsperoPs5InnerImageBuilder.CompressPayload(metaPlain, storeRaw: false, out var metaPf);
         // Capture the per-256KiB-block chunk table so the naps generator reuses it (no second Kraken pass).
@@ -827,12 +873,13 @@ public sealed class ProsperoPs5InnerImageAssembler
                 b.CompressedSize, b.UncompressedSize, b.IsMultiChunk, b.FirstChunkCompressedSize)).ToList();
         pos = AlignUp(pos, BLK);
         metadataOnDisk = pos;
-        payloads.Add(new ProsperoPs5InnerPayload
-        {
-            Data = compressedMeta,
-            StoreRaw = true,
-            BlockAligned = true,
-        });
+        if (outputPath is null)
+            payloads.Add(new ProsperoPs5InnerPayload
+            {
+                Data = compressedMeta,
+                StoreRaw = true,
+                BlockAligned = true,
+            });
         var builder = new ProsperoPs5InnerImageBuilder();
         if (outputPath is null)
         {
@@ -845,10 +892,14 @@ public sealed class ProsperoPs5InnerImageAssembler
         }
 
         using (var output = new FileStream(
-                   outputPath, FileMode.Create, FileAccess.ReadWrite, FileShare.None,
+                   outputPath, FileMode.Open, FileAccess.ReadWrite, FileShare.None,
                    bufferSize: 1 << 20, FileOptions.SequentialScan))
         {
-            long unpaddedLength = builder.Write(output, payloads);
+            output.Position = blockInfoOnDisk;
+            output.Write(blockInfo);
+            output.Position = metadataOnDisk;
+            output.Write(compressedMeta);
+            long unpaddedLength = checked(metadataOnDisk + compressedMeta.LongLength);
             imageLength = AlignUp(unpaddedLength, BLK);
             output.SetLength(imageLength);
             output.Flush(flushToDisk: true);
