@@ -84,6 +84,9 @@ reference direct-root geometry (inode bitmap in block 1, inode table in block 2,
 places only the PFSC v2/Kraken `pfs_image.dat` in the direct-root outer PFS, and validates the finished image.
 Large files receive the same single- and double-indirect 32-bit block maps as publisher images;
 these maps are emitted after the contiguous data extent and checked entry by entry.
+The publisher artifact command and the normal publisher `build-pkg` path write the NAPS/outer
+layers through bounded-memory streams. `selftest-large-outer` exercises the first `ib[1]`
+double-indirect leaf with a 120,127,488-byte file.
 PFSC keeps 128 KiB table entries, but full Kraken groups are encoded as one 256 KiB seeded/seedless
 pair (`C000 -> 4000 -> C000`), matching the requests issued by `ppr_pfs` to the I/O controller.
 The default `fast` read profile physically groups startup and small files in the inner image, leaves

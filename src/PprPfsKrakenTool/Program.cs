@@ -78,6 +78,7 @@ internal static class Program
                 "extract-pkg-si" => ExtractPackageSi(args),
                 "probe-entry-crypto" => ProbeEntryCrypto(args),
                 "selftest" => SelfTest(args),
+                "selftest-large-outer" => SelfTestLargeOuter(args),
                 _ => throw new ArgumentException($"Unknown command: {args[0]}")
             };
         }
@@ -701,6 +702,31 @@ internal static class Program
         }
         Console.WriteLine("selftest: NAPS protected-integrity provider passed");
 
+        byte[] napsStreamingInput = new byte[0x84000];
+        for (int i = 0; i < napsStreamingInput.Length; i++)
+            napsStreamingInput[i] = (byte)((i * 17 + (i >> 12)) & 0xFF);
+        var napsStreamingOptions = new ProsperoNapsBuildOptions
+        {
+            CompressionLevel = 7,
+            Compress = true,
+            VerifyRoundTrip = true,
+            FileBoundaries = [0, 0x20000, napsStreamingInput.Length],
+        };
+        ProsperoNapsBuildResult napsInMemory =
+            ProsperoNapsImage.Pack(napsStreamingInput, napsStreamingOptions);
+        using var napsLogicalStream = new MemoryStream(napsStreamingInput, writable: false);
+        using var napsPackedStream = new MemoryStream();
+        ProsperoNapsFileBuildResult napsFileBacked = ProsperoNapsImage.Pack(
+            napsLogicalStream, napsStreamingInput.Length, napsPackedStream, napsStreamingOptions);
+        if (!napsPackedStream.ToArray().AsSpan().SequenceEqual(napsInMemory.PackedImage) ||
+            !napsFileBacked.LayoutBytes.AsSpan().SequenceEqual(napsInMemory.LayoutBytes) ||
+            napsFileBacked.PackedSize != napsInMemory.PackedImage.LongLength)
+        {
+            throw new InvalidDataException(
+                "File-backed and in-memory NAPS writers produced different artifacts.");
+        }
+        Console.WriteLine("selftest: file-backed NAPS writer matches the in-memory writer");
+
         const string complexGp5 = """
             <?xml version="1.0" encoding="utf-8"?>
             <psproject fmt="gp5" version="1000">
@@ -855,6 +881,68 @@ internal static class Program
 
             const string deterministicContentId = "IV9999-PPSA00000_00-DETERMINISTIC000";
             const string deterministicPasscode = "00000000000000000000000000000000";
+
+            string outerPackedSource = Path.Combine(regressionRoot, "outer-source-pfs-image.dat");
+            string outerLayoutSource = Path.Combine(regressionRoot, ProsperoNapsLayout.FileName);
+            string outerFileBackedPath = Path.Combine(regressionRoot, "outer-file-backed.pfs");
+            File.WriteAllBytes(outerPackedSource, napsInMemory.PackedImage);
+            File.WriteAllBytes(outerLayoutSource, napsInMemory.LayoutBytes);
+            byte[] outerSeed = Enumerable.Range(0, 16).Select(i => (byte)i).ToArray();
+            byte[] outerEkpfs = ProsperoPfsKeys.DeriveEkpfs(
+                deterministicContentId, deterministicPasscode);
+            var outerParameters = new ProsperoOuterPfsBuildParameters
+            {
+                Seed = outerSeed,
+                TimestampSeconds = 0,
+                TimestampNanoseconds = 0,
+            };
+            ProsperoOuterPackageImage outerInMemory = ProsperoOuterPfsBuilder.BuildForPackage(
+                [
+                    new ProsperoOuterFile
+                    {
+                        Name = "pfs_image.dat",
+                        Data = napsInMemory.PackedImage,
+                        SizeCompressed = napsStreamingInput.Length,
+                        Signed = false,
+                    },
+                    new ProsperoOuterFile
+                    {
+                        Name = ProsperoNapsLayout.FileName,
+                        Data = napsInMemory.LayoutBytes,
+                        Signed = true,
+                    },
+                ],
+                outerParameters,
+                outerEkpfs);
+            ProsperoOuterPackageFileResult outerFileBacked =
+                ProsperoOuterPfsBuilder.BuildForPackageToFile(
+                    [
+                        new ProsperoOuterFileSource
+                        {
+                            Name = "pfs_image.dat",
+                            Path = outerPackedSource,
+                            SizeCompressed = napsStreamingInput.Length,
+                            Signed = false,
+                        },
+                        new ProsperoOuterFileSource
+                        {
+                            Name = ProsperoNapsLayout.FileName,
+                            Path = outerLayoutSource,
+                            Signed = true,
+                        },
+                    ],
+                    outerParameters,
+                    outerEkpfs,
+                    outerFileBackedPath);
+            if (!File.ReadAllBytes(outerFileBackedPath).AsSpan()
+                    .SequenceEqual(outerInMemory.Ciphertext) ||
+                !outerFileBacked.ImageDigests.AsSpan().SequenceEqual(outerInMemory.ImageDigests) ||
+                !outerFileBacked.SuperblockIcv.AsSpan().SequenceEqual(outerInMemory.SuperblockIcv))
+            {
+                throw new InvalidDataException(
+                    "File-backed and in-memory outer-PFS writers produced different artifacts.");
+            }
+
             ProsperoBuildResult build1 = ProsperoPackageBuilder.Build(
                 new ProsperoBuildOptions
                 {
@@ -879,6 +967,45 @@ internal static class Program
                     DeterministicBuild = true,
                 },
                 _ => { });
+
+            string artifactOutput = Path.Combine(regressionRoot, "publisher-artifacts");
+            ProsperoPublisherPprFileBuildResult artifacts =
+                ProsperoPublisherPprBuilder.BuildFileBacked(
+                    new ProsperoPublisherPprBuildOptions
+                    {
+                        SourceFolder = source1,
+                        OutputDirectory = artifactOutput,
+                        ContentId = deterministicContentId,
+                        Passcode = deterministicPasscode,
+                        OuterSeed = outerSeed,
+                        DeterministicBuild = true,
+                        TimeStamp = DateTime.UnixEpoch,
+                        PfsOptions = new ProsperoPfsLayoutOptions
+                        {
+                            FileCompression = PfsFileCompressionMethod.Kraken,
+                            CompressionLevel = PprPfsKraken.DefaultLevel,
+                        },
+                        NapsOptions = new ProsperoNapsBuildOptions
+                        {
+                            CompressionLevel = 7,
+                            Compress = true,
+                            VerifyRoundTrip = true,
+                        },
+                    },
+                    _ => { });
+            if (new FileInfo(artifacts.PackedImagePath).Length != artifacts.Naps.PackedSize ||
+                new FileInfo(artifacts.OuterPfsPath).Length <= artifacts.Naps.PackedSize ||
+                artifacts.InnerFileCount != Directory.EnumerateFiles(
+                    source1, "*", SearchOption.AllDirectories).Count())
+            {
+                throw new InvalidDataException(
+                    "File-backed publisher artifact pipeline returned inconsistent geometry: " +
+                    $"packedFile={new FileInfo(artifacts.PackedImagePath).Length}, " +
+                    $"packedResult={artifacts.Naps.PackedSize}, " +
+                    $"outer={new FileInfo(artifacts.OuterPfsPath).Length}, " +
+                    $"files={artifacts.InnerFileCount}.");
+            }
+
             byte[] package1 = File.ReadAllBytes(build1.OutputPath);
             byte[] package2 = File.ReadAllBytes(build2.OutputPath);
             if (!package1.AsSpan().SequenceEqual(package2))
@@ -935,6 +1062,118 @@ internal static class Program
         return 0;
     }
 
+    private static int SelfTestLargeOuter(string[] args)
+    {
+        if (args.Length != 1)
+            throw new ArgumentException("selftest-large-outer takes no arguments.");
+
+        const int directBlocks = 12;
+        int indirectEntries = ProsperoOuterPfsBuilder.BlockSize / 36;
+        int largeFileBlocks = directBlocks + indirectEntries + 1;
+        long largeFileLength = checked((long)largeFileBlocks * ProsperoOuterPfsBuilder.BlockSize);
+        string root = Path.Combine(
+            Path.GetTempPath(), "LibProsperoPkg-large-outer-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            string payloadPath = Path.Combine(root, "large.bin");
+            string encryptedPath = Path.Combine(root, "outer.pfs");
+            string plaintextPath = Path.Combine(root, "outer.plain.pfs");
+            using (var payload = new FileStream(
+                       payloadPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                payload.SetLength(largeFileLength);
+
+            byte[] seed = Enumerable.Range(0, 16).Select(i => (byte)(0xA0 + i)).ToArray();
+            byte[] ekpfs = Enumerable.Range(0, 32).Select(i => (byte)(0x20 + i)).ToArray();
+            ProsperoOuterPackageFileResult result =
+                ProsperoOuterPfsBuilder.BuildForPackageToFile(
+                    [
+                        new ProsperoOuterFileSource
+                        {
+                            Name = "large.bin",
+                            Path = payloadPath,
+                            SizeCompressed = largeFileLength,
+                            Signed = false,
+                        },
+                    ],
+                    new ProsperoOuterPfsBuildParameters
+                    {
+                        TimestampSeconds = 0,
+                        TimestampNanoseconds = 0,
+                        Seed = seed,
+                    },
+                    ekpfs,
+                    encryptedPath);
+
+            if (result.FileBlockCount.Length != 1 ||
+                result.FileBlockCount[0] != largeFileBlocks)
+                throw new InvalidDataException("Large outer-PFS block geometry is incorrect.");
+
+            var (tweakKey, dataKey) =
+                ProsperoPfsKeys.DeriveImageEncryptionKeys(ekpfs, seed);
+            using (var encrypted = new FileStream(
+                       encryptedPath, FileMode.Open, FileAccess.Read, FileShare.Read,
+                       bufferSize: 1 << 20, FileOptions.SequentialScan))
+            using (var plaintext = new FileStream(
+                       plaintextPath, FileMode.CreateNew, FileAccess.Write, FileShare.None,
+                       bufferSize: 1 << 20, FileOptions.SequentialScan))
+                ProsperoOuterPfsImage.Transform(
+                    encrypted, plaintext, result.PfsSize,
+                    tweakKey, dataKey, ProsperoOuterPfsBuilder.BlockSize,
+                    result.BlockKinds, encrypt: false);
+
+            using (var plaintext = new FileStream(
+                       plaintextPath, FileMode.Open, FileAccess.Read, FileShare.Read,
+                       bufferSize: 1 << 20, FileOptions.RandomAccess))
+            {
+                plaintext.Position = checked(
+                    (long)result.InodeTableIndex * ProsperoOuterPfsBuilder.BlockSize +
+                    3 * DinodeS32.SizeOf);
+                DinodeS32 inode = DinodeS32.ReadFromStream(plaintext);
+                if (inode.ib[0].block <= 0 || inode.ib[1].block <= 0 ||
+                    inode.ib[2].block != 0 || inode.Blocks != largeFileBlocks)
+                {
+                    throw new InvalidDataException(
+                        "Large outer inode does not contain the expected single/double-indirect roots.");
+                }
+            }
+
+            using (var plaintext = new FileStream(
+                       plaintextPath, FileMode.Open, FileAccess.Read, FileShare.Read,
+                       bufferSize: 1 << 20, FileOptions.RandomAccess))
+            using (var source = new LibProsperoPkg.Util.StreamReader(plaintext))
+            {
+                var reader = new PfsReader(
+                    source,
+                    superblockOffset: checked(
+                        (long)result.SuperblockIndex * ProsperoOuterPfsBuilder.BlockSize),
+                    encryptedDataAlreadyDecrypted: true);
+                PfsReader.File file = reader.GetFile("large.bin")
+                    ?? throw new InvalidDataException("Large file is absent from the rebuilt outer PFS.");
+                if (file.size != largeFileLength)
+                    throw new InvalidDataException("Large outer-PFS inode size is incorrect.");
+                file.CopyTo(Stream.Null, decompress: false);
+            }
+
+            Console.WriteLine(
+                "selftest-large-outer: signed single + double indirect addressing passed " +
+                $"({largeFileBlocks:N0} blocks, {largeFileLength:N0} bytes)");
+            return 0;
+        }
+        finally
+        {
+            try
+            {
+                if (Directory.Exists(root))
+                    Directory.Delete(root, recursive: true);
+            }
+            catch
+            {
+                // Best-effort cleanup must not hide the regression result.
+            }
+        }
+    }
+
     private static byte[] FindMeta18Record(byte[] plain, string wantedTag)
     {
         for (int pos = 0; pos + 16 <= plain.Length;)
@@ -989,7 +1228,7 @@ internal static class Program
             throw new ArgumentException(
                 "build-publisher-artifacts requires <source-folder> <output-dir> <content-id> <passcode> [cmac-key-hex].");
         byte[]? cmac = args.Length == 6 ? Convert.FromHexString(args[5]) : null;
-        ProsperoPublisherPprBuildResult result = ProsperoPublisherPprBuilder.Build(
+        ProsperoPublisherPprFileBuildResult result = ProsperoPublisherPprBuilder.BuildFileBacked(
             new ProsperoPublisherPprBuildOptions
             {
                 SourceFolder = args[1],
@@ -1006,7 +1245,7 @@ internal static class Program
             Console.WriteLine);
         Console.WriteLine(
             $"publisher artifacts: inner-files={result.InnerFileCount} "
-            + $"naps=0x{result.Naps.PackedImage.Length:x} outer-superblock={result.OuterSuperblockIndex}");
+            + $"naps=0x{result.Naps.PackedSize:x} outer-superblock={result.OuterSuperblockIndex}");
         return 0;
     }
 
@@ -1915,6 +2154,7 @@ internal static class Program
         Console.WriteLine("  extract-pkg-si <package.pkg> <output-dir>");
         Console.WriteLine("  probe-entry-crypto <package.pkg> <entry-id-hex> <passcode>");
         Console.WriteLine("  selftest");
+        Console.WriteLine("  selftest-large-outer");
         Console.WriteLine("  Levels: Kraken -4..9 (default 8), zlib 0..9 (default 9).");
         Console.WriteLine("  Valid builds: ppr+kraken/none; classic+zlib/kraken/none.");
     }

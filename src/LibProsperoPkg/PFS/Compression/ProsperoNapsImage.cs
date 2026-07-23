@@ -66,7 +66,7 @@ public sealed class ProsperoNapsBuildOptions
     public IReadOnlyList<long>? FileBoundaries { get; init; }
 }
 
-/// <summary>Artifacts emitted by <see cref="ProsperoNapsImage.Pack"/>.</summary>
+/// <summary>Artifacts emitted by the in-memory NAPS writer.</summary>
 public sealed class ProsperoNapsBuildResult
 {
     public required byte[] PackedImage { get; init; }
@@ -75,6 +75,17 @@ public sealed class ProsperoNapsBuildResult
     public required int CompressedSpanCount { get; init; }
     public required int StoredSpanCount { get; init; }
     public long LogicalSize { get; init; }
+}
+
+/// <summary>Artifacts emitted by the bounded-memory stream/file NAPS writer.</summary>
+public sealed class ProsperoNapsFileBuildResult
+{
+    public required byte[] LayoutBytes { get; init; }
+    public required NapsLayoutDocument Layout { get; init; }
+    public required int CompressedSpanCount { get; init; }
+    public required int StoredSpanCount { get; init; }
+    public required long LogicalSize { get; init; }
+    public required long PackedSize { get; init; }
 }
 
 /// <summary>Resolves and decodes <c>pfs_image.dat</c> using <c>naps_pkg_layout.dat</c>.</summary>
@@ -228,6 +239,177 @@ public static class ProsperoNapsImage
             CompressedSpanCount = compressedCount,
             StoredSpanCount = storedCount,
             LogicalSize = logicalImage.Length,
+        };
+    }
+
+    /// <summary>
+    /// Packs a seekable logical image into a seekable file/stream using at most one 256-KiB source
+    /// block plus encoder scratch. The packed stream is truncated and rewritten from offset zero.
+    /// </summary>
+    public static ProsperoNapsFileBuildResult Pack(
+        Stream logicalInput,
+        long logicalLength,
+        Stream packedOutput,
+        ProsperoNapsBuildOptions? options = null)
+    {
+        ArgumentNullException.ThrowIfNull(logicalInput);
+        ArgumentNullException.ThrowIfNull(packedOutput);
+        options ??= new ProsperoNapsBuildOptions();
+        if (!logicalInput.CanRead || !logicalInput.CanSeek)
+            throw new ArgumentException("Logical NAPS input must be readable and seekable.", nameof(logicalInput));
+        if (!packedOutput.CanRead || !packedOutput.CanWrite || !packedOutput.CanSeek)
+            throw new ArgumentException(
+                "Packed NAPS output must be readable, writable and seekable.", nameof(packedOutput));
+        if (logicalLength <= 0 || logicalLength > logicalInput.Length)
+            throw new ArgumentOutOfRangeException(nameof(logicalLength));
+        if (options.CompressionLevel is < -4 or > 9)
+            throw new ArgumentOutOfRangeException(nameof(options), "Kraken level must be in -4..9.");
+        if (options.OuterBlockCmacKey is { Length: not 16 })
+            throw new ArgumentException("NAPS outer-block CMAC key must be exactly 16 bytes.", nameof(options));
+
+        long[] boundaries = ValidateBoundaries(logicalLength, options.FileBoundaries);
+        logicalInput.Position = 0;
+        packedOutput.Position = 0;
+        packedOutput.SetLength(0);
+
+        var cblockInfos = new List<NapsCblockInfoEntry>();
+        var spanIndexesByUblock = new List<uint>();
+        int compressedCount = 0;
+        int storedCount = 0;
+        cblockInfos.Add(new NapsCblockInfoEntry
+        {
+            IsRunBase = true,
+            CoffsetEndMod256K = 0,
+            TweakIdxStart = 0,
+            KeyTableIdx = 0,
+            CoffsetStart256K = 0,
+        });
+
+        byte[] sourceBuffer = new byte[UBlockSize];
+        long logicalOffset = 0;
+        int nextBoundaryIndex = 1;
+        while (logicalOffset < logicalLength)
+        {
+            while (nextBoundaryIndex < boundaries.Length &&
+                   boundaries[nextBoundaryIndex] <= logicalOffset)
+                nextBoundaryIndex++;
+            int ublockRemaining = UBlockSize - (int)(logicalOffset & (UBlockSize - 1));
+            long fileRemaining = nextBoundaryIndex < boundaries.Length
+                ? boundaries[nextBoundaryIndex] - logicalOffset
+                : logicalLength - logicalOffset;
+            int uncompressedLength = checked((int)Math.Min(ublockRemaining, fileRemaining));
+            logicalInput.ReadExactly(sourceBuffer.AsSpan(0, uncompressedLength));
+            ReadOnlySpan<byte> source = sourceBuffer.AsSpan(0, uncompressedLength);
+            EncodedBlock? encoded = options.Compress
+                ? OodleKrakenEncoder.EncodeBlock(source, useHuffmanArrays: true, options.CompressionLevel)
+                : null;
+            bool compressed = encoded is EncodedBlock value && value.Payload.Length < source.Length;
+            ReadOnlyMemory<byte> payload = compressed
+                ? encoded!.Value.Payload
+                : sourceBuffer.AsMemory(0, uncompressedLength);
+            int firstChunkLength = compressed
+                ? encoded!.Value.FirstChunkCompSize
+                : Math.Min(0x20000, uncompressedLength);
+            if (firstChunkLength is < 1 or > 0x20000)
+                throw new InvalidDataException("NAPS first-chunk length exceeds the 17-bit minus-one field.");
+
+            long compressedOffset = packedOutput.Position;
+            if ((logicalOffset & (UBlockSize - 1)) == 0)
+                spanIndexesByUblock.Add(checked((uint)cblockInfos.Count));
+            packedOutput.Write(payload.Span);
+            cblockInfos.Add(new NapsCblockInfoEntry
+            {
+                CoffsetStartMod256K = checked((uint)(compressedOffset & (UBlockSize - 1))),
+                UoffsetStart = checked((uint)(logicalOffset & (UBlockSize - 1))),
+                ClenEvenMinus1 = checked((uint)(firstChunkLength - 1)),
+                Even = compressed ? (byte)5 : (byte)1,
+                Odd = compressed && uncompressedLength > 0x20000 ? (byte)4
+                    : !compressed && uncompressedLength > 0x20000 ? (byte)1 : (byte)0,
+                KdePredictor = 0,
+                ShuffleIdx = 0,
+            });
+            if (compressed) compressedCount++; else storedCount++;
+            logicalOffset += uncompressedLength;
+        }
+
+        long compressedEnd = packedOutput.Position;
+        cblockInfos.Add(new NapsCblockInfoEntry
+        {
+            ReservedBit19 = true,
+            CoffsetStartMod256K = checked((uint)(compressedEnd & (UBlockSize - 1))),
+            UoffsetStart = checked((uint)(logicalLength & (UBlockSize - 1))),
+            ClenEvenMinus1 = 0,
+        });
+
+        int outerBlockCount = checked((int)((compressedEnd + OuterBlockSize - 1) / OuterBlockSize));
+        long packedLength = checked((long)outerBlockCount * OuterBlockSize);
+        packedOutput.SetLength(packedLength);
+        var outerDigests = new List<byte[]>(outerBlockCount);
+        if (options.OuterBlockCmacKey is null)
+        {
+            for (int i = 0; i < outerBlockCount; i++)
+                outerDigests.Add(new byte[8]);
+        }
+        else
+        {
+            byte[] outerBlock = new byte[OuterBlockSize];
+            for (int i = 0; i < outerBlockCount; i++)
+            {
+                packedOutput.Position = (long)i * OuterBlockSize;
+                packedOutput.ReadExactly(outerBlock);
+                outerDigests.Add(ComputeOuterBlockDigest(outerBlock, options.OuterBlockCmacKey));
+            }
+        }
+
+        var fileOffsets = new List<NapsFileOffsetEntry>(boundaries.Length);
+        for (int i = 0; i < boundaries.Length; i++)
+            fileOffsets.Add(new NapsFileOffsetEntry(
+                i == boundaries.Length - 1 ? (byte)0x40 : (byte)0,
+                checked((ulong)boundaries[i])));
+
+        int ublockCount = checked((int)((logicalLength + UBlockSize - 1) / UBlockSize));
+        List<NapsU2cEntry> u2c = BuildU2c(
+            spanIndexesByUblock, ublockCount, checked((uint)cblockInfos.Count - 1));
+        var counts = new NapsLayoutCounts(
+            NumFiles: fileOffsets.Count,
+            CompressionType: 2,
+            NumKeys: 1,
+            NumShufflePatterns: 0,
+            NumUBlocks: ublockCount - 1,
+            NumOuterBlocks: outerBlockCount,
+            NumCblockInfo: cblockInfos.Count);
+        var document = new NapsLayoutDocument
+        {
+            Counts = counts,
+            Map = ProsperoNapsLayout.SectionMap(counts),
+            OuterBlockDigests = outerDigests,
+            ShufflePatterns = Array.Empty<byte[]>(),
+            FileOffsets = fileOffsets,
+            CblockInfoOffsetByUblock = u2c,
+            CblockInfos = cblockInfos,
+            TrailingZeroBytes = 0,
+        };
+        byte[] layoutBytes = ProsperoNapsLayout.BuildLayout(document);
+        document = ProsperoNapsLayout.Parse(layoutBytes);
+
+        if (options.VerifyRoundTrip)
+        {
+            packedOutput.Position = 0;
+            logicalInput.Position = 0;
+            using var verifier = new NapsVerifyingWriteStream(logicalInput, logicalLength);
+            Decompress(packedOutput, document, verifier);
+            verifier.EnsureComplete();
+        }
+        logicalInput.Position = 0;
+        packedOutput.Position = 0;
+        return new ProsperoNapsFileBuildResult
+        {
+            LayoutBytes = layoutBytes,
+            Layout = document,
+            CompressedSpanCount = compressedCount,
+            StoredSpanCount = storedCount,
+            LogicalSize = logicalLength,
+            PackedSize = packedLength,
         };
     }
 
@@ -452,7 +634,7 @@ public static class ProsperoNapsImage
             : checked(group.InfoOffset9BBase + group.DeltaFromBase[(ublock & 7) - 1]);
     }
 
-    private static long[] ValidateBoundaries(int logicalLength, IReadOnlyList<long>? requested)
+    private static long[] ValidateBoundaries(long logicalLength, IReadOnlyList<long>? requested)
     {
         if (requested is null)
             return [0, logicalLength];
@@ -469,6 +651,89 @@ public static class ProsperoNapsImage
             previous = current;
         }
         return result;
+    }
+
+    private sealed class NapsVerifyingWriteStream : Stream
+    {
+        private readonly Stream expected;
+        private readonly long expectedLength;
+        private byte[] scratch = new byte[UBlockSize];
+        private long position;
+        private long declaredLength;
+        private long maxWritten;
+
+        public NapsVerifyingWriteStream(Stream expected, long expectedLength)
+        {
+            this.expected = expected;
+            this.expectedLength = expectedLength;
+            declaredLength = expectedLength;
+        }
+
+        public override bool CanRead => false;
+        public override bool CanSeek => true;
+        public override bool CanWrite => true;
+        public override long Length => declaredLength;
+        public override long Position
+        {
+            get => position;
+            set
+            {
+                if (value < 0 || value > expectedLength)
+                    throw new ArgumentOutOfRangeException(nameof(value));
+                position = value;
+            }
+        }
+
+        public override void Write(byte[] buffer, int offset, int count) =>
+            Write(buffer.AsSpan(offset, count));
+
+        public override void Write(ReadOnlySpan<byte> buffer)
+        {
+            if (position > expectedLength || buffer.Length > expectedLength - position)
+                throw new InvalidDataException("NAPS round-trip produced more logical bytes than expected.");
+            if (scratch.Length < buffer.Length)
+                scratch = new byte[buffer.Length];
+            expected.Position = position;
+            expected.ReadExactly(scratch.AsSpan(0, buffer.Length));
+            if (!scratch.AsSpan(0, buffer.Length).SequenceEqual(buffer))
+                throw new InvalidDataException($"Generated NAPS image differs at logical offset 0x{position:X}.");
+            position += buffer.Length;
+            maxWritten = Math.Max(maxWritten, position);
+        }
+
+        public void EnsureComplete()
+        {
+            if (declaredLength != expectedLength || maxWritten != expectedLength)
+                throw new InvalidDataException(
+                    $"NAPS round-trip produced 0x{maxWritten:X} of 0x{expectedLength:X} logical bytes.");
+        }
+
+        public override void SetLength(long value)
+        {
+            if (value != expectedLength)
+                throw new InvalidDataException(
+                    $"NAPS round-trip declared length 0x{value:X}, expected 0x{expectedLength:X}.");
+            declaredLength = value;
+            if (position > value)
+                position = value;
+        }
+
+        public override long Seek(long offset, SeekOrigin origin)
+        {
+            long target = origin switch
+            {
+                SeekOrigin.Begin => offset,
+                SeekOrigin.Current => checked(position + offset),
+                SeekOrigin.End => checked(expectedLength + offset),
+                _ => throw new ArgumentOutOfRangeException(nameof(origin)),
+            };
+            Position = target;
+            return position;
+        }
+
+        public override void Flush() { }
+        public override int Read(byte[] buffer, int offset, int count) =>
+            throw new NotSupportedException();
     }
 
     private static List<NapsU2cEntry> BuildU2c(

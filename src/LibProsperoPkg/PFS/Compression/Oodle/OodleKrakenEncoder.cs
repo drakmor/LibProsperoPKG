@@ -486,7 +486,7 @@ internal static class OodleKrakenEncoder
     }
 
     /// <summary>
-    /// Returns the byte length <see cref="WriteArray"/> would emit for <paramref name="array"/> (the
+    /// Returns the byte length the array writer would emit for a candidate byte stream (the
     /// smaller of the raw 3-byte-header form and the Huffman form), without writing. Used to pick the
     /// cheaper literal model (sub vs raw) the way the array coder does.
     /// </summary>
@@ -631,7 +631,7 @@ internal static class OodleKrakenEncoder
     /// Value-model lazy parse over the output range, a faithful managed implementation of the reference
     /// <c>greedy optimal pre-pass</c> (the implementation). Each
     /// candidate match is scored by the exact value function (<see cref="FindMatch"/> /
-    /// <see cref="MatchValue"/>):<c>len*4 - (isRep ? 0 : bitlen(dist)+2)</c> — validated from
+    /// <c>match value</c>):<c>len*4 - (isRep ? 0 : bitlen(dist)+2)</c> — validated from
     /// <c>algorithm</c> + <c>algorithm</c> (<c>bitlen = 32 - clz</c>). Repeat-offset matches
     /// transmit no offset, so they cost 0 there and are strongly preferred; among new offsets the
     /// finder keeps the highest value and, on a value tie, the SHORTEST distance (the hash chain is

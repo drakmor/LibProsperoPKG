@@ -528,23 +528,6 @@ public static class ProsperoPkgBuilder
         uint contentVersionHigh = ContentVersionHigh(ReadParamJsonInfo(sourceFolder).ContentVersion);
         long nestedMetaBaseBlocks = inner.MetaBaseLogical / BlockSize;
 
-        ProsperoOuterFile[] outerFiles =
-        [
-            new ProsperoOuterFile
-            {
-                Name = "pfs_image.dat",
-                Data = inner.Image,
-                SizeCompressed = inner.Ndblock * BlockSize,
-                Signed = false,
-            },
-            new ProsperoOuterFile
-            {
-                Name = ProsperoNapsLayout.FileName,
-                Data = napsLayout,
-                Signed = true,
-            },
-        ];
-
         if (props.OuterPfsSeed is { Length: not 16 })
             throw new ArgumentException("Outer PFS seed must contain exactly 16 bytes.", nameof(props));
         byte[] outerSeed = props.OuterPfsSeed?.AsSpan().ToArray()
@@ -552,10 +535,45 @@ public static class ProsperoPkgBuilder
                 ? DeriveDeterministicOuterSeed(props.ContentId, props.Passcode)
                 : System.Security.Cryptography.RandomNumberGenerator.GetBytes(16));
         byte[] ekpfs = ProsperoPfsKeys.DeriveEkpfs(props.ContentId, props.Passcode);
-        ProsperoOuterPackageImage outer = ProsperoOuterPfsBuilder.BuildForPackage(
-            outerFiles,
-            new ProsperoOuterPfsBuildParameters { TimestampSeconds = fileTime, Seed = outerSeed },
-            ekpfs);
+        string publisherTempStem = Path.Combine(
+            Path.GetTempPath(), "libprospero-publisher-" + Guid.NewGuid().ToString("N"));
+        string packedImagePath = publisherTempStem + ".pfs_image.dat";
+        string napsLayoutPath = publisherTempStem + ".naps_pkg_layout.dat";
+        string outerImagePath = publisherTempStem + ".outer.pfs";
+        ProsperoOuterPackageFileResult outer;
+        File.WriteAllBytes(packedImagePath, inner.Image);
+        File.WriteAllBytes(napsLayoutPath, napsLayout);
+        try
+        {
+            outer = ProsperoOuterPfsBuilder.BuildForPackageToFile(
+                [
+                    new ProsperoOuterFileSource
+                    {
+                        Name = "pfs_image.dat",
+                        Path = packedImagePath,
+                        SizeCompressed = inner.Ndblock * BlockSize,
+                        Signed = false,
+                    },
+                    new ProsperoOuterFileSource
+                    {
+                        Name = ProsperoNapsLayout.FileName,
+                        Path = napsLayoutPath,
+                        Signed = true,
+                    },
+                ],
+                new ProsperoOuterPfsBuildParameters
+                {
+                    TimestampSeconds = fileTime,
+                    Seed = outerSeed,
+                },
+                ekpfs,
+                outerImagePath);
+        }
+        finally
+        {
+            TryDeleteTemp(packedImagePath);
+            TryDeleteTemp(napsLayoutPath);
+        }
 
         long packedSize = inner.Image.Length;
         ulong packedAlignedSize = Align((ulong)packedSize, BlockSize);
@@ -578,53 +596,68 @@ public static class ProsperoPkgBuilder
             Array.Reverse(reversedDigests, off, ProsperoImageDigests.DigestSize);
         imagedigsEntry.FileData = reversedDigests;
 
-        long totalSize = checked((long)(pkg.Header.body_offset + pkg.Header.body_size + pkg.Header.pfs_image_size));
-        using var fs = new FileStream(outputPath, FileMode.Create, FileAccess.ReadWrite, FileShare.None);
-        fs.SetLength(totalSize);
-        fs.Position = (long)pkg.Header.pfs_image_offset;
-        fs.Write(outer.Ciphertext);
-        log($"Writing publisher outer PFS at 0x{pkg.Header.pfs_image_offset:X} ({outer.PfsSize:N0} bytes)...");
-
-        ProsperoPfsImageXmlOptions siXml = FinishContainer(
-            pkg, fs, props, nestedImageDigest, log, napsLayout.Length, nestedMetaBaseBlocks,
-            contentVersionHigh, (int)napsFileCount, appFileCount);
-        byte[]? playGoChunkDat =
-            (pkg.Entries.FirstOrDefault(e => (uint)e.Id == PlayGoChunkDatEntryId) as GenericEntry)?.FileData;
-        long mountImageTotal = siXml.PfsImageOffset + siXml.PfsImageSize;
-        siXml.OuterPfsTree = outer.Tree;
-        siXml.ChunkInfo = new ProsperoChunkInfoModel
+        try
         {
-            PlayGoChunkDatSize = playGoChunkDat?.Length ?? 0,
-            TotalSize = mountImageTotal,
-            Outer0Size = checked((long)packedAlignedSize),
-            Outer1Size = mountImageTotal - (long)packedAlignedSize,
-        };
+            long totalSize = checked(
+                (long)(pkg.Header.body_offset + pkg.Header.body_size + pkg.Header.pfs_image_size));
+            using var fs = new FileStream(
+                outputPath, FileMode.Create, FileAccess.ReadWrite, FileShare.None);
+            fs.SetLength(totalSize);
+            fs.Position = (long)pkg.Header.pfs_image_offset;
+            using (var outerStream = new FileStream(
+                       outerImagePath, FileMode.Open, FileAccess.Read, FileShare.Read,
+                       bufferSize: 1 << 20, FileOptions.SequentialScan))
+                outerStream.CopyTo(fs);
+            log(
+                $"Writing publisher outer PFS at 0x{pkg.Header.pfs_image_offset:X} " +
+                $"({outer.PfsSize:N0} bytes)...");
 
-        var contentFiles = inner.Nodes
-            .Where(n => !n.IsDirectory && n.ParentInode >= 0)
-            .OrderBy(n => n.Afid)
-            .Select(n => (Path: n.FullPath.TrimStart('/'), Size: n.Size))
-            .ToList();
-        contentFiles.Add(("*PFSmetadata", outer.PfsSize));
+            ProsperoPfsImageXmlOptions siXml = FinishContainer(
+                pkg, fs, props, nestedImageDigest, log, napsLayout.Length, nestedMetaBaseBlocks,
+                contentVersionHigh, (int)napsFileCount, appFileCount);
+            byte[]? playGoChunkDat =
+                (pkg.Entries.FirstOrDefault(e => (uint)e.Id == PlayGoChunkDatEntryId)
+                    as GenericEntry)?.FileData;
+            long mountImageTotal = siXml.PfsImageOffset + siXml.PfsImageSize;
+            siXml.OuterPfsTree = outer.Tree;
+            siXml.ChunkInfo = new ProsperoChunkInfoModel
+            {
+                PlayGoChunkDatSize = playGoChunkDat?.Length ?? 0,
+                TotalSize = mountImageTotal,
+                Outer0Size = checked((long)packedAlignedSize),
+                Outer1Size = mountImageTotal - (long)packedAlignedSize,
+            };
 
-        siInputs = new ProsperoSiBuildInputs
+            var contentFiles = inner.Nodes
+                .Where(n => !n.IsDirectory && n.ParentInode >= 0)
+                .OrderBy(n => n.Afid)
+                .Select(n => (Path: n.FullPath.TrimStart('/'), Size: n.Size))
+                .ToList();
+            contentFiles.Add(("*PFSmetadata", outer.PfsSize));
+
+            siInputs = new ProsperoSiBuildInputs
+            {
+                Xml = siXml,
+                PlayGoChunkDat = playGoChunkDat,
+                InnerImageSize = (long)packedAlignedSize,
+                NapsLayoutSize = (ulong)napsLayout.Length,
+                FihNapsFileCount = napsFileCount,
+                NapsMeta18 = props.NapsMeta18,
+                NapsIntegrityProvider = props.NapsIntegrityProvider,
+                // Verified prospero-pub-cmd 2.79 APP and AC nwonly SI profiles both contain the
+                // seven NAPS/PlayGo records and no common/etc/pfsimage.xml.
+                IncludePfsImageXml = false,
+                ContentFiles = contentFiles,
+                InnerImage = inner,
+                NestedMetaBaseBlocks = nestedMetaBaseBlocks,
+                ContentVersionHigh = contentVersionHigh,
+                AppFileCount = appFileCount,
+            };
+        }
+        finally
         {
-            Xml = siXml,
-            PlayGoChunkDat = playGoChunkDat,
-            InnerImageSize = (long)packedAlignedSize,
-            NapsLayoutSize = (ulong)napsLayout.Length,
-            FihNapsFileCount = napsFileCount,
-            NapsMeta18 = props.NapsMeta18,
-            NapsIntegrityProvider = props.NapsIntegrityProvider,
-            // Verified prospero-pub-cmd 2.79 APP and AC nwonly SI profiles both contain the
-            // seven NAPS/PlayGo records and no common/etc/pfsimage.xml.
-            IncludePfsImageXml = false,
-            ContentFiles = contentFiles,
-            InnerImage = inner,
-            NestedMetaBaseBlocks = nestedMetaBaseBlocks,
-            ContentVersionHigh = contentVersionHigh,
-            AppFileCount = appFileCount,
-        };
+            TryDeleteTemp(outerImagePath);
+        }
     }
 
     private static IReadOnlyList<(string Path, long Size)> ReadPfsContentFiles(string imagePath)
