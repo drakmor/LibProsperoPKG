@@ -500,6 +500,8 @@ public static class ProsperoPackageBuilder
         // can install — and keep ONLY that final package.
         if (!wantsFih)
         {
+            if (siInputs?.TemporaryInnerImagePath is string temporaryInner)
+                TryDelete(temporaryInner);
             log(options.Mode == ProsperoPackageMode.AdditionalContentNoData
                 ? "Done (PSAL CNT+SI package; no PFS/FIH layer)."
                 : "Done (CNT metadata container).");
@@ -542,6 +544,8 @@ public static class ProsperoPackageBuilder
             // Remove the intermediate CNT and its detached signature so only the final FIH remains.
             TryDelete(cntPath);
             TryDelete(cntPath + ".metasig");
+            if (siInputs?.TemporaryInnerImagePath is string temporaryInner)
+                TryDelete(temporaryInner);
         }
 
         log("Done (debug FIH).");

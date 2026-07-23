@@ -75,6 +75,9 @@ internal sealed class ProsperoSiBuildInputs
     /// <summary>Exact assembled data-first inner image used to build the NAPS block map.</summary>
     public ProsperoPs5InnerImageResult? InnerImage { get; init; }
 
+    /// <summary>Temporary file owned by the high-level finalizer and deleted after SI generation.</summary>
+    public string? TemporaryInnerImagePath { get; init; }
+
     public long NestedMetaBaseBlocks { get; init; }
     public uint ContentVersionHigh { get; init; }
     public int AppFileCount { get; init; }
@@ -503,8 +506,14 @@ public static class ProsperoPkgBuilder
     {
         log("Preparing publisher data-first PPR-PFS and NAPS image...");
         long fileTime = ToUnixSeconds(props.TimeStamp);
+        string publisherTempStem = Path.Combine(
+            Path.GetTempPath(), "libprospero-publisher-" + Guid.NewGuid().ToString("N"));
+        string packedImagePath = publisherTempStem + ".pfs_image.dat";
+        string napsLayoutPath = publisherTempStem + ".naps_pkg_layout.dat";
+        string outerImagePath = publisherTempStem + ".outer.pfs";
         ProsperoPs5InnerImageResult inner =
-            new ProsperoPs5InnerImageAssembler(fileTime, 0).BuildFromFsTree(innerRoot);
+            new ProsperoPs5InnerImageAssembler(fileTime, 0)
+                .BuildFromFsTreeToFile(innerRoot, packedImagePath);
         byte[] napsLayout = ProsperoNwonlyNapsGenerator.Generate(
             inner,
             outerBlockCmacKey: props.NapsOuterBlockCmacKey);
@@ -535,14 +544,9 @@ public static class ProsperoPkgBuilder
                 ? DeriveDeterministicOuterSeed(props.ContentId, props.Passcode)
                 : System.Security.Cryptography.RandomNumberGenerator.GetBytes(16));
         byte[] ekpfs = ProsperoPfsKeys.DeriveEkpfs(props.ContentId, props.Passcode);
-        string publisherTempStem = Path.Combine(
-            Path.GetTempPath(), "libprospero-publisher-" + Guid.NewGuid().ToString("N"));
-        string packedImagePath = publisherTempStem + ".pfs_image.dat";
-        string napsLayoutPath = publisherTempStem + ".naps_pkg_layout.dat";
-        string outerImagePath = publisherTempStem + ".outer.pfs";
         ProsperoOuterPackageFileResult outer;
-        File.WriteAllBytes(packedImagePath, inner.Image);
         File.WriteAllBytes(napsLayoutPath, napsLayout);
+        bool outerReady = false;
         try
         {
             outer = ProsperoOuterPfsBuilder.BuildForPackageToFile(
@@ -568,14 +572,16 @@ public static class ProsperoPkgBuilder
                 },
                 ekpfs,
                 outerImagePath);
+            outerReady = true;
         }
         finally
         {
-            TryDeleteTemp(packedImagePath);
             TryDeleteTemp(napsLayoutPath);
+            if (!outerReady)
+                TryDeleteTemp(packedImagePath);
         }
 
-        long packedSize = inner.Image.Length;
+        long packedSize = inner.ImageLength;
         ulong packedAlignedSize = Align((ulong)packedSize, BlockSize);
         ulong mchunkTotal = checked((ulong)ProsperoImageDigests.FihRelativeImageOffset + (ulong)outer.PfsSize);
         // Publisher nwonly splits PlayGo at the inner pfs_image.dat data extent:
@@ -596,6 +602,7 @@ public static class ProsperoPkgBuilder
             Array.Reverse(reversedDigests, off, ProsperoImageDigests.DigestSize);
         imagedigsEntry.FileData = reversedDigests;
 
+        bool transferredInnerFile = false;
         try
         {
             long totalSize = checked(
@@ -649,14 +656,18 @@ public static class ProsperoPkgBuilder
                 IncludePfsImageXml = false,
                 ContentFiles = contentFiles,
                 InnerImage = inner,
+                TemporaryInnerImagePath = packedImagePath,
                 NestedMetaBaseBlocks = nestedMetaBaseBlocks,
                 ContentVersionHigh = contentVersionHigh,
                 AppFileCount = appFileCount,
             };
+            transferredInnerFile = true;
         }
         finally
         {
             TryDeleteTemp(outerImagePath);
+            if (!transferredInnerFile)
+                TryDeleteTemp(packedImagePath);
         }
     }
 

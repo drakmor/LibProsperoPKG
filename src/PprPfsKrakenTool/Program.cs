@@ -879,6 +879,40 @@ internal static class Program
             File.WriteAllBytes(Path.Combine(source2, "data", "a.bin"), [0x41, 0x31]);
             File.WriteAllBytes(Path.Combine(source2, "data", "z.bin"), [0x5A, 0x31]);
 
+            byte[] compressibleInnerData = new byte[0x52000];
+            for (int i = 0; i < compressibleInnerData.Length; i++)
+                compressibleInnerData[i] = (byte)((i >> 8) & 7);
+            IReadOnlyList<ProsperoPs5InnerFile> innerFiles =
+            [
+                new ProsperoPs5InnerFile
+                {
+                    Path = "/data/payload.bin",
+                    Data = compressibleInnerData,
+                },
+                new ProsperoPs5InnerFile
+                {
+                    Path = "/sce_sys/keystone",
+                    Data = Enumerable.Range(0, 96).Select(i => (byte)i).ToArray(),
+                },
+            ];
+            var innerAssembler = new ProsperoPs5InnerImageAssembler(0, 0);
+            ProsperoPs5InnerImageResult memoryInner = innerAssembler.Build(innerFiles);
+            string fileInnerPath = Path.Combine(regressionRoot, "file-backed-inner.dat");
+            ProsperoPs5InnerImageResult fileInner =
+                innerAssembler.BuildToFile(innerFiles, fileInnerPath);
+            byte[] testCmacKey = Enumerable.Range(0, 16).Select(i => (byte)(0xC0 + i)).ToArray();
+            if (fileInner.Image.Length != 0 ||
+                fileInner.ImageLength != memoryInner.Image.LongLength ||
+                !File.ReadAllBytes(fileInnerPath).AsSpan().SequenceEqual(memoryInner.Image) ||
+                !ProsperoNwonlyNapsGenerator.Generate(fileInner, outerBlockCmacKey: testCmacKey)
+                    .AsSpan().SequenceEqual(
+                        ProsperoNwonlyNapsGenerator.Generate(
+                            memoryInner, outerBlockCmacKey: testCmacKey)))
+            {
+                throw new InvalidDataException(
+                    "File-backed and in-memory specialized inner-image assemblers differ.");
+            }
+
             const string deterministicContentId = "IV9999-PPSA00000_00-DETERMINISTIC000";
             const string deterministicPasscode = "00000000000000000000000000000000";
 

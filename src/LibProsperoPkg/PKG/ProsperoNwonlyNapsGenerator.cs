@@ -11,6 +11,7 @@ using LibProsperoPkg.PFS;
 using LibProsperoPkg.PFS.Compression;
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 
 namespace LibProsperoPkg.PKG;
@@ -145,29 +146,22 @@ public static class ProsperoNwonlyNapsGenerator
 
         // Publisher header includes one terminal accounting ublock beyond ceil(mount/UBlock).
         int numUBlocks = checked((int)((mountSize + Ublock256K - 1) / Ublock256K) + 1);
-        int numOuterBlocks = (result.Image.Length + Block64K - 1) / Block64K;
+        int numOuterBlocks = checked((int)(
+            (result.ImageLength + Block64K - 1) / Block64K));
         IReadOnlyList<byte[]>? outerBlockDigests = null;
         if (outerBlockCmacKey is not null)
         {
             var tags = new List<byte[]>(numOuterBlocks);
+            using Stream image = result.OpenImage();
+            byte[] block = new byte[Block64K];
             for (int i = 0; i < numOuterBlocks; i++)
             {
-                int offset = i * Block64K;
-                int available = Math.Min(Block64K, result.Image.Length - offset);
-                ReadOnlySpan<byte> block;
-                byte[]? padded = null;
-                if (available == Block64K)
-                {
-                    block = result.Image.AsSpan(offset, Block64K);
-                }
-                else
-                {
-                    // NAPS accounts the physical stream in complete 64-KiB outer blocks. The
-                    // final short block is zero-filled before SHA3/CMAC, matching the packer.
-                    padded = new byte[Block64K];
-                    result.Image.AsSpan(offset, available).CopyTo(padded);
-                    block = padded;
-                }
+                Array.Clear(block);
+                int available = checked((int)Math.Min(
+                    Block64K, result.ImageLength - (long)i * Block64K));
+                image.Position = (long)i * Block64K;
+                if (available > 0)
+                    image.ReadExactly(block.AsSpan(0, available));
                 tags.Add(ProsperoNapsImage.ComputeOuterBlockDigest(
                     block,
                     outerBlockCmacKey));

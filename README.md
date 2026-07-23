@@ -87,6 +87,9 @@ these maps are emitted after the contiguous data extent and checked entry by ent
 The publisher artifact command and the normal publisher `build-pkg` path write the NAPS/outer
 layers through bounded-memory streams. `selftest-large-outer` exercises the first `ib[1]`
 double-indirect leaf with a 120,127,488-byte file.
+The specialized publisher inner assembler also writes its final physical `pfs_image.dat` directly
+to a temporary file; NAPS CMAC/`obdg`, outer PFS, and SI metadata read that file through
+`ProsperoPs5InnerImageResult.OpenImage`.
 PFSC keeps 128 KiB table entries, but full Kraken groups are encoded as one 256 KiB seeded/seedless
 pair (`C000 -> 4000 -> C000`), matching the requests issued by `ppr_pfs` to the I/O controller.
 The default `fast` read profile physically groups startup and small files in the inner image, leaves

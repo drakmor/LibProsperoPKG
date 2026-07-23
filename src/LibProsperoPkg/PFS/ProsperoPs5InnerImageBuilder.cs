@@ -42,7 +42,7 @@ public sealed class ProsperoPs5InnerImageBuilder
     /// <summary>The per-file Kraken compression block size (256 KiB).</summary>
     public const int CompressBlockSize = 0x40000;
 
-    private static int AlignUp(int v, int a) => (v + a - 1) & ~(a - 1);
+    private static long AlignUp(long v, long a) => (v + a - 1) & ~(a - 1);
 
     /// <summary>
     /// Kraken-compresses a payload into its concatenated on-disk bytes (256 KiB blocks). Returns the raw bytes
@@ -85,23 +85,40 @@ public sealed class ProsperoPs5InnerImageBuilder
     /// </summary>
     public byte[] Build(IReadOnlyList<ProsperoPs5InnerPayload> payloads)
     {
-        // First pass: compress + resolve offsets.
-        var chunks = new List<(int offset, byte[] data)>();
-        int pos = 0;
-        foreach (var p in payloads)
+        using var output = new MemoryStream();
+        Write(output, payloads);
+        return output.ToArray();
+    }
+
+    /// <summary>
+    /// Streaming counterpart of <see cref="Build"/>. Payloads are compressed one at a time and
+    /// written directly to a seekable destination; gaps created by alignment remain zero-filled.
+    /// Returns the exact unpadded image length.
+    /// </summary>
+    public long Write(Stream output, IReadOnlyList<ProsperoPs5InnerPayload> payloads)
+    {
+        ArgumentNullException.ThrowIfNull(output);
+        ArgumentNullException.ThrowIfNull(payloads);
+        if (!output.CanWrite || !output.CanSeek)
+            throw new ArgumentException("Inner-image output must be writable and seekable.", nameof(output));
+
+        output.Position = 0;
+        output.SetLength(0);
+        long pos = 0;
+        foreach (ProsperoPs5InnerPayload payload in payloads)
         {
-            byte[] data = CompressPayload(p.Data, p.StoreRaw);
-            if (p.BlockAligned)
+            ArgumentNullException.ThrowIfNull(payload);
+            byte[] data = CompressPayload(payload.Data, payload.StoreRaw);
+            if (payload.BlockAligned)
                 pos = AlignUp(pos, BlockSize);
-            chunks.Add((pos, data));
-            pos += data.Length;
-            if (p.BlockAlignedAfter)
+            output.Position = pos;
+            output.Write(data);
+            pos = checked(pos + data.LongLength);
+            if (payload.BlockAlignedAfter)
                 pos = AlignUp(pos, BlockSize);
         }
-
-        byte[] img = new byte[pos];
-        foreach (var (offset, data) in chunks)
-            Array.Copy(data, 0, img, offset, data.Length);
-        return img;
+        output.SetLength(pos);
+        output.Position = 0;
+        return pos;
     }
 }

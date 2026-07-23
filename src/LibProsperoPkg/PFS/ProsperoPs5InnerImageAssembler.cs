@@ -14,6 +14,7 @@
 using LibProsperoPkg.PFS.Compression;
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 
 namespace LibProsperoPkg.PFS;
@@ -31,8 +32,27 @@ public sealed class ProsperoPs5InnerFile
 /// <summary>The assembled inner image plus the intermediate model (for verification/diagnostics).</summary>
 public sealed class ProsperoPs5InnerImageResult
 {
-    /// <summary>The on-disk inner <c>pfs_image.dat</c> bytes (data-first, per-file compressed).</summary>
+    /// <summary>
+    /// The on-disk inner <c>pfs_image.dat</c> bytes (data-first, per-file compressed).
+    /// Empty for a result produced by a file-backed assembler overload.
+    /// </summary>
     public required byte[] Image { get; init; }
+
+    /// <summary>Physical image path for a file-backed result; otherwise <see langword="null"/>.</summary>
+    public string? ImagePath { get; init; }
+
+    /// <summary>Exact block-aligned physical <c>pfs_image.dat</c> length.</summary>
+    public required long ImageLength { get; init; }
+
+    /// <summary>Opens the physical image without materializing it when this is a file-backed result.</summary>
+    public Stream OpenImage()
+    {
+        if (ImagePath is not null)
+            return new FileStream(
+                ImagePath, FileMode.Open, FileAccess.Read, FileShare.Read,
+                bufferSize: 1 << 20, FileOptions.RandomAccess);
+        return new MemoryStream(Image, writable: false);
+    }
 
     /// <summary>The uncompressed metadata-region plaintext (the block that is Kraken-compressed into the image tail).</summary>
     public required byte[] MetadataPlaintext { get; init; }
@@ -178,6 +198,17 @@ public sealed class ProsperoPs5InnerImageAssembler
     /// assembler into <c>ProsperoPkgBuilder</c> for the nwonly Kraken format.
     /// </summary>
     public ProsperoPs5InnerImageResult BuildFromFsTree(FSDir uroot)
+        => Build(RenderFsTree(uroot));
+
+    /// <summary>
+    /// File-backed counterpart of <see cref="BuildFromFsTree"/>. The final physical image is written
+    /// directly to <paramref name="outputPath"/> and <see cref="ProsperoPs5InnerImageResult.Image"/>
+    /// is empty; metadata and per-file integrity inputs remain available in the result.
+    /// </summary>
+    public ProsperoPs5InnerImageResult BuildFromFsTreeToFile(FSDir uroot, string outputPath)
+        => BuildToFile(RenderFsTree(uroot), outputPath);
+
+    private static IReadOnlyList<ProsperoPs5InnerFile> RenderFsTree(FSDir uroot)
     {
         ArgumentNullException.ThrowIfNull(uroot);
         var files = new List<ProsperoPs5InnerFile>();
@@ -188,7 +219,7 @@ public sealed class ProsperoPs5InnerImageAssembler
             f.Write(ms);
             files.Add(new ProsperoPs5InnerFile { Path = f.FullPath(), Data = ms.ToArray() });
         }
-        return Build(files);
+        return files;
     }
 
     // A sce_sys file whose sce_sys-relative name is a known outer-CNT entry is carried in the OUTER
@@ -205,6 +236,20 @@ public sealed class ProsperoPs5InnerImageAssembler
 
     /// <summary>Assembles the inner image from the supplied files.</summary>
     public ProsperoPs5InnerImageResult Build(IReadOnlyList<ProsperoPs5InnerFile> files)
+        => BuildCore(files, outputPath: null);
+
+    /// <summary>Assembles the inner image directly into a file without retaining its full bytes.</summary>
+    public ProsperoPs5InnerImageResult BuildToFile(
+        IReadOnlyList<ProsperoPs5InnerFile> files, string outputPath)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(outputPath);
+        string fullPath = Path.GetFullPath(outputPath);
+        Directory.CreateDirectory(Path.GetDirectoryName(fullPath) ?? Directory.GetCurrentDirectory());
+        return BuildCore(files, fullPath);
+    }
+
+    private ProsperoPs5InnerImageResult BuildCore(
+        IReadOnlyList<ProsperoPs5InnerFile> files, string? outputPath)
     {
         ArgumentNullException.ThrowIfNull(files);
         if (files.Count == 0)
@@ -324,7 +369,9 @@ public sealed class ProsperoPs5InnerImageAssembler
             inodeFltInode, aprFltInode, afidTableInode, uroot);
 
         // ---- 7. Assemble the data-first image. ----------------------------------------------------
-        byte[] image = BuildImage(afidOrder, metaPlain, out long blockInfoOnDisk, out long metadataOnDisk,
+        byte[] image = BuildImage(
+            afidOrder, metaPlain, outputPath,
+            out long imageLength, out long blockInfoOnDisk, out long metadataOnDisk,
             out byte[] compressedMeta, out var metaBlocks);
 
         long metaBaseLogical = ndblock * ProsperoPs5InnerImageBuilder.BlockSize - metaPlain.Length;
@@ -344,6 +391,8 @@ public sealed class ProsperoPs5InnerImageAssembler
         return new ProsperoPs5InnerImageResult
         {
             Image = image,
+            ImagePath = outputPath,
+            ImageLength = imageLength,
             MetadataPlaintext = metaPlain,
             Nodes = nodes,
             Ndblock = ndblock,
@@ -717,8 +766,8 @@ public sealed class ProsperoPs5InnerImageAssembler
         return RoundUp(pos, BlockSize) / BlockSize;
     }
 
-    private byte[] BuildImage(List<FileNode> afidOrder, byte[] metaPlain,
-        out long blockInfoOnDisk, out long metadataOnDisk, out byte[] compressedMeta,
+    private byte[] BuildImage(List<FileNode> afidOrder, byte[] metaPlain, string? outputPath,
+        out long imageLength, out long blockInfoOnDisk, out long metadataOnDisk, out byte[] compressedMeta,
         out IReadOnlyList<ProsperoInnerMetaBlockChunk> metaBlocks)
     {
         const int BLK = ProsperoPs5InnerImageBuilder.BlockSize; // 0x10000
@@ -784,11 +833,27 @@ public sealed class ProsperoPs5InnerImageAssembler
             StoreRaw = true,
             BlockAligned = true,
         });
-        byte[] image = new ProsperoPs5InnerImageBuilder().Build(payloads);
-        int alignedLength = checked((int)AlignUp(image.Length, BLK));
-        if (image.Length != alignedLength)
-            Array.Resize(ref image, alignedLength);
-        return image;
+        var builder = new ProsperoPs5InnerImageBuilder();
+        if (outputPath is null)
+        {
+            byte[] image = builder.Build(payloads);
+            int alignedLength = checked((int)AlignUp(image.Length, BLK));
+            if (image.Length != alignedLength)
+                Array.Resize(ref image, alignedLength);
+            imageLength = image.LongLength;
+            return image;
+        }
+
+        using (var output = new FileStream(
+                   outputPath, FileMode.Create, FileAccess.ReadWrite, FileShare.None,
+                   bufferSize: 1 << 20, FileOptions.SequentialScan))
+        {
+            long unpaddedLength = builder.Write(output, payloads);
+            imageLength = AlignUp(unpaddedLength, BLK);
+            output.SetLength(imageLength);
+            output.Flush(flushToDisk: true);
+        }
+        return [];
     }
 
     /// <summary>

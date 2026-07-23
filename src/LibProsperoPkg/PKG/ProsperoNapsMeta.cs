@@ -72,6 +72,12 @@ public sealed class ProsperoNapsIntegrityContext
     /// <summary>Physical packed <c>pfs_image.dat</c>, or an empty memory for a legacy identity map.</summary>
     public required ReadOnlyMemory<byte> PhysicalInnerImage { get; init; }
 
+    /// <summary>
+    /// Physical packed-image path for a file-backed build. Providers should prefer this when
+    /// <see cref="PhysicalInnerImage"/> is empty.
+    /// </summary>
+    public string? PhysicalInnerImagePath { get; init; }
+
     /// <summary>Mapping blocks in the exact order used by <c>i2ob/i2op/ihsh/rhsh</c>.</summary>
     public required IReadOnlyList<ProsperoNapsIntegrityBlock> MappingBlocks { get; init; }
 
@@ -469,13 +475,19 @@ public static class ProsperoNapsMeta
         // obdg: one SHA3-256 digest per physical block of pfs_image.dat.
         {
             var body = new byte[checked((int)innerBlocks * 32)];
-            ReadOnlySpan<byte> image = inner?.Image ?? ReadOnlySpan<byte>.Empty;
+            using Stream? image = inner?.OpenImage();
+            byte[] block = new byte[Meta18BlockSize];
             for (int i = 0; i < innerBlocks; i++)
             {
-                ReadOnlySpan<byte> block = image.Length >= (i + 1) * Meta18BlockSize
-                    ? image.Slice(i * Meta18BlockSize, Meta18BlockSize)
-                    : ReadOnlySpan<byte>.Empty;
-                ProsperoImageDigests.Sha3_256(block).CopyTo(body, i * 32);
+                ReadOnlySpan<byte> input = ReadOnlySpan<byte>.Empty;
+                if (image is not null &&
+                    image.Length >= checked((long)(i + 1) * Meta18BlockSize))
+                {
+                    image.Position = (long)i * Meta18BlockSize;
+                    image.ReadExactly(block);
+                    input = block;
+                }
+                ProsperoImageDigests.Sha3_256(input).CopyTo(body, i * 32);
             }
             WriteRecord(plain, "obdg", 1, body);
         }
@@ -777,15 +789,6 @@ public static class ProsperoNapsMeta
     // size. SHA3-256 over it yields the hole digest for that plaintext size.
     private static byte[] InnerHoleDigestPreimage(uint plaintextSize) => new byte[plaintextSize];
 
-    // Bounds-safe slice of a real block's compressed bytes from the inner image (for the ihsh digest).
-    private static ReadOnlySpan<byte> InnerBlockBytes(byte[] image, long offset, int length)
-    {
-        if (image is null || offset < 0 || length <= 0 || offset >= image.Length)
-            return ReadOnlySpan<byte>.Empty;
-        int avail = (int)Math.Min((long)length, image.Length - offset);
-        return image.AsSpan((int)offset, avail);
-    }
-
     private static ProsperoNapsIntegrityContext BuildIntegrityContext(
         ulong innerImageSize,
         byte[] mountImage,
@@ -840,6 +843,7 @@ public static class ProsperoNapsMeta
             InnerImageSize = innerImageSize,
             MountImage = mountImage,
             PhysicalInnerImage = inner?.Image ?? ReadOnlyMemory<byte>.Empty,
+            PhysicalInnerImagePath = inner?.ImagePath,
             MappingBlocks = mapped,
         };
     }
