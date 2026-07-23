@@ -189,6 +189,14 @@ public sealed class ProsperoBuildOptions
     /// when omitted, the embedded research profile is used and remains suitable only for self-tests.
     /// </summary>
     public IProsperoMetadataSigner? MetadataSigner { get; set; }
+
+    /// <summary>
+    /// Refuses to build unless every caller-supplied input required by the external Publishing
+    /// Tools acceptance path is present. This checks availability, not whether a supplied signer
+    /// or keyed provider belongs to a particular SDK trust domain; final acceptance is still
+    /// established by <c>img_info</c>/<c>img_verify</c>.
+    /// </summary>
+    public bool RequirePublisherCompatibility { get; set; }
 }
 
 /// <summary>The result of a build: the output path plus any non-fatal warnings.</summary>
@@ -460,9 +468,26 @@ public static class ProsperoPackageBuilder
 
         bool usesNaps = options.UsePublisherPprNaps &&
                         options.Mode != ProsperoPackageMode.AdditionalContentNoData;
+        if (options.RequirePublisherCompatibility)
+        {
+            var missing = new List<string>();
+            if (metadataSigner is null)
+                missing.Add("a caller-supplied trusted RSA-3072 metadata signer");
+            if (usesNaps && napsCmacKey is null)
+                missing.Add("the 16-byte publisher NAPS outer-block CMAC key");
+            if (usesNaps &&
+                options.NapsMeta18 is null &&
+                options.NapsIntegrityProvider is null)
+            {
+                missing.Add("a publisher naps_meta_18 blob or NAPS obcc integrity provider");
+            }
+            if (missing.Count != 0)
+                throw new InvalidOperationException(
+                    "Strict publisher compatibility requires " + string.Join(", ", missing) + ".");
+        }
         if (usesNaps && napsCmacKey is null)
             warnings.Add("NAPS outer-block CMAC key was not supplied; its eight-byte integrity tags are zero.");
-        if (usesNaps && metadataSigner is null)
+        if (metadataSigner is null)
             warnings.Add(
                 "Publisher metadata signer was not supplied; the embedded research RSA-3072 profile is not trusted by current prospero-pub-cmd builds.");
         if (usesNaps &&

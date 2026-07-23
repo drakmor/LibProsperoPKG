@@ -27,7 +27,10 @@ if ([IO.File]::Exists($layout)) {
     if ($LASTEXITCODE -ne 0) { throw "NAPS round-trip failed: $LASTEXITCODE" }
 }
 
+& $PublishingTools img_info $packagePath
+if ($LASTEXITCODE -ne 0) { throw "Publishing Tools format inspection failed: $LASTEXITCODE" }
+
 & $PublishingTools img_verify --passcode $Passcode --format_check on --integrity_check on --no_progress_bar $packagePath
-if ($LASTEXITCODE -ne 0) { throw "Publishing Tools/ric verification failed: $LASTEXITCODE" }
+if ($LASTEXITCODE -ne 0) { throw "Publishing Tools verification failed: $LASTEXITCODE" }
 
 Write-Output "Publisher compatibility passed. Artifacts: $work"

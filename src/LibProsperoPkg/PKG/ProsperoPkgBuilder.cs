@@ -1110,7 +1110,8 @@ public static class ProsperoPkgBuilder
             pkg.Entries.Insert(1, pkg.ImageKey);
 
         // sce_sys media entries (icon0.png, pic0.png, pic1.png, snd0.at9, ...) present in the folder.
-        foreach (var media in CollectMediaEntries(sourceFolder, generateDds: !noData))
+        foreach (var media in CollectMediaEntries(
+                     sourceFolder, props.VolumeType, props.ContentId, generateDds: !noData))
             if (!pkg.Entries.Any(existing => (uint)existing.Id == (uint)media.Id))
                 pkg.Entries.Add(media);
 
@@ -1899,7 +1900,47 @@ public static class ProsperoPkgBuilder
             if (!result.TryAdd(relative, candidate))
                 throw new InvalidDataException($"GP5 contains duplicate destination '{normalized}'.");
         }
+
+        // Publishing Tools obtain AC/AL licenses from their backend rather than ordinary GP5 file
+        // mappings. For an offline rebuild the caller supplies already-issued plaintext sidecars
+        // beside the project; include them even though the GP5 remains authoritative for payload.
+        string looseSceSys = Path.Combine(sourceFolder, "sce_sys");
+        foreach (string sidecar in new[] { "license.dat", "license.info" })
+        {
+            string candidate = Path.Combine(looseSceSys, sidecar);
+            if (!result.ContainsKey(sidecar) && File.Exists(candidate))
+                result.Add(sidecar, Path.GetFullPath(candidate));
+        }
         return result;
+    }
+
+    private static byte[]? ResolveGp5EntitlementKey(string sourceFolder)
+    {
+        string? project = Directory.EnumerateFiles(sourceFolder, "*.gp5", SearchOption.TopDirectoryOnly)
+            .OrderBy(path => Path.GetFileName(path), StringComparer.OrdinalIgnoreCase)
+            .FirstOrDefault();
+        if (project is null)
+            return null;
+
+        XDocument document = XDocument.Load(project, LoadOptions.None);
+        string? value = (string?)document.Descendants("package").FirstOrDefault()?
+            .Attribute("entitlement_key");
+        if (string.IsNullOrWhiteSpace(value))
+            return null;
+        byte[] key;
+        try
+        {
+            key = Convert.FromHexString(value);
+        }
+        catch (FormatException ex)
+        {
+            throw new InvalidDataException(
+                "GP5 package entitlement_key must contain hexadecimal bytes.", ex);
+        }
+        if (key.Length != 16)
+            throw new InvalidDataException(
+                $"GP5 package entitlement_key must be 16 bytes (got {key.Length}).");
+        return key;
     }
 
     private static byte[] DeriveDeterministicOuterSeed(string contentId, string passcode)
@@ -1938,9 +1979,25 @@ public static class ProsperoPkgBuilder
     // which is regenerated when absent.
     private static readonly HashSet<uint> GeneratedEntryIds = [0x1000];
 
-    private static IEnumerable<Entry> CollectMediaEntries(string sourceFolder, bool generateDds = true)
+    private static IEnumerable<Entry> CollectMediaEntries(
+        string sourceFolder, ProsperoVolumeType volumeType, string contentId,
+        bool generateDds = true)
     {
         IReadOnlyDictionary<string, string> sceSysFiles = ResolveSceSysFiles(sourceFolder);
+        byte[]? entitlementKey = IsAdditionalContent(volumeType)
+            ? ResolveGp5EntitlementKey(sourceFolder)
+            : null;
+        if (IsAdditionalContent(volumeType))
+        {
+            foreach (string required in new[] { "license.dat", "license.info" })
+            {
+                if (!sceSysFiles.ContainsKey(required))
+                    throw new FileNotFoundException(
+                        $"{volumeType} requires an existing backend-issued sce_sys/{required}. " +
+                        "Place the decrypted sidecar beside the GP5/source tree; LibProsperoPkg " +
+                        "can validate and re-encrypt it but cannot issue a new backend license.");
+            }
+        }
         var emitted = new HashSet<uint>();
 
         foreach (var (name, id) in MediaFiles)
@@ -1991,7 +2048,16 @@ public static class ProsperoPkgBuilder
             if (GeneratedEntryIds.Contains(idv)) continue;
             if (!emitted.Add(idv)) continue; // already emitted above
             var data = File.ReadAllBytes(file);
-            if (!ProsperoSystemFiles.Validate(rel, data, out var error))
+            string? error;
+            bool valid = rel switch
+            {
+                "license.dat" => ProsperoSystemFiles.ValidateLicenseDat(
+                    data, contentId, out error),
+                "license.info" => ProsperoSystemFiles.ValidateLicenseInfo(
+                    data, contentId, entitlementKey, out error),
+                _ => ProsperoSystemFiles.Validate(rel, data, out error),
+            };
+            if (!valid)
                 throw new InvalidDataException($"sce_sys/{rel}: {error}");
             // Publisher AC license records are identified exclusively by id. Reference packages
             // keep NameTableOffset at zero for 0x0400/0x0401; adding their friendly names grows

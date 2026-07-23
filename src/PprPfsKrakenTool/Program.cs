@@ -227,9 +227,9 @@ internal static class Program
 
     private static int BuildPackage(string[] args)
     {
-        if (args.Length is < 5 or > 11)
+        if (args.Length is < 5 or > 12)
             throw new ArgumentException(
-                "build-pkg requires <source-dir> <output-dir> <content-id> <app|ac|al> [passcode] [naps-cmac-key-hex|-] [naps-meta-18-file|-] [metadata-private-key.pem|-] [outer-pfs-seed-hex|-] [deterministic].");
+                "build-pkg requires <source-dir> <output-dir> <content-id> <app|ac|al> [passcode] [naps-cmac-key-hex|-] [naps-meta-18-file|-] [metadata-private-key.pem|-] [outer-pfs-seed-hex|-] [deterministic] [strict].");
         ProsperoPackageMode mode = args[4].ToLowerInvariant() switch
         {
             "app" => ProsperoPackageMode.Application,
@@ -245,10 +245,15 @@ internal static class Program
         byte[]? outerPfsSeed = args.Length >= 10 && args[9] != "-"
             ? Convert.FromHexString(args[9])
             : null;
-        bool deterministic = args.Length == 11 &&
-            string.Equals(args[10], "deterministic", StringComparison.OrdinalIgnoreCase);
-        if (args.Length == 11 && !deterministic)
-            throw new ArgumentException("The final build-pkg argument must be 'deterministic'.");
+        string[] modes = args.Skip(10).Select(value => value.ToLowerInvariant()).ToArray();
+        if (modes.Any(value => value is not ("deterministic" or "strict")) ||
+            modes.Distinct(StringComparer.Ordinal).Count() != modes.Length)
+        {
+            throw new ArgumentException(
+                "Trailing build-pkg modes may contain 'deterministic' and/or 'strict' once each.");
+        }
+        bool deterministic = modes.Contains("deterministic", StringComparer.Ordinal);
+        bool strict = modes.Contains("strict", StringComparer.Ordinal);
         if (outerPfsSeed is { Length: not 16 })
             throw new ArgumentException("Outer PFS seed must decode to exactly 16 bytes.");
         var result = ProsperoPackageBuilder.Build(
@@ -266,6 +271,7 @@ internal static class Program
                 MetadataSigner = metadataSigner,
                 OuterPfsSeed = outerPfsSeed,
                 DeterministicBuild = deterministic,
+                RequirePublisherCompatibility = strict,
             },
             Console.WriteLine);
         Console.WriteLine(result.OutputPath);
@@ -1002,6 +1008,29 @@ internal static class Program
                 },
                 _ => { });
 
+            try
+            {
+                ProsperoPackageBuilder.Build(
+                    new ProsperoBuildOptions
+                    {
+                        SourceFolder = source1,
+                        OutputFolder = Path.Combine(regressionRoot, "strict-output"),
+                        ContentId = deterministicContentId,
+                        TitleId = "PPSA00000",
+                        Mode = ProsperoPackageMode.Application,
+                        Passcode = deterministicPasscode,
+                        RequirePublisherCompatibility = true,
+                    },
+                    _ => { });
+                throw new InvalidDataException(
+                    "Strict publisher mode accepted a build without external signer/integrity inputs.");
+            }
+            catch (InvalidOperationException ex) when (
+                ex.Message.StartsWith("Strict publisher compatibility requires", StringComparison.Ordinal))
+            {
+                // Expected: strict mode must stop before emitting a package.
+            }
+
             string artifactOutput = Path.Combine(regressionRoot, "publisher-artifacts");
             ProsperoPublisherPprFileBuildResult artifacts =
                 ProsperoPublisherPprBuilder.BuildFileBacked(
@@ -1077,6 +1106,80 @@ internal static class Program
                 throw new InvalidDataException(
                     "File-backed APP/PPR-NAPS extraction did not reproduce the source tree cleanly.");
             }
+
+            // A GP5 is authoritative for ordinary payload, but publisher AC/AL licenses are issued
+            // out-of-band. Verify that decrypted license sidecars beside an otherwise explicit GP5
+            // are validated, content-id matched and emitted as protected CNT ids 0x400/0x401.
+            const string acContentId = "IV9999-PPSA00001_00-ACSIDECARTEST000";
+            string acSource = Path.Combine(regressionRoot, "ac-sidecar-source");
+            string acOutput = Path.Combine(regressionRoot, "ac-sidecar-output");
+            Directory.CreateDirectory(Path.Combine(acSource, "sce_sys"));
+            Directory.CreateDirectory(Path.Combine(acSource, "data"));
+            File.WriteAllText(
+                Path.Combine(acSource, "project.gp5"),
+                $$"""
+                <?xml version="1.0" encoding="utf-8"?>
+                <psproject fmt="gp5" version="1000">
+                  <volume>
+                    <volume_type>prospero_ac</volume_type>
+                    <package passcode="{{deterministicPasscode}}"
+                             entitlement_key="00112233445566778899AABBCCDDEEFF"/>
+                  </volume>
+                  <files>
+                    <file dst_path="sce_sys/param.json" src_path="sce_sys\param.json"/>
+                    <file dst_path="data/payload.bin" src_path="data\payload.bin"/>
+                  </files>
+                </psproject>
+                """,
+                new UTF8Encoding(false));
+            File.WriteAllText(
+                Path.Combine(acSource, "sce_sys", "param.json"),
+                "{\"conceptId\":\"10000001\",\"contentId\":\"" + acContentId +
+                "\",\"contentVersion\":\"01.000.000\",\"localizedParameters\":" +
+                "{\"defaultLanguage\":\"en-US\",\"en-US\":{\"titleName\":\"AC sidecar test\"}}," +
+                "\"masterVersion\":\"01.00\",\"requiredSystemSoftwareVersion\":" +
+                "\"0x0100000000000000\",\"titleId\":\"PPSA00001\",\"versionFileUri\":\"\"}",
+                new UTF8Encoding(false));
+            File.WriteAllBytes(Path.Combine(acSource, "data", "payload.bin"), [1, 2, 3, 4]);
+            byte[] acContentIdBytes = Encoding.ASCII.GetBytes(acContentId);
+            var licenseDat = new byte[ProsperoSystemFiles.LicenseDatSize];
+            "RIF\0"u8.CopyTo(licenseDat);
+            acContentIdBytes.CopyTo(licenseDat, 0x20);
+            var licenseInfo = new byte[ProsperoSystemFiles.LicenseInfoSize];
+            acContentIdBytes.CopyTo(licenseInfo, 0);
+            Convert.FromHexString("00112233445566778899AABBCCDDEEFF")
+                .CopyTo(licenseInfo, 0x30);
+            File.WriteAllBytes(Path.Combine(acSource, "sce_sys", "license.dat"), licenseDat);
+            File.WriteAllBytes(Path.Combine(acSource, "sce_sys", "license.info"), licenseInfo);
+
+            ProsperoBuildResult acBuild = ProsperoPackageBuilder.Build(
+                new ProsperoBuildOptions
+                {
+                    SourceFolder = acSource,
+                    OutputFolder = acOutput,
+                    ContentId = acContentId,
+                    TitleId = "PPSA00001",
+                    Mode = ProsperoPackageMode.AdditionalContentData,
+                    Passcode = deterministicPasscode,
+                    UsePublisherPprNaps = true,
+                    DeterministicBuild = true,
+                });
+            ProsperoPkg parsedAc = ProsperoPkgReader.Read(acBuild.OutputPath);
+            ProsperoPkgEntry? licenseDatEntry =
+                parsedAc.Entries.SingleOrDefault(entry => entry.RawId == 0x0400);
+            ProsperoPkgEntry? licenseInfoEntry =
+                parsedAc.Entries.SingleOrDefault(entry => entry.RawId == 0x0401);
+            if (licenseDatEntry is null || licenseInfoEntry is null ||
+                licenseDatEntry.DataSize != ProsperoSystemFiles.LicenseDatSize ||
+                licenseInfoEntry.DataSize != ProsperoSystemFiles.LicenseInfoSize ||
+                licenseDatEntry.Flags1 != 0x80000000 || licenseDatEntry.Flags2 != 0x00003000 ||
+                licenseInfoEntry.Flags1 != 0x80000000 || licenseInfoEntry.Flags2 != 0x00004000)
+            {
+                throw new InvalidDataException(
+                    "GP5 AC license sidecars were not emitted with publisher CNT ids/flags.");
+            }
+            Console.WriteLine("selftest: GP5 AC license sidecar validation and CNT encryption passed");
+
             Console.WriteLine(
                 "selftest: deterministic APP/PPR-NAPS build + file-backed extraction passed " +
                 $"(SHA3-256 {Convert.ToHexString(ProsperoSha3.HashData(package1))})");
@@ -2174,7 +2277,7 @@ internal static class Program
         Console.WriteLine("        [--exclude \"sce_sys/**;movies/*.mp4\"] [--only-if-smaller false]");
         Console.WriteLine("        [--classic true]   (alias for --layout classic)");
         Console.WriteLine("  build-publisher-artifacts <source-folder> <output-dir> <content-id> <passcode> [cmac-key-hex]");
-        Console.WriteLine("  build-pkg <source-dir> <output-dir> <content-id> <app|ac|al> [passcode] [naps-cmac-key-hex|-] [naps-meta-18-file|-] [metadata-private-key.pem|-] [outer-pfs-seed-hex|-] [deterministic]");
+        Console.WriteLine("  build-pkg <source-dir> <output-dir> <content-id> <app|ac|al> [passcode] [naps-cmac-key-hex|-] [naps-meta-18-file|-] [metadata-private-key.pem|-] [outer-pfs-seed-hex|-] [deterministic] [strict]");
         Console.WriteLine("  pack  <input-file> <output.pfsc> [--compression zlib|kraken|none] [--level N]");
         Console.WriteLine("        [--min-savings-percent 0]");
         Console.WriteLine("  unpack <input-or-image> <output-file> [--offset 0x0]");

@@ -9,6 +9,7 @@
 #nullable enable
 using System;
 using System.Buffers.Binary;
+using System.Linq;
 using System.Text;
 
 namespace LibProsperoPkg.PKG;
@@ -29,8 +30,17 @@ public static class ProsperoSystemFiles
     /// <summary>Fixed size of a <c>nptitle.dat</c> file, in bytes.</summary>
     public const int NptitleSize = 160;
 
+    /// <summary>Fixed publisher size of an AC/AL <c>license.dat</c> record.</summary>
+    public const int LicenseDatSize = 0x400;
+
+    /// <summary>Fixed publisher size of an AC/AL <c>license.info</c> record.</summary>
+    public const int LicenseInfoSize = 0x200;
+
     // "NPTD" title-descriptor magic at offset 0x00 of nptitle.dat.
     private static ReadOnlySpan<byte> NptitleMagic => "NPTD"u8;
+
+    // "RIF\0" at offset 0 of the decrypted publisher license.dat.
+    private static ReadOnlySpan<byte> RifMagic => "RIF\0"u8;
 
     // TLV tag that carries the network-platform communication id inside npbind.dat.
     private const ushort NpbindCommIdTag = 0x0010;
@@ -93,18 +103,69 @@ public static class ProsperoSystemFiles
     }
 
     /// <summary>
-    /// Validates a <c>license.dat</c> blob. The license container is backend-signed and
-    /// content-key material; validation confirms only that a non-empty blob is present.
+    /// Validates the fixed publisher framing of a decrypted <c>license.dat</c> blob.
+    /// The backend signature itself remains opaque.
     /// </summary>
     public static bool ValidateLicenseDat(ReadOnlySpan<byte> data, out string? error) =>
-        RequireNonEmpty(data, "license.dat", out error);
+        ValidateLicenseDat(data, expectedContentId: null, out error);
 
     /// <summary>
-    /// Validates a <c>license.info</c> blob. Like <c>license.dat</c>, it is backend-signed;
-    /// validation confirms only that a non-empty blob is present.
+    /// Validates a decrypted <c>license.dat</c> and, when supplied, its embedded content id.
+    /// </summary>
+    public static bool ValidateLicenseDat(
+        ReadOnlySpan<byte> data, string? expectedContentId, out string? error)
+    {
+        if (data.Length != LicenseDatSize)
+        {
+            error = $"license.dat must be {LicenseDatSize} bytes (got {data.Length}).";
+            return false;
+        }
+        if (!data[..RifMagic.Length].SequenceEqual(RifMagic))
+        {
+            error = "license.dat has a bad RIF magic.";
+            return false;
+        }
+        return ValidateEmbeddedContentId(
+            data, offset: 0x20, "license.dat", expectedContentId, out error);
+    }
+
+    /// <summary>
+    /// Validates the fixed publisher framing of a decrypted <c>license.info</c> blob.
     /// </summary>
     public static bool ValidateLicenseInfo(ReadOnlySpan<byte> data, out string? error) =>
-        RequireNonEmpty(data, "license.info", out error);
+        ValidateLicenseInfo(data, expectedContentId: null, out error);
+
+    /// <summary>
+    /// Validates a decrypted <c>license.info</c> and, when supplied, its leading content id.
+    /// </summary>
+    public static bool ValidateLicenseInfo(
+        ReadOnlySpan<byte> data, string? expectedContentId, out string? error)
+        => ValidateLicenseInfo(data, expectedContentId, expectedEntitlementKey: default, out error);
+
+    /// <summary>
+    /// Validates a decrypted <c>license.info</c>, its content id and optional 16-byte
+    /// GP5 entitlement key.
+    /// </summary>
+    public static bool ValidateLicenseInfo(
+        ReadOnlySpan<byte> data, string? expectedContentId,
+        ReadOnlySpan<byte> expectedEntitlementKey, out string? error)
+    {
+        if (data.Length != LicenseInfoSize)
+        {
+            error = $"license.info must be {LicenseInfoSize} bytes (got {data.Length}).";
+            return false;
+        }
+        if (!ValidateEmbeddedContentId(
+                data, offset: 0, "license.info", expectedContentId, out error))
+            return false;
+        if (!expectedEntitlementKey.IsEmpty &&
+            !data.Slice(0x30, 16).SequenceEqual(expectedEntitlementKey))
+        {
+            error = "license.info entitlement key does not match the GP5 package entitlement_key.";
+            return false;
+        }
+        return true;
+    }
 
     /// <summary>
     /// Runs the checker that matches an sce_sys-relative file name, if one exists. File names with no
@@ -131,9 +192,24 @@ public static class ProsperoSystemFiles
         }
     }
 
-    private static bool RequireNonEmpty(ReadOnlySpan<byte> data, string name, out string? error)
+    private static bool ValidateEmbeddedContentId(
+        ReadOnlySpan<byte> data, int offset, string name,
+        string? expectedContentId, out string? error)
     {
-        if (data.Length == 0) { error = $"{name} is empty."; return false; }
+        const int ContentIdSize = 36;
+        string actual = Encoding.ASCII.GetString(data.Slice(offset, ContentIdSize));
+        if (actual.Any(c => c is < ' ' or > '~'))
+        {
+            error = $"{name} contains a non-ASCII content id.";
+            return false;
+        }
+        if (expectedContentId is not null &&
+            !string.Equals(actual, expectedContentId, StringComparison.Ordinal))
+        {
+            error = $"{name} content id '{actual}' does not match package content id " +
+                $"'{expectedContentId}'.";
+            return false;
+        }
         error = null;
         return true;
     }
