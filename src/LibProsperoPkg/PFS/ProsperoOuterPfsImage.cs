@@ -21,6 +21,7 @@
 #nullable enable
 using LibProsperoPkg.Util;
 using System;
+using System.IO;
 
 namespace LibProsperoPkg.PFS;
 
@@ -93,7 +94,7 @@ public static class ProsperoOuterPfsImage
         if (blockSize <= 0 || (blockSize & 15) != 0)
             throw new ArgumentOutOfRangeException(nameof(blockSize), "Block size must be a positive multiple of 16.");
 
-        var xts = new XtsBlockTransform(dataKey.ToArray(), tweakKey.ToArray());
+        using var xts = new XtsBlockTransform(dataKey.ToArray(), tweakKey.ToArray());
         int total = (image.Length + blockSize - 1) / blockSize;
         int transformed = 0;
 
@@ -144,7 +145,7 @@ public static class ProsperoOuterPfsImage
             throw new ArgumentException(
                 $"blockKinds length ({blockKinds.Length}) must equal the block count ({total}).", nameof(blockKinds));
 
-        var xts = new XtsBlockTransform(dataKey.ToArray(), tweakKey.ToArray());
+        using var xts = new XtsBlockTransform(dataKey.ToArray(), tweakKey.ToArray());
         int transformed = 0;
 
         for (int i = 0; i < total; i++)
@@ -170,6 +171,77 @@ public static class ProsperoOuterPfsImage
 
         return transformed;
     }
+
+    /// <summary>
+    /// Streaming equivalent of the explicit-kind transform. Exactly <paramref name="length"/> bytes
+    /// are consumed from the current input position and written at the current output position.
+    /// Memory use is bounded by one outer-PFS block, so finalized images larger than 2 GiB do not
+    /// need to be materialized in a single managed array.
+    /// </summary>
+    public static int Transform(
+        Stream input, Stream output, long length,
+        ReadOnlySpan<byte> tweakKey, ReadOnlySpan<byte> dataKey,
+        int blockSize, ReadOnlySpan<ProsperoOuterBlockKind> blockKinds, bool encrypt)
+    {
+        ArgumentNullException.ThrowIfNull(input);
+        ArgumentNullException.ThrowIfNull(output);
+        if (!input.CanRead)
+            throw new ArgumentException("Input stream must be readable.", nameof(input));
+        if (!output.CanWrite)
+            throw new ArgumentException("Output stream must be writable.", nameof(output));
+        if (ReferenceEquals(input, output))
+            throw new ArgumentException("Streaming outer-PFS transform requires distinct input and output streams.");
+        if (length < 0)
+            throw new ArgumentOutOfRangeException(nameof(length));
+        if (tweakKey.Length != 16)
+            throw new ArgumentException($"Tweak key must be 16 bytes (was {tweakKey.Length}).", nameof(tweakKey));
+        if (dataKey.Length != 16)
+            throw new ArgumentException($"Data key must be 16 bytes (was {dataKey.Length}).", nameof(dataKey));
+        if (blockSize <= 0 || (blockSize & 15) != 0)
+            throw new ArgumentOutOfRangeException(nameof(blockSize), "Block size must be a positive multiple of 16.");
+        if ((length & 15) != 0)
+            throw new ArgumentException("Outer-PFS length must be a multiple of the AES block size.", nameof(length));
+
+        long blockCount64 = checked((length + blockSize - 1) / blockSize);
+        if (blockCount64 > int.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(length), "Outer-PFS block count exceeds Int32.");
+        int blockCount = (int)blockCount64;
+        if (blockKinds.Length != blockCount)
+            throw new ArgumentException(
+                $"blockKinds length ({blockKinds.Length}) must equal the block count ({blockCount}).",
+                nameof(blockKinds));
+
+        using var xts = new XtsBlockTransform(dataKey.ToArray(), tweakKey.ToArray());
+        byte[] block = new byte[blockSize];
+        int transformed = 0;
+        long remaining = length;
+        for (int index = 0; index < blockCount; index++)
+        {
+            int count = checked((int)Math.Min(blockSize, remaining));
+            input.ReadExactly(block, 0, count);
+            ProsperoOuterBlockKind kind = blockKinds[index];
+            if (kind != ProsperoOuterBlockKind.Plaintext)
+            {
+                ulong sector = ProsperoOuterPfsSignature.BlockSector(
+                    index, kind == ProsperoOuterBlockKind.Signed);
+                if (count == block.Length)
+                {
+                    xts.CryptSector(block, sector, encrypt);
+                }
+                else
+                {
+                    byte[] tail = block.AsSpan(0, count).ToArray();
+                    xts.CryptSector(tail, sector, encrypt);
+                    tail.CopyTo(block, 0);
+                }
+                transformed++;
+            }
+            output.Write(block, 0, count);
+            remaining -= count;
+        }
+        return transformed;
+    }
+
     public static int EncryptInPlace(
         Span<byte> image, byte[] ekpfs, byte[] seed, int plaintextBlockIndex,
         int blockSize = DefaultBlockSize)

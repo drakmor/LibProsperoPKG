@@ -212,12 +212,18 @@ public static class ProsperoFself
             throw new ArgumentException("Only 64-bit ELF modules are supported.", nameof(elf));
 
         ushort eType = BinaryPrimitives.ReadUInt16LittleEndian(elf.AsSpan(0x10));
-        int phoff = (int)BinaryPrimitives.ReadUInt64LittleEndian(elf.AsSpan(0x20));
+        ulong phoffValue = BinaryPrimitives.ReadUInt64LittleEndian(elf.AsSpan(0x20));
+        if (phoffValue != ElfHeaderSize)
+            throw new ArgumentException(
+                $"The ELF program-header table must follow the ELF header at 0x{ElfHeaderSize:X} " +
+                $"(e_phoff is 0x{phoffValue:X}).",
+                nameof(elf));
+        int phoff = ElfHeaderSize;
         int phentSize = BinaryPrimitives.ReadUInt16LittleEndian(elf.AsSpan(0x36));
         int phnum = BinaryPrimitives.ReadUInt16LittleEndian(elf.AsSpan(0x38));
         if (phentSize != ElfPhdrSize)
             throw new ArgumentException($"Unexpected ELF program-header size {phentSize}.", nameof(elf));
-        if (phoff + phnum * ElfPhdrSize > elf.Length)
+        if ((long)phoff + (long)phnum * ElfPhdrSize > elf.Length)
             throw new ArgumentException("ELF program headers overrun the file.", nameof(elf));
 
         var selected = SelectSegments(elf, phoff, phnum);
@@ -231,6 +237,14 @@ public static class ProsperoFself
         int headerSize = extInfoStart + ExtInfoSize + ControlRegionSize;
         int metaSize = MetaFooterBase + (segCount + 4) * 0x40;
         int dataStart = headerSize + metaSize;
+
+        // Both fields are serialized as u16 in the SCE header. Refuse an
+        // unrepresentable module instead of silently truncating the layout.
+        if (headerSize > ushort.MaxValue || metaSize > ushort.MaxValue)
+            throw new ArgumentException(
+                $"The ELF has too many segments to fake-sign (header 0x{headerSize:X}, " +
+                $"meta 0x{metaSize:X} exceed the 16-bit SCE fields).",
+                nameof(elf));
 
         // Assign segment file offsets: a 0x20 digest segment then the data (padded to 16) per pair.
         var segOffsets = new int[segCount];

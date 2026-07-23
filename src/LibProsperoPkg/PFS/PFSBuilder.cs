@@ -406,7 +406,7 @@ public class PfsBuilder
                       return localData;
                   },
                   // Finalizer
-                  local => { });
+                  local => local.Item1.Dispose());
             }
         }
     }
@@ -466,7 +466,7 @@ public class PfsBuilder
         {
             Log("Encrypting...");
             var (tweakKey, dataKey) = Crypto.PfsGenEncKey(properties.EKPFS, hdr.Seed);
-            var transformer = new XtsBlockTransform(dataKey, tweakKey);
+            using var transformer = new XtsBlockTransform(dataKey, tweakKey);
             byte[] sectorBuffer = new byte[xtsSectorSize];
             foreach (var xtsSector in XtsSectorGen())
             {
@@ -553,10 +553,17 @@ public class PfsBuilder
     }
 
     ///<summary>
-    ///Given an inode number and an index into the db[] array, returns the absolute offset of that array value
+    ///Given an inode number and an index into the db[] array, returns the absolute offset of that array value.
+    ///The inode table has tail padding in every filesystem block, so the inode's block boundary
+    ///must be applied rather than treating all inode records as one contiguous run.
     ///</summary>
     long inoNumberToOffset(uint number, int db = 0)
-      => hdr.BlockSize + (DinodeS32.SizeOf * number) + 0x64 + (36 * db);
+    {
+        long inodesPerBlock = hdr.BlockSize / DinodeS32.SizeOf;
+        long block = 1 + number / inodesPerBlock;
+        long withinBlock = (number % inodesPerBlock) * DinodeS32.SizeOf;
+        return block * hdr.BlockSize + withinBlock + 0x64 + 36L * db;
+    }
 
     /// <summary>
     /// Sets the data blocks. Also updates header for total number of data blocks.

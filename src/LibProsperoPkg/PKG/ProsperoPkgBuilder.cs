@@ -1067,7 +1067,8 @@ public static class ProsperoPkgBuilder
 
         // sce_sys media entries (icon0.png, pic0.png, pic1.png, snd0.at9, ...) present in the folder.
         foreach (var media in CollectMediaEntries(sourceFolder, generateDds: !noData))
-            pkg.Entries.Add(media);
+            if (!pkg.Entries.Any(existing => (uint)existing.Id == (uint)media.Id))
+                pkg.Entries.Add(media);
 
         // PS5 image-digest + PlayGo descriptor CNT entries. Reference package layout shows
         // these are OUTER CNT entries — imagedigs.dat

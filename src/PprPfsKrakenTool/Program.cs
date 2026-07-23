@@ -1,4 +1,5 @@
 using LibProsperoPkg;
+using LibProsperoPkg.Content;
 using LibProsperoPkg.GP5;
 using LibProsperoPkg.PFS;
 using LibProsperoPkg.PFS.Compression;
@@ -67,6 +68,7 @@ internal static class Program
                 "inspect-pkg" => InspectPackage(args),
                 "extract-pkg-outer" => ExtractPackageOuter(args),
                 "dump-pkg-outer" => DumpPackageOuter(args),
+                "dump-pkg-inner" => DumpPackageInner(args),
                 "check-pkg-fih" => CheckPackageFih(args),
                 "check-pkg-imagedigs" => CheckPackageImageDigests(args),
                 "check-pkg-signature" => CheckPackageSignature(args),
@@ -418,7 +420,17 @@ internal static class Program
         if (args.Length is < 3 or > 4)
             throw new ArgumentException("Usage: dump-pkg-outer <package.pkg> <output.pfs> [passcode]");
         string passcode = args.Length == 4 ? args[3] : new string('0', 32);
-        File.WriteAllBytes(args[2], ProsperoPackageArchive.DecryptOuterPfs(args[1], passcode));
+        ProsperoPackageArchive.DecryptOuterPfs(args[1], args[2], passcode);
+        Console.WriteLine(args[2]);
+        return 0;
+    }
+
+    private static int DumpPackageInner(string[] args)
+    {
+        if (args.Length is < 3 or > 4)
+            throw new ArgumentException("Usage: dump-pkg-inner <package.pkg> <output.pfs> [passcode]");
+        string passcode = args.Length == 4 ? args[3] : new string('0', 32);
+        ProsperoPackageArchive.DecodeInnerPfs(args[1], args[2], passcode);
         Console.WriteLine(args[2]);
         return 0;
     }
@@ -790,7 +802,38 @@ internal static class Program
         deterministicKeys2.Write(keys2);
         if (!keys1.ToArray().AsSpan().SequenceEqual(keys2.ToArray()))
             throw new InvalidDataException("Deterministic RSA-wrapped ENTRY_KEYS differ.");
-        Console.WriteLine("selftest: deterministic RSA-3072 ENTRY_KEYS generation passed");
+        keys1.Position = 0;
+        KeysEntry parsedKeys = KeysEntry.Read(
+            new MetaEntry { DataOffset = 0, DataSize = deterministicKeys1.Length }, keys1);
+        if (parsedKeys.Keys.Length != 7 || parsedKeys.Keys.Any(key => key.key.Length != 384))
+            throw new InvalidDataException("RSA-3072 ENTRY_KEYS width was not recovered from its record size.");
+        try
+        {
+            KeysEntry.Read(
+                new MetaEntry { DataOffset = 0, DataSize = 0x100 },
+                new MemoryStream(new byte[0x100], writable: false));
+            throw new InvalidDataException("A truncated ENTRY_KEYS record was accepted.");
+        }
+        catch (InvalidDataException e) when (e.Message.StartsWith("ENTRY_KEYS has invalid size", StringComparison.Ordinal))
+        {
+            // Expected structural rejection before reading the record body.
+        }
+
+        byte[] displacedPhdrElf = new byte[0x40];
+        "\u007fELF"u8.CopyTo(displacedPhdrElf);
+        displacedPhdrElf[4] = 2;
+        BinaryPrimitives.WriteUInt64LittleEndian(displacedPhdrElf.AsSpan(0x20), 0x80);
+        BinaryPrimitives.WriteUInt16LittleEndian(displacedPhdrElf.AsSpan(0x36), 0x38);
+        try
+        {
+            ProsperoFself.MakeFself(displacedPhdrElf);
+            throw new InvalidDataException("An ELF with a displaced program-header table was accepted.");
+        }
+        catch (ArgumentException e) when (e.Message.Contains("e_phoff", StringComparison.Ordinal))
+        {
+            // Expected: the FSELF header embeds ELF+PHDR as one contiguous region.
+        }
+        Console.WriteLine("selftest: RSA-3072 ENTRY_KEYS and FSELF structural validation passed");
 
         string regressionRoot = Path.Combine(
             Path.GetTempPath(), "LibProsperoPkg-selftest-" + Guid.NewGuid().ToString("N"));
@@ -847,8 +890,34 @@ internal static class Program
             }
             if (ProsperoPkgReader.Read(build1.OutputPath).Type != ProsperoPkgType.FullDebug)
                 throw new InvalidDataException("Deterministic APP regression package is not a finalized debug image.");
+
+            string streamedOuterPath = Path.Combine(regressionRoot, "outer.pfs");
+            ProsperoPackageArchive.DecryptOuterPfs(
+                build1.OutputPath, streamedOuterPath, deterministicPasscode);
+            if (!File.ReadAllBytes(streamedOuterPath).AsSpan().SequenceEqual(
+                    ProsperoPackageArchive.DecryptOuterPfs(
+                        build1.OutputPath, deterministicPasscode)))
+            {
+                throw new InvalidDataException(
+                    "Streaming and in-memory outer-PFS decryptors produced different bytes.");
+            }
+
+            string extracted = Path.Combine(regressionRoot, "extracted");
+            IReadOnlyList<string> extractedPaths = ProsperoPackageArchive.ExtractInnerFiles(
+                build1.OutputPath, extracted, deterministicPasscode);
+            if (!extractedPaths.Contains("data/a.bin", StringComparer.Ordinal) ||
+                !extractedPaths.Contains("data/z.bin", StringComparer.Ordinal) ||
+                !File.ReadAllBytes(Path.Combine(extracted, "data", "a.bin")).AsSpan()
+                    .SequenceEqual(new byte[] { 0x41, 0x31 }) ||
+                !File.ReadAllBytes(Path.Combine(extracted, "data", "z.bin")).AsSpan()
+                    .SequenceEqual(new byte[] { 0x5A, 0x31 }) ||
+                Directory.EnumerateFiles(extracted, ".libprospero-*.tmp").Any())
+            {
+                throw new InvalidDataException(
+                    "File-backed APP/PPR-NAPS extraction did not reproduce the source tree cleanly.");
+            }
             Console.WriteLine(
-                "selftest: deterministic APP/PPR-NAPS full-package regression passed " +
+                "selftest: deterministic APP/PPR-NAPS build + file-backed extraction passed " +
                 $"(SHA3-256 {Convert.ToHexString(ProsperoSha3.HashData(package1))})");
         }
         finally
@@ -1836,6 +1905,7 @@ internal static class Program
         Console.WriteLine("  inspect-pkg <package.pkg>");
         Console.WriteLine("  extract-pkg-outer <package.pkg> <output-dir> [passcode]");
         Console.WriteLine("  dump-pkg-outer <package.pkg> <output.pfs> [passcode]");
+        Console.WriteLine("  dump-pkg-inner <package.pkg> <output.pfs> [passcode]");
         Console.WriteLine("  check-pkg-fih <package.pkg> [passcode]");
         Console.WriteLine("  check-pkg-imagedigs <package.pkg> [passcode]");
         Console.WriteLine("  check-pkg-signature <package.pkg>");

@@ -275,10 +275,17 @@ public class KeysEntry : Entry
     }
     public static KeysEntry Read(MetaEntry e, Stream pkg)
     {
+        const int keyCount = 7;
+        const int fixedSize = 32 + keyCount * 32;
+        long wrappedKeyBytes = (long)e.DataSize - fixedSize;
+        if (wrappedKeyBytes <= 0 || wrappedKeyBytes % keyCount != 0)
+            throw new InvalidDataException(
+                $"ENTRY_KEYS has invalid size {e.DataSize}: expected a 32-byte seed digest, " +
+                $"{keyCount} 32-byte key digests and {keyCount} equal-size wrapped keys.");
+        int keySize = checked((int)(wrappedKeyBytes / keyCount));
+
         pkg.Position = e.DataOffset;
         var seedDigest = pkg.ReadBytes(32);
-        const int keyCount = 7;
-        int keySize = e.DataSize >= 0xB80 ? 384 : 256;
         var digests = new byte[keyCount][];
         var keys = new PkgEntryKey[keyCount];
         for (var x = 0; x < keyCount; x++)

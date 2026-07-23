@@ -5,6 +5,7 @@
 #nullable disable
 using LibProsperoPkg.Util;
 using System;
+using System.Buffers.Binary;
 using System.Security.Cryptography;
 
 namespace LibProsperoPkg.PFS;
@@ -52,12 +53,12 @@ public class XtsDecryptReader : IMemoryReader
           encryptedTweak = context.encryptedTweak,
           xor = context.xor;
 
-        // Reset tweak to sector number
-        Buffer.BlockCopy(BitConverter.GetBytes(sectorNum), 0, tweak, 0, 8);
+        // Reset tweak to sector number.
+        BinaryPrimitives.WriteUInt64LittleEndian(tweak, sectorNum);
         Buffer.BlockCopy(zeroes, 0, tweak, 8, 8);
-        using (var tweakEncryptor = context.tweakCipher.CreateEncryptor())
-        using (var decryptor = context.cipher.CreateDecryptor())
         {
+            ICryptoTransform tweakEncryptor = context.tweakEncryptor;
+            ICryptoTransform decryptor = context.decryptor;
             tweakEncryptor.TransformBlock(tweak, 0, 16, encryptedTweak, 0);
             for (int plaintextOffset = 0; plaintextOffset < sector.Length; plaintextOffset += 16)
             {
@@ -90,13 +91,23 @@ public class XtsDecryptReader : IMemoryReader
         }
     }
 
-    public class Ctx
+    public sealed class Ctx : IDisposable
     {
         public SymmetricAlgorithm cipher;
         public SymmetricAlgorithm tweakCipher;
+        public ICryptoTransform decryptor;
+        public ICryptoTransform tweakEncryptor;
         public byte[] tweak;
         public byte[] xor;
         public byte[] encryptedTweak;
+
+        public void Dispose()
+        {
+            decryptor?.Dispose();
+            tweakEncryptor?.Dispose();
+            cipher?.Dispose();
+            tweakCipher?.Dispose();
+        }
     }
 
     /// <summary>
@@ -113,14 +124,21 @@ public class XtsDecryptReader : IMemoryReader
             DecryptSector(ctx, sectorBuf, (ulong)currentSector);
     }
 
-    private Ctx MakeCtx() => new Ctx
+    private Ctx MakeCtx()
     {
-        cipher = CreateEcbAes(dataKey),
-        tweakCipher = CreateEcbAes(tweakKey),
-        xor = new byte[16],
-        encryptedTweak = new byte[16],
-        tweak = new byte[16]
-    };
+        var cipher = CreateEcbAes(dataKey);
+        var tweakCipher = CreateEcbAes(tweakKey);
+        return new Ctx
+        {
+            cipher = cipher,
+            tweakCipher = tweakCipher,
+            decryptor = cipher.CreateDecryptor(),
+            tweakEncryptor = tweakCipher.CreateEncryptor(),
+            xor = new byte[16],
+            encryptedTweak = new byte[16],
+            tweak = new byte[16]
+        };
+    }
 
     /// <summary>
     /// Creates a single-block AES-128-ECB engine (no padding) used as the primitive for
@@ -139,7 +157,9 @@ public class XtsDecryptReader : IMemoryReader
 
     public void Read(long position, byte[] buffer, int offset, int count)
     {
-        var ctx = MakeCtx();
+        if (count <= 0)
+            return;
+        using var ctx = MakeCtx();
         var sectorBuf = new byte[sectorSize];
         var currentSector = (int)(position / sectorSize);
         var offsetIntoSector = (int)(position - (sectorSize * currentSector));

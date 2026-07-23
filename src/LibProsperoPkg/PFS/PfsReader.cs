@@ -83,7 +83,7 @@ public class PfsReader
         }
         public void Save(string path, bool decompress = false)
         {
-            using (var file = System.IO.File.OpenWrite(path))
+            using (var file = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None))
             {
                 CopyTo(file, decompress);
             }

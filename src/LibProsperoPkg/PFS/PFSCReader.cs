@@ -101,6 +101,8 @@ public class PFSCReader : IMemoryReader
     {
         if (src + count > hdr.DataLength)
             throw new ArgumentException("Attempt to read beyond end of file");
+        if (count <= 0)
+            return;
         var sectorSize = hdr.BlockSz;
         var sectorBuffer = new byte[sectorSize];
         var currentSector = (int)(src / sectorSize);

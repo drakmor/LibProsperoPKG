@@ -16,8 +16,9 @@ application.
   `\x7FCNT` metadata container -> finalized `\x7FFIH` debug image, end to end.
 - **Self-contained.** The GP5 project model, the PFS image builder, AES-XTS encryption,
   RSA-3072 metadata signing and the finalized debug image are produced by the library itself.
-- **Reader and writer.** Parse and inspect existing PS5 packages (`\x7FCNT` / `\x7FFIH`) and
-  build new ones.
+- **Reader and writer.** Parse, inspect, and file-back extract existing PS5 packages
+  (`\x7FCNT` / `\x7FFIH`) without loading complete multi-gigabyte outer/inner images, and build
+  new ones.
 - **Texture generation.** The `sce_sys` icon/picture DDS (BC7) re-encoder uses the Publishing
   Tools `p2d --high --st` profile when available for byte-exact output, with a portable
   deterministic BCnEncoder.NET fallback.

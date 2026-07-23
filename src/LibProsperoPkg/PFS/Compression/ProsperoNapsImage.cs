@@ -187,7 +187,8 @@ public static class ProsperoNapsImage
                 checked((ulong)boundaries[i])));
 
         int ublockCount = checked((logicalImage.Length + UBlockSize - 1) / UBlockSize);
-        List<NapsU2cEntry> u2c = BuildU2c(spanIndexesByUblock, ublockCount);
+        List<NapsU2cEntry> u2c = BuildU2c(
+            spanIndexesByUblock, ublockCount, checked((uint)cblockInfos.Count - 1));
         var counts = new NapsLayoutCounts(
             NumFiles: fileOffsets.Count,
             CompressionType: 2,
@@ -470,7 +471,8 @@ public static class ProsperoNapsImage
         return result;
     }
 
-    private static List<NapsU2cEntry> BuildU2c(IReadOnlyList<uint> indexes, int ublockCount)
+    private static List<NapsU2cEntry> BuildU2c(
+        IReadOnlyList<uint> indexes, int ublockCount, uint terminalIndex)
     {
         if (indexes.Count != ublockCount)
             throw new InvalidDataException("NAPS writer did not record one CblockInfo start per ublock.");
@@ -484,7 +486,7 @@ public static class ProsperoNapsImage
             for (int delta = 1; delta < 8; delta++)
             {
                 int block = startBlock + delta;
-                uint value = block < ublockCount ? indexes[block] : indexes[^1];
+                uint value = block < ublockCount ? indexes[block] : terminalIndex;
                 uint difference = checked(value - baseIndex);
                 if (difference > byte.MaxValue)
                     throw new InvalidDataException("NAPS u2c group delta exceeds eight bits.");
