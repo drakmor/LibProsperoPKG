@@ -303,7 +303,7 @@ public class PfsReader
     private File LoadFile(uint dinode, Dir parent, string name)
     {
         int[] blocks = null;
-        if (dinodes[dinode].Blocks > 1 && dinodes[dinode].DirectBlocks[1] != -1)
+        if (dinodes[dinode].Blocks > 1)
         {
             if (!hdr.Mode.HasFlag(PfsMode.Signed))
             {
@@ -313,32 +313,57 @@ public class PfsReader
             }
             else
             {
-                blocks = new int[dinodes[dinode].Blocks];
-                var remainingBlocks = (long)dinodes[dinode].Blocks;
-                var sigsPerBlock = hdr.BlockSize / 36;
-                for (int i = 0; i < 12 && i < remainingBlocks; i++)
+                int fileBlockCount = checked((int)dinodes[dinode].Blocks);
+                blocks = new int[fileBlockCount];
+                int outputIndex = 0;
+                int remainingBlocks = fileBlockCount;
+                int directCount = Math.Min(
+                    remainingBlocks, dinodes[dinode].DirectBlocks.Count);
+                for (int i = 0; i < directCount; i++)
                 {
-                    blocks[i] = dinodes[dinode].DirectBlocks[i];
+                    int block = dinodes[dinode].DirectBlocks[i];
+                    if (block < 0)
+                        throw new InvalidDataException(
+                            $"Signed inode {dinode} has an invalid direct block {block} at db[{i}].");
+                    blocks[outputIndex++] = block;
                 }
 
                 var bufferedReader = new BufferedMemoryReader(reader, 0x10000);
-                remainingBlocks -= 12;
-                long blockIndexOffset = 12;
-                for (int i = 0; i < remainingBlocks && i < sigsPerBlock; i++)
+                remainingBlocks -= directCount;
+                int entriesPerBlock = checked((int)(hdr.BlockSize / 36));
+
+                void ReadIndirectNode(int mapBlock, int depth)
                 {
-                    bufferedReader.Read(dinodes[dinode].IndirectBlocks[0] * hdr.BlockSize + (i * 36) + 32, out blocks[i + blockIndexOffset]);
-                }
-                remainingBlocks -= sigsPerBlock;
-                blockIndexOffset += sigsPerBlock;
-                for (int j = 0; j * sigsPerBlock < remainingBlocks; j++)
-                {
-                    bufferedReader.Read(dinodes[dinode].IndirectBlocks[1] * hdr.BlockSize + (j * 36) + 32, out int indirectBlockOffset);
-                    for (int i = 0; i < sigsPerBlock && i + (j * sigsPerBlock) < remainingBlocks; i++)
+                    if (mapBlock <= 0)
+                        throw new InvalidDataException(
+                            $"Signed inode {dinode} has a missing depth-{depth} indirect map.");
+                    long mapOffset = checked((long)mapBlock * hdr.BlockSize);
+                    for (int entry = 0; entry < entriesPerBlock && remainingBlocks > 0; entry++)
                     {
-                        bufferedReader.Read(indirectBlockOffset * hdr.BlockSize + (i * 36) + 32, out blocks[i + blockIndexOffset]);
+                        bufferedReader.Read(
+                            checked(mapOffset + entry * 36L + 32), out int referencedBlock);
+                        if (referencedBlock < 0)
+                            throw new InvalidDataException(
+                                $"Signed inode {dinode} has a negative indirect block pointer.");
+                        if (depth == 1)
+                        {
+                            blocks[outputIndex++] = referencedBlock;
+                            remainingBlocks--;
+                        }
+                        else
+                        {
+                            ReadIndirectNode(referencedBlock, depth - 1);
+                        }
                     }
-                    blockIndexOffset += sigsPerBlock;
                 }
+
+                IList<int> indirectBlocks = dinodes[dinode].IndirectBlocks;
+                for (int level = 0; level < indirectBlocks.Count && remainingBlocks > 0; level++)
+                    ReadIndirectNode(indirectBlocks[level], level + 1);
+                if (remainingBlocks != 0)
+                    throw new InvalidDataException(
+                        $"Signed inode {dinode} is missing mappings for {remainingBlocks} data blocks.");
+
                 bool contiguous = true;
                 for (int i = 1; i < blocks.Length; i++)
                 {

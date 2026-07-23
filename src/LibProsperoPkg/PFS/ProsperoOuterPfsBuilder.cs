@@ -176,6 +176,30 @@ public sealed class ProsperoOuterPackageFileResult
 }
 
 /// <summary>
+/// Addressing geometry of one signed outer-PFS inode. Index 0 in both arrays describes
+/// <c>ib[0]</c> (single indirect), index 1 describes <c>ib[1]</c> (double indirect), and so on.
+/// This is useful for checking very large image layouts without materializing their payload.
+/// </summary>
+public sealed class ProsperoOuterAddressingGeometry
+{
+    public required long DataBlocks { get; init; }
+    public required long DirectDataBlocks { get; init; }
+    public required long[] DataBlocksByIndirectLevel { get; init; }
+    public required long[] MetadataBlocksByIndirectLevel { get; init; }
+    public required int HighestIndirectLevel { get; init; }
+    public long TotalIndirectMetadataBlocks
+    {
+        get
+        {
+            long total = 0;
+            foreach (long count in MetadataBlocksByIndirectLevel)
+                total = checked(total + count);
+            return total;
+        }
+    }
+}
+
+/// <summary>
 /// Assembles, signs, and encrypts the plaintext outer-PFS image of a PS5 nwonly finalized package.
 /// See the file header for the full byte layout.
 /// </summary>
@@ -208,6 +232,232 @@ public static class ProsperoOuterPfsBuilder
     private const uint FltHeaderSize = 0x10;
     private const uint FltDataOffset = 0x40;
     private static readonly byte[] FltMagic = { 0x7F, 0x46, 0x4C, 0x54 }; // "\x7fFLT"
+
+    private const int DirectBlockSlots = 12;
+    private const int SignedPointerSize = 36;
+    private const int IndirectLevelCount = 5;
+    private const int IndirectEntriesPerBlock = BlockSize / SignedPointerSize;
+
+    private sealed class IndirectNodePlan
+    {
+        public required int BlockIndex { get; init; }
+        public required int Depth { get; init; }
+        public required int FirstDataOffset { get; init; }
+        public required int DataBlockCount { get; init; }
+        public List<IndirectNodePlan> Children { get; } = [];
+    }
+
+    private sealed class IndirectTreePlan
+    {
+        public required int InodeLevel { get; init; }
+        public required IndirectNodePlan Root { get; init; }
+    }
+
+    private delegate void CopyDigest(int blockIndex, Span<byte> destination);
+
+    /// <summary>
+    /// Calculates which direct and indirect levels are needed for a file of
+    /// <paramref name="dataBlockCount"/> blocks. No image or indirect-map buffers are allocated.
+    /// </summary>
+    public static ProsperoOuterAddressingGeometry GetAddressingGeometry(long dataBlockCount)
+    {
+        if (dataBlockCount < 0)
+            throw new ArgumentOutOfRangeException(nameof(dataBlockCount));
+
+        long direct = Math.Min(dataBlockCount, DirectBlockSlots);
+        long remaining = dataBlockCount - direct;
+        var dataByLevel = new long[IndirectLevelCount];
+        var metadataByLevel = new long[IndirectLevelCount];
+        int highest = -1;
+        for (int level = 0; level < IndirectLevelCount && remaining > 0; level++)
+        {
+            int depth = level + 1;
+            long capacity = SaturatingPow(IndirectEntriesPerBlock, depth);
+            long take = Math.Min(remaining, capacity);
+            dataByLevel[level] = take;
+            metadataByLevel[level] = CountIndirectTreeBlocks(take, depth);
+            remaining -= take;
+            highest = level;
+        }
+
+        if (remaining > 0)
+            throw new NotSupportedException(
+                $"A signed outer-PFS inode cannot address {dataBlockCount} data blocks with " +
+                $"{IndirectLevelCount} indirect levels.");
+
+        // For every file size representable by the actual writer, derive the public geometry from
+        // the same concrete node planner used during serialization. The arithmetic path above also
+        // handles larger diagnostic values and provides the address-space check.
+        if (dataBlockCount <= int.MaxValue)
+        {
+            IndirectTreePlan[][] plans = PlanIndirectTrees(
+                [checked((int)dataBlockCount)], firstMetadataBlock: 0, out _);
+            Array.Clear(dataByLevel);
+            Array.Clear(metadataByLevel);
+            highest = -1;
+            foreach (IndirectTreePlan tree in plans[0])
+            {
+                dataByLevel[tree.InodeLevel] = tree.Root.DataBlockCount;
+                metadataByLevel[tree.InodeLevel] = CountIndirectNodes(tree.Root);
+                highest = tree.InodeLevel;
+            }
+        }
+
+        return new ProsperoOuterAddressingGeometry
+        {
+            DataBlocks = dataBlockCount,
+            DirectDataBlocks = direct,
+            DataBlocksByIndirectLevel = dataByLevel,
+            MetadataBlocksByIndirectLevel = metadataByLevel,
+            HighestIndirectLevel = highest,
+        };
+    }
+
+    private static long SaturatingPow(long value, int exponent)
+    {
+        long result = 1;
+        for (int i = 0; i < exponent; i++)
+        {
+            if (result > long.MaxValue / value)
+                return long.MaxValue;
+            result *= value;
+        }
+        return result;
+    }
+
+    private static long CountIndirectTreeBlocks(long dataBlocks, int depth)
+    {
+        long total = 0;
+        long divisor = 1;
+        for (int level = 0; level < depth; level++)
+        {
+            if (divisor > long.MaxValue / IndirectEntriesPerBlock)
+                divisor = long.MaxValue;
+            else
+                divisor *= IndirectEntriesPerBlock;
+            long count = dataBlocks / divisor + (dataBlocks % divisor == 0 ? 0 : 1);
+            total = checked(total + count);
+        }
+        return total;
+    }
+
+    private static IndirectTreePlan[][] PlanIndirectTrees(
+        int[] fileBlockCounts, int firstMetadataBlock, out int nextMetadataBlock)
+    {
+        var result = new IndirectTreePlan[fileBlockCounts.Length][];
+        int nextBlock = firstMetadataBlock;
+        for (int fileIndex = 0; fileIndex < fileBlockCounts.Length; fileIndex++)
+        {
+            int remaining = Math.Max(0, fileBlockCounts[fileIndex] - DirectBlockSlots);
+            int firstDataOffset = DirectBlockSlots;
+            var trees = new List<IndirectTreePlan>(IndirectLevelCount);
+            for (int level = 0; level < IndirectLevelCount && remaining > 0; level++)
+            {
+                int depth = level + 1;
+                long capacity = SaturatingPow(IndirectEntriesPerBlock, depth);
+                int take = checked((int)Math.Min(remaining, capacity));
+                IndirectNodePlan root = AllocateIndirectNode(
+                    depth, firstDataOffset, take, ref nextBlock);
+                trees.Add(new IndirectTreePlan { InodeLevel = level, Root = root });
+                firstDataOffset = checked(firstDataOffset + take);
+                remaining -= take;
+            }
+            if (remaining > 0)
+                throw new NotSupportedException(
+                    $"Outer file {fileIndex} spans {fileBlockCounts[fileIndex]} blocks and exceeds " +
+                    $"the five-level signed inode address space.");
+            result[fileIndex] = trees.ToArray();
+        }
+        nextMetadataBlock = nextBlock;
+        return result;
+    }
+
+    private static IndirectNodePlan AllocateIndirectNode(
+        int depth, int firstDataOffset, int dataBlockCount, ref int nextBlock)
+    {
+        var node = new IndirectNodePlan
+        {
+            BlockIndex = nextBlock,
+            Depth = depth,
+            FirstDataOffset = firstDataOffset,
+            DataBlockCount = dataBlockCount,
+        };
+        nextBlock = checked(nextBlock + 1);
+        if (depth == 1)
+            return node;
+
+        long childCapacity = SaturatingPow(IndirectEntriesPerBlock, depth - 1);
+        int remaining = dataBlockCount;
+        int childDataOffset = firstDataOffset;
+        while (remaining > 0)
+        {
+            int childCount = checked((int)Math.Min(remaining, childCapacity));
+            node.Children.Add(AllocateIndirectNode(
+                depth - 1, childDataOffset, childCount, ref nextBlock));
+            childDataOffset = checked(childDataOffset + childCount);
+            remaining -= childCount;
+        }
+        return node;
+    }
+
+    private static void MarkIndirectBlocksSigned(
+        ProsperoOuterBlockKind[] kinds, IndirectTreePlan[][] plans)
+    {
+        foreach (IndirectTreePlan[] filePlans in plans)
+            foreach (IndirectTreePlan tree in filePlans)
+                MarkIndirectNodeSigned(kinds, tree.Root);
+    }
+
+    private static void MarkIndirectNodeSigned(
+        ProsperoOuterBlockKind[] kinds, IndirectNodePlan node)
+    {
+        kinds[node.BlockIndex] = ProsperoOuterBlockKind.Signed;
+        foreach (IndirectNodePlan child in node.Children)
+            MarkIndirectNodeSigned(kinds, child);
+    }
+
+    private static long CountIndirectNodes(IndirectNodePlan node)
+    {
+        long count = 1;
+        foreach (IndirectNodePlan child in node.Children)
+            count = checked(count + CountIndirectNodes(child));
+        return count;
+    }
+
+    private static byte[] WriteIndirectTree(
+        IndirectNodePlan node, int fileFirstBlock, CopyDigest copyDataDigest,
+        Action<int, byte[]> writeBlock)
+    {
+        var map = new byte[BlockSize];
+        if (node.Depth == 1)
+        {
+            for (int entry = 0; entry < node.DataBlockCount; entry++)
+            {
+                int dataBlock = checked(fileFirstBlock + node.FirstDataOffset + entry);
+                int entryOffset = entry * SignedPointerSize;
+                copyDataDigest(dataBlock, map.AsSpan(entryOffset, 32));
+                BinaryPrimitives.WriteInt32LittleEndian(
+                    map.AsSpan(entryOffset + 32, 4), dataBlock);
+            }
+        }
+        else
+        {
+            for (int entry = 0; entry < node.Children.Count; entry++)
+            {
+                IndirectNodePlan child = node.Children[entry];
+                byte[] childHash = WriteIndirectTree(
+                    child, fileFirstBlock, copyDataDigest, writeBlock);
+                int entryOffset = entry * SignedPointerSize;
+                childHash.CopyTo(map, entryOffset);
+                BinaryPrimitives.WriteInt32LittleEndian(
+                    map.AsSpan(entryOffset + 32, 4), child.BlockIndex);
+            }
+        }
+
+        byte[] hash = ProsperoOuterPfsSignature.ComputeBlockHash(map);
+        writeBlock(node.BlockIndex, map);
+        return hash;
+    }
 
     /// <summary>
     /// Builds the plaintext outer-PFS image (assembled + signed, not yet encrypted) for the given
@@ -243,46 +493,12 @@ public static class ProsperoOuterPfsBuilder
         int superRootDirentIndex = dataBlockTotal + 2; // block D+2
         int fltIndex = dataBlockTotal + 3;           // block D+3
 
-        // Files whose block count exceeds the 12 direct-block slots use the signed-PFS hierarchy:
-        // ib[0] is one single-indirect {sig,block} table; ib[1] is a double-indirect root whose
-        // entries point at leaf {sig,block} tables. The maps live after the FLT and before uroot
-        // dirents (the common small image places pfs_image.dat's ib[0] at D+4).
-        const int DirectBlockSlots = 12;
-        int indirectEntriesPerBlock = BlockSize / 36;
-        long maxAddressableBlocks = DirectBlockSlots
-            + indirectEntriesPerBlock
-            + (long)indirectEntriesPerBlock * indirectEntriesPerBlock;
-        var fileSingleIndirectBlock = new int[files.Count];
-        var fileDoubleIndirectBlock = new int[files.Count];
-        var fileDoubleIndirectLeafCount = new int[files.Count];
-        Array.Fill(fileSingleIndirectBlock, -1);
-        Array.Fill(fileDoubleIndirectBlock, -1);
+        // Signed maps live after the FLT and before uroot. ib[n] is a tree of depth n+1,
+        // so ib[2] removes the former ~202-GiB single+double-indirect file-size ceiling.
         int indirectRegionStart = fltIndex + 1;
-        int indirectBlocksTotal = 0;
-        for (int i = 0; i < files.Count; i++)
-        {
-            if (fileBlockCount[i] > DirectBlockSlots)
-            {
-                if (fileBlockCount[i] > maxAddressableBlocks)
-                    throw new NotSupportedException(
-                        $"Outer file '{files[i].Name}' spans {fileBlockCount[i]} blocks; one inode addresses at most " +
-                        $"{maxAddressableBlocks} blocks (~{maxAddressableBlocks * BlockSize / (1024 * 1024)} MiB).");
-
-                fileSingleIndirectBlock[i] = indirectRegionStart + indirectBlocksTotal++;
-                int doubleDataBlocks = Math.Max(
-                    0, fileBlockCount[i] - DirectBlockSlots - indirectEntriesPerBlock);
-                if (doubleDataBlocks > 0)
-                {
-                    fileDoubleIndirectBlock[i] = indirectRegionStart + indirectBlocksTotal++;
-                    int leafCount = checked(
-                        (doubleDataBlocks + indirectEntriesPerBlock - 1) / indirectEntriesPerBlock);
-                    fileDoubleIndirectLeafCount[i] = leafCount;
-                    indirectBlocksTotal += leafCount;
-                }
-            }
-        }
-
-        int urootDirentIndex = indirectRegionStart + indirectBlocksTotal; // after the indirect region
+        IndirectTreePlan[][] indirectPlans = PlanIndirectTrees(
+            fileBlockCount, indirectRegionStart, out int afterIndirectRegion);
+        int urootDirentIndex = afterIndirectRegion;
         int totalBlocks = urootDirentIndex + 1;
 
         var image = new byte[(long)totalBlocks * BlockSize];
@@ -303,8 +519,7 @@ public static class ProsperoOuterPfsBuilder
         BuildInodeTable(
             image, inodeTableIndex, parameters, files,
             fileFirstBlock, fileBlockCount,
-            fileSingleIndirectBlock, fileDoubleIndirectBlock, fileDoubleIndirectLeafCount,
-            indirectEntriesPerBlock,
+            indirectPlans,
             superRootDirentIndex, fltIndex, urootDirentIndex);
 
         // ---- 5. Build the superblock (block D): super-root inode hash (of the inode table) + seed + ICV. ----
@@ -327,17 +542,7 @@ public static class ProsperoOuterPfsBuilder
         kinds[inodeTableIndex] = ProsperoOuterBlockKind.Signed;
         kinds[superRootDirentIndex] = ProsperoOuterBlockKind.Signed;
         kinds[fltIndex] = ProsperoOuterBlockKind.Signed;
-        for (int i = 0; i < files.Count; i++)
-        {
-            if (fileSingleIndirectBlock[i] >= 0)
-                kinds[fileSingleIndirectBlock[i]] = ProsperoOuterBlockKind.Signed;
-            if (fileDoubleIndirectBlock[i] >= 0)
-            {
-                kinds[fileDoubleIndirectBlock[i]] = ProsperoOuterBlockKind.Signed;
-                for (int leaf = 0; leaf < fileDoubleIndirectLeafCount[i]; leaf++)
-                    kinds[fileDoubleIndirectBlock[i] + 1 + leaf] = ProsperoOuterBlockKind.Signed;
-            }
-        }
+        MarkIndirectBlocksSigned(kinds, indirectPlans);
         kinds[urootDirentIndex] = ProsperoOuterBlockKind.Signed;
 
         return new ProsperoOuterPfsBuildResult
@@ -477,39 +682,10 @@ public static class ProsperoOuterPfsBuilder
         int inodeTableIndex = checked(dataBlockTotal + 1);
         int superRootDirentIndex = checked(dataBlockTotal + 2);
         int fltIndex = checked(dataBlockTotal + 3);
-        const int directBlockSlots = 12;
-        int entriesPerIndirectBlock = BlockSize / 36;
-        long maxAddressableBlocks = directBlockSlots
-            + entriesPerIndirectBlock
-            + (long)entriesPerIndirectBlock * entriesPerIndirectBlock;
-        var singleIndirect = new int[files.Count];
-        var doubleIndirect = new int[files.Count];
-        var doubleLeafCounts = new int[files.Count];
-        Array.Fill(singleIndirect, -1);
-        Array.Fill(doubleIndirect, -1);
         int indirectRegionStart = checked(fltIndex + 1);
-        int indirectBlockCount = 0;
-        for (int i = 0; i < files.Count; i++)
-        {
-            if (blockCounts[i] <= directBlockSlots)
-                continue;
-            if (blockCounts[i] > maxAddressableBlocks)
-                throw new NotSupportedException(
-                    $"Outer file '{files[i].Name}' spans {blockCounts[i]} blocks; one signed inode " +
-                    $"addresses at most {maxAddressableBlocks} blocks.");
-            singleIndirect[i] = checked(indirectRegionStart + indirectBlockCount++);
-            int doubleDataBlocks = Math.Max(
-                0, blockCounts[i] - directBlockSlots - entriesPerIndirectBlock);
-            if (doubleDataBlocks > 0)
-            {
-                doubleIndirect[i] = checked(indirectRegionStart + indirectBlockCount++);
-                doubleLeafCounts[i] = checked(
-                    (doubleDataBlocks + entriesPerIndirectBlock - 1) / entriesPerIndirectBlock);
-                indirectBlockCount = checked(indirectBlockCount + doubleLeafCounts[i]);
-            }
-        }
-
-        int urootDirentIndex = checked(indirectRegionStart + indirectBlockCount);
+        IndirectTreePlan[][] indirectPlans = PlanIndirectTrees(
+            blockCounts, indirectRegionStart, out int afterIndirectRegion);
+        int urootDirentIndex = afterIndirectRegion;
         int totalBlocks = checked(urootDirentIndex + 1);
         long totalLength = checked((long)totalBlocks * BlockSize);
         var kinds = new ProsperoOuterBlockKind[totalBlocks];
@@ -520,15 +696,8 @@ public static class ProsperoOuterPfsBuilder
                 : ProsperoOuterBlockKind.Data;
             for (int block = 0; block < blockCounts[i]; block++)
                 kinds[firstBlocks[i] + block] = kind;
-            if (singleIndirect[i] >= 0)
-                kinds[singleIndirect[i]] = ProsperoOuterBlockKind.Signed;
-            if (doubleIndirect[i] >= 0)
-            {
-                kinds[doubleIndirect[i]] = ProsperoOuterBlockKind.Signed;
-                for (int leaf = 0; leaf < doubleLeafCounts[i]; leaf++)
-                    kinds[doubleIndirect[i] + 1 + leaf] = ProsperoOuterBlockKind.Signed;
-            }
         }
+        MarkIndirectBlocksSigned(kinds, indirectPlans);
         kinds[superblockIndex] = ProsperoOuterBlockKind.Plaintext;
         kinds[inodeTableIndex] = ProsperoOuterBlockKind.Signed;
         kinds[superRootDirentIndex] = ProsperoOuterBlockKind.Signed;
@@ -640,7 +809,7 @@ public static class ProsperoOuterPfsBuilder
                         Blocks = checked((uint)blockCounts[fileIndex]),
                     };
                     StampTime(inode, parameters);
-                    int directCount = Math.Min(blockCounts[fileIndex], directBlockSlots);
+                    int directCount = Math.Min(blockCounts[fileIndex], DirectBlockSlots);
                     for (int entry = 0; entry < directCount; entry++)
                     {
                         int dataBlock = firstBlocks[fileIndex] + entry;
@@ -648,54 +817,17 @@ public static class ProsperoOuterPfsBuilder
                         inode.db[entry].block = dataBlock;
                     }
 
-                    if (singleIndirect[fileIndex] >= 0)
+                    foreach (IndirectTreePlan treePlan in indirectPlans[fileIndex])
                     {
-                        Array.Clear(block);
-                        int singleCount = Math.Min(
-                            blockCounts[fileIndex] - directBlockSlots, entriesPerIndirectBlock);
-                        for (int entry = 0; entry < singleCount; entry++)
+                        void CopyStoredDigest(int dataBlock, Span<byte> destination)
                         {
-                            int dataBlock = firstBlocks[fileIndex] + directBlockSlots + entry;
-                            imageDigests.AsSpan(dataBlock * 32, 32).CopyTo(block.AsSpan(entry * 36));
-                            BinaryPrimitives.WriteInt32LittleEndian(block.AsSpan(entry * 36 + 32), dataBlock);
+                            imageDigests.AsSpan(dataBlock * 32, 32).CopyTo(destination);
                         }
-                        WriteBlock(singleIndirect[fileIndex], block);
-                        inode.ib[0].sig = imageDigests.AsSpan(
-                            singleIndirect[fileIndex] * 32, 32).ToArray();
-                        inode.ib[0].block = singleIndirect[fileIndex];
-
-                        int doubleDataBlocks =
-                            blockCounts[fileIndex] - directBlockSlots - singleCount;
-                        if (doubleDataBlocks > 0)
-                        {
-                            int rootBlock = doubleIndirect[fileIndex];
-                            byte[] root = new byte[BlockSize];
-                            int dataIndex = directBlockSlots + singleCount;
-                            int remaining = doubleDataBlocks;
-                            for (int leaf = 0; leaf < doubleLeafCounts[fileIndex]; leaf++)
-                            {
-                                Array.Clear(block);
-                                int leafBlock = rootBlock + 1 + leaf;
-                                int leafEntries = Math.Min(remaining, entriesPerIndirectBlock);
-                                for (int entry = 0; entry < leafEntries; entry++)
-                                {
-                                    int dataBlock = firstBlocks[fileIndex] + dataIndex++;
-                                    imageDigests.AsSpan(dataBlock * 32, 32)
-                                        .CopyTo(block.AsSpan(entry * 36));
-                                    BinaryPrimitives.WriteInt32LittleEndian(
-                                        block.AsSpan(entry * 36 + 32), dataBlock);
-                                }
-                                WriteBlock(leafBlock, block);
-                                imageDigests.AsSpan(leafBlock * 32, 32)
-                                    .CopyTo(root.AsSpan(leaf * 36));
-                                BinaryPrimitives.WriteInt32LittleEndian(
-                                    root.AsSpan(leaf * 36 + 32), leafBlock);
-                                remaining -= leafEntries;
-                            }
-                            WriteBlock(rootBlock, root);
-                            inode.ib[1].sig = imageDigests.AsSpan(rootBlock * 32, 32).ToArray();
-                            inode.ib[1].block = rootBlock;
-                        }
+                        byte[] rootHash = WriteIndirectTree(
+                            treePlan.Root, firstBlocks[fileIndex], CopyStoredDigest,
+                            (mapBlock, bytes) => WriteBlock(mapBlock, bytes));
+                        inode.ib[treePlan.InodeLevel].sig = rootHash;
+                        inode.ib[treePlan.InodeLevel].block = treePlan.Root.BlockIndex;
                     }
                     inodes.Add(inode);
                 }
@@ -997,8 +1129,7 @@ public static class ProsperoOuterPfsBuilder
         byte[] image, int inodeTableIndex, ProsperoOuterPfsBuildParameters p,
         IReadOnlyList<ProsperoOuterFile> files,
         int[] fileFirstBlock, int[] fileBlockCount,
-        int[] fileSingleIndirectBlock, int[] fileDoubleIndirectBlock, int[] fileDoubleIndirectLeafCount,
-        int indirectEntriesPerBlock,
+        IndirectTreePlan[][] indirectPlans,
         int superRootDirentIndex, int fltIndex, int urootDirentIndex)
     {
         var inodes = new List<DinodeS32>(MetadataInodeCount + files.Count);
@@ -1018,8 +1149,8 @@ public static class ProsperoOuterPfsBuilder
 
         // inode 3..: the outer files in order. Every file (signed metadata blob AND the plain-data
         // pfs_image.dat) stores a per-block SHA3 signature in its direct-block table; files whose block
-        // count exceeds the 12 direct slots spill into ib[0] (single indirect) and ib[1]
-        // (double-indirect root plus signed leaf tables).
+        // count exceeds the 12 direct slots spill into ib[0]..ib[4]. ib[n] is a signed
+        // {SHA3-256,block} tree of depth n+1.
         for (int i = 0; i < files.Count; i++)
         {
             ProsperoOuterFile f = files[i];
@@ -1046,64 +1177,22 @@ public static class ProsperoOuterPfsBuilder
                 di.db[j].block = blk;
             }
 
-            if (blockCount > di.db.Length)
+            foreach (IndirectTreePlan treePlan in indirectPlans[i])
             {
-                // ib[0]: one single-indirect table for the first BlockSize/36 overflow blocks.
-                int singleIndirect = fileSingleIndirectBlock[i];
-                if (singleIndirect < 0)
-                    throw new InvalidOperationException("Indirect block was not allocated for a >12-block file.");
-                int singleCount = Math.Min(blockCount - di.db.Length, indirectEntriesPerBlock);
-                for (int k = 0; k < singleCount; k++)
+                void CopyImageDigest(int dataBlock, Span<byte> destination)
                 {
-                    int blk = firstBlock + di.db.Length + k;
-                    int entryOff = singleIndirect * BlockSize + k * 36;
                     byte[] hash = ProsperoOuterPfsSignature.ComputeBlockHash(
-                        image.AsSpan(blk * BlockSize, BlockSize));
-                    hash.CopyTo(image, entryOff);
-                    BinaryPrimitives.WriteInt32LittleEndian(image.AsSpan(entryOff + 32), blk);
+                        image.AsSpan(dataBlock * BlockSize, BlockSize));
+                    hash.CopyTo(destination);
                 }
-                di.ib[0].sig = ProsperoOuterPfsSignature.ComputeBlockHash(
-                    image.AsSpan(singleIndirect * BlockSize, BlockSize));
-                di.ib[0].block = singleIndirect;
-
-                // ib[1]: a signed root of signed leaf tables for all remaining data blocks.
-                int doubleDataBlocks = blockCount - di.db.Length - singleCount;
-                if (doubleDataBlocks > 0)
+                void StoreMapBlock(int mapBlock, byte[] bytes)
                 {
-                    int doubleRoot = fileDoubleIndirectBlock[i];
-                    int leafCount = fileDoubleIndirectLeafCount[i];
-                    if (doubleRoot < 0 || leafCount <= 0)
-                        throw new InvalidOperationException("Double-indirect blocks were not allocated.");
-
-                    int dataIndex = di.db.Length + singleCount;
-                    int remaining = doubleDataBlocks;
-                    for (int leaf = 0; leaf < leafCount; leaf++)
-                    {
-                        int leafBlock = doubleRoot + 1 + leaf;
-                        int leafEntries = Math.Min(remaining, indirectEntriesPerBlock);
-                        for (int entry = 0; entry < leafEntries; entry++)
-                        {
-                            int blk = firstBlock + dataIndex++;
-                            int entryOff = leafBlock * BlockSize + entry * 36;
-                            byte[] hash = ProsperoOuterPfsSignature.ComputeBlockHash(
-                                image.AsSpan(blk * BlockSize, BlockSize));
-                            hash.CopyTo(image, entryOff);
-                            BinaryPrimitives.WriteInt32LittleEndian(image.AsSpan(entryOff + 32), blk);
-                        }
-
-                        int rootEntryOff = doubleRoot * BlockSize + leaf * 36;
-                        byte[] leafHash = ProsperoOuterPfsSignature.ComputeBlockHash(
-                            image.AsSpan(leafBlock * BlockSize, BlockSize));
-                        leafHash.CopyTo(image, rootEntryOff);
-                        BinaryPrimitives.WriteInt32LittleEndian(
-                            image.AsSpan(rootEntryOff + 32), leafBlock);
-                        remaining -= leafEntries;
-                    }
-
-                    di.ib[1].sig = ProsperoOuterPfsSignature.ComputeBlockHash(
-                        image.AsSpan(doubleRoot * BlockSize, BlockSize));
-                    di.ib[1].block = doubleRoot;
+                    bytes.CopyTo(image, mapBlock * BlockSize);
                 }
+                byte[] rootHash = WriteIndirectTree(
+                    treePlan.Root, firstBlock, CopyImageDigest, StoreMapBlock);
+                di.ib[treePlan.InodeLevel].sig = rootHash;
+                di.ib[treePlan.InodeLevel].block = treePlan.Root.BlockIndex;
             }
             inodes.Add(di);
         }

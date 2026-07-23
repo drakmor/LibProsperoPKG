@@ -1103,6 +1103,25 @@ internal static class Program
 
         const int directBlocks = 12;
         int indirectEntries = ProsperoOuterPfsBuilder.BlockSize / 36;
+        long firstTripleBlockCount = checked(
+            directBlocks + (long)indirectEntries +
+            (long)indirectEntries * indirectEntries + 1);
+        ProsperoOuterAddressingGeometry tripleGeometry =
+            ProsperoOuterPfsBuilder.GetAddressingGeometry(firstTripleBlockCount);
+        if (tripleGeometry.HighestIndirectLevel != 2 ||
+            tripleGeometry.DataBlocksByIndirectLevel[0] != indirectEntries ||
+            tripleGeometry.DataBlocksByIndirectLevel[1] !=
+                (long)indirectEntries * indirectEntries ||
+            tripleGeometry.DataBlocksByIndirectLevel[2] != 1 ||
+            tripleGeometry.MetadataBlocksByIndirectLevel[0] != 1 ||
+            tripleGeometry.MetadataBlocksByIndirectLevel[1] != indirectEntries + 1L ||
+            tripleGeometry.MetadataBlocksByIndirectLevel[2] != 3 ||
+            tripleGeometry.TotalIndirectMetadataBlocks != indirectEntries + 5L)
+        {
+            throw new InvalidDataException(
+                "Triple-indirect outer-PFS addressing geometry is incorrect.");
+        }
+
         int largeFileBlocks = directBlocks + indirectEntries + 1;
         long largeFileLength = checked((long)largeFileBlocks * ProsperoOuterPfsBuilder.BlockSize);
         string root = Path.Combine(
@@ -1190,8 +1209,9 @@ internal static class Program
             }
 
             Console.WriteLine(
-                "selftest-large-outer: signed single + double indirect addressing passed " +
-                $"({largeFileBlocks:N0} blocks, {largeFileLength:N0} bytes)");
+                "selftest-large-outer: serialized single/double maps and planned triple map passed " +
+                $"({largeFileBlocks:N0} serialized blocks; ib[2] starts at " +
+                $"{firstTripleBlockCount:N0} data blocks)");
             return 0;
         }
         finally
