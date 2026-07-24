@@ -1131,6 +1131,8 @@ internal static class Program
             string output2 = Path.Combine(regressionRoot, "output2");
             Directory.CreateDirectory(Path.Combine(source1, "data"));
             Directory.CreateDirectory(Path.Combine(source2, "data"));
+            Directory.CreateDirectory(Path.Combine(source1, "sce_sys", "uds"));
+            Directory.CreateDirectory(Path.Combine(source2, "sce_sys", "uds"));
 
             // Create the same tree in opposite host-enumeration order. The package writer must
             // sort by logical path, so creation order and temporary root names cannot affect bytes.
@@ -1138,6 +1140,35 @@ internal static class Program
             File.WriteAllBytes(Path.Combine(source1, "data", "a.bin"), [0x41, 0x31]);
             File.WriteAllBytes(Path.Combine(source2, "data", "a.bin"), [0x41, 0x31]);
             File.WriteAllBytes(Path.Combine(source2, "data", "z.bin"), [0x5A, 0x31]);
+            var publisherSystemFiles = new Dictionary<string, byte[]>(StringComparer.Ordinal)
+            {
+                ["selfinfo.dat"] = Enumerable.Range(0, 0x31)
+                    .Select(i => (byte)(0x10 + i)).ToArray(),
+                ["imageinfo.dat"] = Enumerable.Range(0, 0x42)
+                    .Select(i => (byte)(0x20 + i)).ToArray(),
+                ["target-deltainfo.dat"] = Enumerable.Range(0, 0x53)
+                    .Select(i => (byte)(0x30 + i)).ToArray(),
+                ["origin-deltainfo.dat"] = Enumerable.Range(0, 0x64)
+                    .Select(i => (byte)(0x40 + i)).ToArray(),
+                ["psreserved.dat"] = Enumerable.Range(0, 0x75)
+                    .Select(i => (byte)(0x50 + i)).ToArray(),
+                ["pubtoolinfo.dat"] = Enumerable.Range(0, 0x86)
+                    .Select(i => (byte)(0x60 + i)).ToArray(),
+                ["uds/npbind.dat"] = Enumerable.Range(0, 0x97)
+                    .Select(i => (byte)(0x70 + i)).ToArray(),
+            };
+            foreach ((string relativeName, byte[] data) in publisherSystemFiles)
+            {
+                string nativeName = relativeName.Replace(
+                    '/', Path.DirectorySeparatorChar);
+                File.WriteAllBytes(Path.Combine(source1, "sce_sys", nativeName), data);
+            }
+            foreach ((string relativeName, byte[] data) in publisherSystemFiles.Reverse())
+            {
+                string nativeName = relativeName.Replace(
+                    '/', Path.DirectorySeparatorChar);
+                File.WriteAllBytes(Path.Combine(source2, "sce_sys", nativeName), data);
+            }
 
             byte[] compressibleInnerData = new byte[0x52000];
             for (int i = 0; i < compressibleInnerData.Length; i++)
@@ -1293,6 +1324,22 @@ internal static class Program
                 Enumerable.Range(0, 0x800)
                     .Select(i => (byte)((i * 29 + 7) & 0xFF))
                     .ToArray();
+            byte[] deterministicContentIdBytes =
+                Encoding.ASCII.GetBytes(deterministicContentId);
+            var gdLicenseDat = new byte[ProsperoSystemFiles.LicenseDatSize];
+            "RIF\0"u8.CopyTo(gdLicenseDat);
+            deterministicContentIdBytes.CopyTo(gdLicenseDat, 0x20);
+            var gdLicenseInfoBytes = new byte[ProsperoSystemFiles.LicenseInfoSize];
+            deterministicContentIdBytes.CopyTo(gdLicenseInfoBytes, 0);
+            string gdLicenseProviderDirectory =
+                Path.Combine(regressionRoot, "gd-license-provider");
+            Directory.CreateDirectory(gdLicenseProviderDirectory);
+            File.WriteAllBytes(
+                Path.Combine(gdLicenseProviderDirectory, "license.dat"), gdLicenseDat);
+            File.WriteAllBytes(
+                Path.Combine(gdLicenseProviderDirectory, "license.info"), gdLicenseInfoBytes);
+            var gdLicenseProvider =
+                new ProsperoDirectoryLicenseProvider(gdLicenseProviderDirectory);
             byte[] deterministicPublisherEntryKeys;
             using (var entryKeysStream = new MemoryStream())
             {
@@ -1316,6 +1363,7 @@ internal static class Program
                     NapsPfsImageSeed = deterministicPfsImageSeed,
                     PublisherImageKey = deterministicPublisherImageKey,
                     PublisherEntryKeys = deterministicPublisherEntryKeys,
+                    LicenseProvider = gdLicenseProvider,
                 },
                 _ => { });
             ProsperoBuildResult build2 = ProsperoPackageBuilder.Build(
@@ -1332,6 +1380,7 @@ internal static class Program
                     NapsPfsImageSeed = deterministicPfsImageSeed,
                     PublisherImageKey = deterministicPublisherImageKey,
                     PublisherEntryKeys = deterministicPublisherEntryKeys,
+                    LicenseProvider = gdLicenseProvider,
                 },
                 _ => { });
 
@@ -1397,17 +1446,31 @@ internal static class Program
                         },
                     },
                     _ => { });
+            string[] artifactInnerPaths;
+            using (var artifactLogical = File.OpenRead(artifacts.LogicalImagePath))
+            using (var artifactSource =
+                new LibProsperoPkg.Util.StreamReader(artifactLogical))
+            {
+                var artifactReader = new PfsReader(
+                    artifactSource,
+                    superblockOffset: ProsperoPublisherPprBuilder.NestedPfsOffset,
+                    encryptedDataAlreadyDecrypted: true);
+                artifactInnerPaths = artifactReader.GetAllFiles()
+                    .Select(file => file.FullName)
+                    .OrderBy(name => name, StringComparer.Ordinal)
+                    .ToArray();
+            }
             if (new FileInfo(artifacts.PackedImagePath).Length != artifacts.Naps.PackedSize ||
                 new FileInfo(artifacts.OuterPfsPath).Length <= artifacts.Naps.PackedSize ||
-                artifacts.InnerFileCount != Directory.EnumerateFiles(
-                    source1, "*", SearchOption.AllDirectories).Count())
+                artifacts.InnerFileCount != 2)
             {
                 throw new InvalidDataException(
                     "File-backed publisher artifact pipeline returned inconsistent geometry: " +
                     $"packedFile={new FileInfo(artifacts.PackedImagePath).Length}, " +
                     $"packedResult={artifacts.Naps.PackedSize}, " +
                     $"outer={new FileInfo(artifacts.OuterPfsPath).Length}, " +
-                    $"files={artifacts.InnerFileCount}.");
+                    $"files={artifacts.InnerFileCount} " +
+                    $"[{string.Join(", ", artifactInnerPaths)}].");
             }
 
             byte[] package1 = File.ReadAllBytes(build1.OutputPath);
@@ -1426,6 +1489,52 @@ internal static class Program
                 entry => entry.RawId == 0x0020);
             ProsperoPkgEntry deterministicEntryKeys = parsedDeterministic.Entries.Single(
                 entry => entry.RawId == 0x0010);
+            ProsperoPkgEntry gdLicenseDatEntry = parsedDeterministic.Entries.Single(
+                entry => entry.RawId == (uint)EntryId.LICENSE_DAT);
+            ProsperoPkgEntry gdLicenseInfoEntry = parsedDeterministic.Entries.Single(
+                entry => entry.RawId == (uint)EntryId.LICENSE_INFO);
+            if (gdLicenseDatEntry is not
+                    { Flags1: 0x80000000, Flags2: 0x00003000, NameTableOffset: 0 } ||
+                gdLicenseInfoEntry is not
+                    { Flags1: 0x80000000, Flags2: 0x00002000, NameTableOffset: 0 })
+            {
+                throw new InvalidDataException(
+                    "GD provider licenses were not emitted with key indexes 3/2.");
+            }
+            uint[] fixedProtectedIds =
+            [
+                (uint)EntryId.SELFINFO_DAT,
+                (uint)EntryId.IMAGEINFO_DAT,
+                (uint)EntryId.TARGET_DELTAINFO_DAT,
+                (uint)EntryId.ORIGIN_DELTAINFO_DAT,
+                (uint)EntryId.PSRESERVED_DAT,
+            ];
+            foreach (uint id in fixedProtectedIds)
+            {
+                ProsperoPkgEntry entry = parsedDeterministic.Entries.Single(
+                    candidate => candidate.RawId == id);
+                if (entry is not
+                        { Flags1: 0x80000000, Flags2: 0x00003000, NameTableOffset: 0 })
+                {
+                    throw new InvalidDataException(
+                        $"Fixed protected CNT entry 0x{id:X4} has invalid flags/name policy.");
+                }
+            }
+            ProsperoPkgEntry nestedNpbindEntry = parsedDeterministic.Entries.Single(
+                entry => entry.RawId == 0x2020);
+            ProsperoPkgEntry pubtoolinfoEntry = parsedDeterministic.Entries.Single(
+                entry => entry.RawId == (uint)EntryId.PUBTOOLINFO_DAT);
+            if (nestedNpbindEntry is not
+                    { Flags1: 0x80000000, Flags2: 0x00003000 } ||
+                nestedNpbindEntry.NameTableOffset == 0 ||
+                !string.Equals(
+                    nestedNpbindEntry.Name, "uds/npbind.dat", StringComparison.Ordinal) ||
+                pubtoolinfoEntry is not { Flags1: 0x08000000, Flags2: 0 } ||
+                pubtoolinfoEntry.NameTableOffset == 0)
+            {
+                throw new InvalidDataException(
+                    "Named UDS npbind/pubtoolinfo CNT entry policy was not serialized.");
+            }
             ulong deterministicCntBase = parsedDeterministic.Fih?.EmbeddedCntOffset ?? 0;
             if (!package1.AsSpan(
                     checked((int)(deterministicCntBase + deterministicImageKey.DataOffset)),
@@ -1474,6 +1583,29 @@ internal static class Program
             {
                 throw new InvalidDataException(
                     "Known unencrypted CNT entry names were not resolved during raw extraction.");
+            }
+            string gdProtectedExtracted =
+                Path.Combine(regressionRoot, "gd-protected-cnt");
+            ProsperoPackageArchive.ExtractCntEntries(
+                build1.OutputPath, gdProtectedExtracted, deterministicPasscode);
+            if (!File.ReadAllBytes(Path.Combine(gdProtectedExtracted, "license.dat"))
+                    .AsSpan().SequenceEqual(gdLicenseDat) ||
+                !File.ReadAllBytes(Path.Combine(gdProtectedExtracted, "license.info"))
+                    .AsSpan().SequenceEqual(gdLicenseInfoBytes))
+            {
+                throw new InvalidDataException(
+                    "GD provider license records did not survive protected CNT round trip.");
+            }
+            foreach ((string relativeName, byte[] expected) in publisherSystemFiles)
+            {
+                string nativeName = relativeName.Replace(
+                    '/', Path.DirectorySeparatorChar);
+                if (!File.ReadAllBytes(Path.Combine(gdProtectedExtracted, nativeName))
+                        .AsSpan().SequenceEqual(expected))
+                {
+                    throw new InvalidDataException(
+                        $"CNT round trip changed sce_sys/{relativeName}.");
+                }
             }
 
             string streamedOuterPath = Path.Combine(regressionRoot, "outer.pfs");
@@ -1702,8 +1834,120 @@ internal static class Program
                 throw new InvalidDataException(
                     "License-provider CNT round trip changed the issued RIF/license records.");
             }
+
+            static void ExpectInvalidLicense(
+                ProsperoLicenseArtifacts artifacts,
+                ProsperoLicenseRequest request,
+                string scenario)
+            {
+                try
+                {
+                    artifacts.Validate(request);
+                }
+                catch (InvalidDataException)
+                {
+                    return;
+                }
+                throw new InvalidDataException(
+                    $"License validation accepted {scenario}.");
+            }
+
+            var validAcLicenseRequest = new ProsperoLicenseRequest
+            {
+                VolumeType = ProsperoVolumeType.AdditionalContentData,
+                ContentId = acContentId,
+                EntitlementKey =
+                    Convert.FromHexString("00112233445566778899AABBCCDDEEFF"),
+            };
+            var malformedRif = (byte[])licenseDat.Clone();
+            malformedRif[0] ^= 0xFF;
+            ExpectInvalidLicense(
+                new ProsperoLicenseArtifacts
+                {
+                    LicenseDat = malformedRif,
+                    LicenseInfo = (byte[])licenseInfo.Clone(),
+                },
+                validAcLicenseRequest,
+                "a license.dat record without the RIF framing");
+            ExpectInvalidLicense(
+                new ProsperoLicenseArtifacts
+                {
+                    LicenseDat = (byte[])licenseDat.Clone(),
+                    LicenseInfo = (byte[])licenseInfo.Clone(),
+                },
+                new ProsperoLicenseRequest
+                {
+                    VolumeType = ProsperoVolumeType.AdditionalContentData,
+                    ContentId = acContentId[..^1] + "1",
+                    EntitlementKey =
+                        Convert.FromHexString("00112233445566778899AABBCCDDEEFF"),
+                },
+                "a license issued for another content id");
+            ExpectInvalidLicense(
+                new ProsperoLicenseArtifacts
+                {
+                    LicenseDat = (byte[])licenseDat.Clone(),
+                    LicenseInfo = (byte[])licenseInfo.Clone(),
+                },
+                new ProsperoLicenseRequest
+                {
+                    VolumeType = ProsperoVolumeType.AdditionalContentData,
+                    ContentId = acContentId,
+                    EntitlementKey =
+                        Convert.FromHexString("FFEEDDCCBBAA99887766554433221100"),
+                },
+                "a mismatched entitlement key");
+            ExpectInvalidLicense(
+                new ProsperoLicenseArtifacts
+                {
+                    LicenseDat = (byte[])licenseDat.Clone(),
+                    LicenseInfo = licenseInfo[..^1],
+                },
+                validAcLicenseRequest,
+                "a truncated license.info record");
+
+            string alOutput = Path.Combine(regressionRoot, "al-provider-output");
+            ProsperoBuildResult alProviderBuild = ProsperoPackageBuilder.Build(
+                new ProsperoBuildOptions
+                {
+                    SourceFolder = acSource,
+                    OutputFolder = alOutput,
+                    ContentId = acContentId,
+                    TitleId = "PPSA00001",
+                    Mode = ProsperoPackageMode.AdditionalContentNoData,
+                    Passcode = deterministicPasscode,
+                    DeterministicBuild = true,
+                    LicenseProvider =
+                        new ProsperoDirectoryLicenseProvider(licenseProviderDirectory),
+                });
+            ProsperoPkg parsedAl = ProsperoPkgReader.Read(alProviderBuild.OutputPath);
+            ProsperoPkgEntry alLicenseDatEntry = parsedAl.Entries.Single(
+                entry => entry.RawId == (uint)EntryId.LICENSE_DAT);
+            ProsperoPkgEntry alLicenseInfoEntry = parsedAl.Entries.Single(
+                entry => entry.RawId == (uint)EntryId.LICENSE_INFO);
+            if (parsedAl.Header?.ContentType != 0x22 ||
+                alLicenseDatEntry is not
+                    { Flags1: 0x80000000, Flags2: 0x00003000, NameTableOffset: 0 } ||
+                alLicenseInfoEntry is not
+                    { Flags1: 0x80000000, Flags2: 0x00004000, NameTableOffset: 0 })
+            {
+                throw new InvalidDataException(
+                    "AL provider package has invalid content type or license key indexes.");
+            }
+            string alProviderExtracted =
+                Path.Combine(regressionRoot, "al-provider-extracted");
+            ProsperoPackageArchive.ExtractCntEntries(
+                alProviderBuild.OutputPath, alProviderExtracted, deterministicPasscode);
+            if (!File.ReadAllBytes(Path.Combine(alProviderExtracted, "license.dat"))
+                    .AsSpan().SequenceEqual(licenseDat) ||
+                !File.ReadAllBytes(Path.Combine(alProviderExtracted, "license.info"))
+                    .AsSpan().SequenceEqual(licenseInfo))
+            {
+                throw new InvalidDataException(
+                    "AL provider license records did not survive protected CNT round trip.");
+            }
             Console.WriteLine(
-                "selftest: GP5 AC sidecar/provider validation and CNT encryption passed");
+                "selftest: GD/AC/AL license providers, rejection paths and CNT encryption passed");
 
             Console.WriteLine(
                 "selftest: deterministic APP/PPR-NAPS build + file-backed extraction passed " +

@@ -259,7 +259,13 @@ public class PfsBuilder
                 name = parent.name + "/" + name;
                 parent = parent.Parent;
             }
-            return !is_sce_sys || !PKG.EntryNames.NameToId.ContainsKey(name);
+            // param.json is the named CNT entry 0x2000 but is intentionally not part of
+            // EntryNames (the enum table contains the legacy param.sfo mapping instead).
+            // Treat it like the other outer sce_sys records so a high-level package build
+            // cannot leave a duplicate copy in the nested PPR-PFS image.
+            bool isOuterEntry = name.Equals("param.json", StringComparison.Ordinal) ||
+                PKG.EntryNames.NameToId.ContainsKey(name);
+            return !is_sce_sys || !isOuterEntry;
         }).ToList();
         if (properties.OptimizeFileLayoutForReadSpeed)
         {
