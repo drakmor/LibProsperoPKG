@@ -573,6 +573,11 @@ public static class ProsperoNapsImage
         destination.SetLength(plan.UncompressedSize);
         foreach (ProsperoNapsSpan span in plan.Spans)
         {
+            if (span.KdePredictor != 0)
+                throw new NotSupportedException(
+                    $"NAPS span {span.Index} requires KDE predictor {span.KdePredictor}.");
+            ProsperoPfsShufflePattern shuffle = ResolveShufflePattern(
+                layout, span.ShuffleIndex);
             if (span.StoredOffset < 0 || span.StoredOffset > pfsImage.Length
                 || span.CompressedLength > pfsImage.Length - span.StoredOffset)
                 throw new InvalidDataException($"NAPS span {span.Index} lies outside pfs_image.dat.");
@@ -593,19 +598,62 @@ public static class ProsperoNapsImage
             }
             else
             {
-                if (span.KdePredictor != 0 || span.ShuffleIndex != 0)
-                    throw new NotSupportedException(
-                        $"NAPS span {span.Index} requires predictor/shuffle {span.KdePredictor}/{span.ShuffleIndex}.");
                 int firstChunk = span.UncompressedLength > 0x20000
                     ? span.FirstChunkCompressedLength
                     : 0;
                 DecodeKrakenSpan(payload, output, firstChunk, span);
+            }
+            if (shuffle != ProsperoPfsShufflePattern.None)
+            {
+                byte[] restored = ProsperoPfsShuffle.Deshuffle(output, shuffle);
+                restored.CopyTo(output, 0);
             }
 
             destination.Position = span.UncompressedOffset;
             destination.Write(output);
         }
         destination.Position = 0;
+    }
+
+    private static ProsperoPfsShufflePattern ResolveShufflePattern(
+        NapsLayoutDocument layout, byte shuffleIndex)
+    {
+        int patternCount = layout.ShufflePatterns.Count;
+        // The publisher compacts actually used source patterns into indexes 0..count-1.
+        // The value equal to count is the no-shuffle sentinel; for the common empty-table
+        // profile this naturally makes index zero the identity transform.
+        if (shuffleIndex == patternCount)
+            return ProsperoPfsShufflePattern.None;
+        if (shuffleIndex > patternCount)
+            throw new InvalidDataException(
+                $"NAPS shuffle index {shuffleIndex} exceeds the " +
+                $"{patternCount}-entry pattern table and its identity sentinel.");
+
+        ReadOnlySpan<byte> descriptor = layout.ShufflePatterns[shuffleIndex];
+        if (descriptor.Length != ProsperoNapsLayout.ShufflePatternStride)
+            throw new InvalidDataException(
+                $"NAPS shuffle pattern {shuffleIndex} has invalid size {descriptor.Length}.");
+        int fieldCount = descriptor.Length;
+        while (fieldCount > 0 && descriptor[fieldCount - 1] == 0)
+            fieldCount--;
+
+        for (ProsperoPfsShufflePattern candidate = ProsperoPfsShufflePattern.Shuffle44;
+             candidate <= ProsperoPfsShufflePattern.Shuffle2626;
+             candidate++)
+        {
+            (_, int[] fields) = ProsperoPfsShuffle.Describe(candidate);
+            bool matches = fields.Length == fieldCount;
+            for (int i = 0; matches && i < fields.Length; i++)
+                matches = descriptor[i] == fields[i];
+            if (matches)
+            {
+                return candidate;
+            }
+        }
+
+        throw new NotSupportedException(
+            $"NAPS shuffle pattern {shuffleIndex} has unknown descriptor " +
+            $"{Convert.ToHexString(descriptor)}.");
     }
 
     private static bool IsDeduplicatedZeroSpan(ProsperoNapsSpan span)

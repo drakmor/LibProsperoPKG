@@ -719,8 +719,15 @@ public static class ProsperoNapsLayout
 
         int terminalCount = 0;
         foreach (NapsCblockInfoEntry entry in document.CblockInfos)
+        {
             if (entry.IsTerminal)
                 terminalCount++;
+            else if (!entry.IsRunBase &&
+                     entry.ShuffleIdx > document.Counts.NumShufflePatterns)
+                throw new InvalidDataException(
+                    $"NAPS shuffle index {entry.ShuffleIdx} exceeds the " +
+                    $"{document.Counts.NumShufflePatterns}-entry table and identity sentinel.");
+        }
         if (terminalCount != 1 || !document.CblockInfos[^1].IsTerminal)
             throw new InvalidDataException("NAPS CblockInfo must end in exactly one terminal boundary.");
     }

@@ -71,6 +71,16 @@ public static class ProsperoNwonlyNapsGenerator
                 previousEnd = placements[i].OnDiskOffset + placements[i].OnDiskSize;
             }
         }
+        foreach (ProsperoPs5SparseAfidHole hole in result.SparseAfidHoles)
+        {
+            ProsperoPs5InnerPlacement? next = placements
+                .Where(placement => placement.LogicalOffset > hole.LogicalOffset)
+                .OrderBy(placement => placement.LogicalOffset)
+                .Cast<ProsperoPs5InnerPlacement?>()
+                .FirstOrDefault();
+            if (next is ProsperoPs5InnerPlacement nextPlacement)
+                runSet.Add(nextPlacement.OnDiskOffset);
+        }
 
         // ---- Tail: padding blocks + metadata blocks + terminator ------------------------------------
         var tail = new List<NapsCblockPlanEntry>();
@@ -169,14 +179,35 @@ public static class ProsperoNwonlyNapsGenerator
             outerBlockDigests = tags;
         }
 
-        var doc = ProsperoNapsLayoutBuilder.BuildFromInnerImage(
-            numUBlocks: numUBlocks,
-            numOuterBlocks: numOuterBlocks,
-            files: files,
-            runStartOnDiskOffsets: runSet,
-            tailBlocks: tail,
-            fileLogicalOffsets: fidx,
-            outerBlockDigests: outerBlockDigests);
+        List<NapsCblockPlanEntry> blocks =
+            ProsperoNapsLayoutBuilder.DeriveDataRegionBlocks(files, runSet);
+        blocks.AddRange(result.SparseAfidHoles.Select(hole =>
+            new NapsCblockPlanEntry
+            {
+                StartRun = true,
+                OnDiskOffset = result.BlockInfoOnDiskOffset,
+                LogicalOffset = hole.LogicalOffset,
+                EvenChunkCompressedLength = 8,
+                StreamLength = 0x10,
+                Even = 1,
+                Odd = 1,
+                KdePredictor = 0,
+                ShuffleIndex = 0,
+            }));
+        blocks = blocks
+            .OrderBy(block => block.LogicalOffset)
+            .ToList();
+        blocks.AddRange(tail);
+
+        NapsLayoutDocument doc = ProsperoNapsLayoutBuilder.BuildDocument(
+            new NapsGenerationRequest
+            {
+                NumUBlocks = numUBlocks,
+                NumOuterBlocks = numOuterBlocks,
+                FileLogicalOffsets = fidx,
+                Blocks = blocks,
+                OuterBlockDigests = outerBlockDigests,
+            });
 
         return ProsperoNapsLayout.BuildLayout(doc);
     }

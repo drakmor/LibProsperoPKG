@@ -179,6 +179,13 @@ public sealed class ProsperoBuildOptions
     public IProsperoNapsIntegrityProvider? NapsIntegrityProvider { get; set; }
 
     /// <summary>
+    /// Optional exact path-to-AFID assignment for preserving a sparse publisher FIDX layout.
+    /// Paths are rooted at the inner user root (for example <c>/data/file.bin</c>). Missing slot
+    /// numbers become 256-KiB zero extents and <c>-1</c> AFID table entries.
+    /// </summary>
+    public IReadOnlyDictionary<string, uint>? PublisherAfidAssignments { get; set; }
+
+    /// <summary>
     /// Optional expected 32-byte publisher <c>pfs-image-key</c>. The library derives this
     /// value locally from primary id, passcode and seed; when supplied, it is treated as a
     /// known-answer vector and must match.
@@ -575,6 +582,7 @@ public static class ProsperoPackageBuilder
             NapsOuterBlockCmacKey = napsCmacKey,
             NapsMeta18 = napsMeta18,
             NapsIntegrityProvider = options.NapsIntegrityProvider,
+            PublisherAfidAssignments = options.PublisherAfidAssignments,
             NapsPfsImageKey = napsPfsImageKey,
             NapsPfsImageSeed = napsPfsImageSeed,
             PublisherImageKey = publisherImageKey,

@@ -295,11 +295,20 @@ public static class ProsperoNapsMeta
                     : inner is not null && i < inner.Placements.Count
                         ? checked((uint)PlacementBlockCount(inner.Placements[i]))
                         : 1u;
+                uint sparseBlocksBefore = !isMeta &&
+                    inner is not null && i < inner.Placements.Count
+                    ? checked((uint)inner.SparseAfidHoles.Count(
+                        hole => hole.Afid < inner.Placements[i].Afid))
+                    : 0u;
                 uint idx = isMeta && metaFirstBlockIndex >= 0
                     ? (uint)metaFirstBlockIndex
-                    : firstBlock;
+                    : checked(firstBlock + sparseBlocksBefore);
                 uint field10 = isMeta ? (uint)Meta300KindId : 0u;
-                uint flag = !isMeta && IsExecutableAfid(inner, i) ? 1u : 0u;
+                uint flag = !isMeta && inner is not null &&
+                    i < inner.Placements.Count &&
+                    IsExecutableAfid(inner, checked((int)inner.Placements[i].Afid))
+                    ? 1u
+                    : 0u;
                 ulong size = isMeta && inner is not null
                     ? (ulong)inner.MetadataPlaintext.Length
                     : (ulong)contentFiles[i].Size;
@@ -644,7 +653,7 @@ public static class ProsperoNapsMeta
     private readonly record struct Meta18Block(
         ulong Co, uint Cs, uint Ps, uint C0, uint C1, uint Flag,
         bool IsHole, uint OwnerFlag, ulong Tail, long OnDiskOffset, uint OnDiskLen,
-        ReadOnlyMemory<byte> Plaintext);
+        ReadOnlyMemory<byte> Plaintext, long LogicalOffset);
 
     private static int PlacementBlockCount(LibProsperoPkg.PFS.ProsperoPs5InnerPlacement placement)
     {
@@ -686,7 +695,7 @@ public static class ProsperoNapsMeta
         for (int i = 0; i < placements.Count; i++)
         {
             LibProsperoPkg.PFS.ProsperoPs5InnerPlacement p = placements[i];
-            uint ownerFlag = IsExecutableAfid(inner, i) ? 1u : 0u;
+            uint ownerFlag = IsExecutableAfid(inner, checked((int)p.Afid)) ? 1u : 0u;
             if (p.CompressionBlocks is { Count: > 0 } chunks)
             {
                 long onDisk = p.OnDiskOffset;
@@ -707,7 +716,8 @@ public static class ProsperoNapsMeta
                         Co: (ulong)onDisk, Cs: cs, Ps: ps, C0: c0, C1: c1,
                         Flag: flag, IsHole: false, OwnerFlag: ownerFlag, Tail: 0,
                         OnDiskOffset: onDisk, OnDiskLen: cs,
-                        Plaintext: p.PlainData.Slice(compressedPlainOffset, checked((int)ps))));
+                        Plaintext: p.PlainData.Slice(compressedPlainOffset, checked((int)ps)),
+                        LogicalOffset: checked(p.LogicalOffset + compressedPlainOffset)));
                     onDisk += cs;
                     compressedPlainOffset += checked((int)ps);
                 }
@@ -730,14 +740,33 @@ public static class ProsperoNapsMeta
                     Co: (ulong)onDisk, Cs: ps, Ps: ps, C0: c0, C1: c1,
                     Flag: 0x40090000u, IsHole: false, OwnerFlag: ownerFlag, Tail: 0,
                     OnDiskOffset: onDisk, OnDiskLen: ps,
-                    Plaintext: p.PlainData.Slice(checked((int)plainOffset), checked((int)ps))));
+                    Plaintext: p.PlainData.Slice(checked((int)plainOffset), checked((int)ps)),
+                    LogicalOffset: checked(p.LogicalOffset + plainOffset)));
                 plainOffset += ps;
                 if (ps == 0)
                     break;
             }
         }
 
-        // 2) data-region hole ublocks tiling [DataEndLogical, MetaBaseLogical) by 256 KiB. Each hole
+        // 2) Explicit sparse AFID slots. They are logical 256-KiB zero files interleaved with real
+        //    payload files and reuse the same physical block-info token.
+        foreach (LibProsperoPkg.PFS.ProsperoPs5SparseAfidHole hole in inner.SparseAfidHoles)
+        {
+            uint ps = checked((uint)hole.Size);
+            if (!zeroBlocks.TryGetValue(ps, out byte[]? zeroBlock))
+            {
+                zeroBlock = new byte[ps];
+                zeroBlocks[ps] = zeroBlock;
+            }
+            blocks.Add(new Meta18Block(
+                Co: checked((ulong)inner.BlockInfoOnDiskOffset),
+                Cs: 0x10, Ps: ps, C0: 8, C1: 8, Flag: 0x40110000u,
+                IsHole: true, OwnerFlag: 0, Tail: 0,
+                OnDiskOffset: 0, OnDiskLen: 0, Plaintext: zeroBlock,
+                LogicalOffset: hole.LogicalOffset));
+        }
+
+        // 3) data-region hole ublocks tiling [DataEndLogical, MetaBaseLogical) by 256 KiB. Each hole
         //    compresses to 0x10 bytes (two 8-byte 0x20000 sub-chunks); identical-plaintext holes reuse the
         //    same compressed offset (dedup, stride cs from BlockInfoOnDiskOffset). flag 0x40110000.
         long padding = inner.MetaBaseLogical - inner.DataEndLogical;
@@ -763,11 +792,12 @@ public static class ProsperoNapsMeta
                 blocks.Add(new Meta18Block(
                     Co: co, Cs: 0x10, Ps: ps, C0: 8, C1: 8, Flag: 0x40110000u,
                     IsHole: true, OwnerFlag: 0, Tail: Meta300KindId, OnDiskOffset: 0, OnDiskLen: 0,
-                    Plaintext: zeroBlock));
+                    Plaintext: zeroBlock,
+                    LogicalOffset: checked(inner.DataEndLogical + (long)k * Meta18UBlock)));
             }
         }
 
-        // 3) metadata ublocks: co = MetadataOnDiskOffset + cumulative cs; c0 = first sub-chunk, c1 = cs-c0
+        // 4) metadata ublocks: co = MetadataOnDiskOffset + cumulative cs; c0 = first sub-chunk, c1 = cs-c0
         //    (0 when single-sub-chunk); flag 0x40450000 (two sub-chunks) / 0x40050000 (one); ihsh tail 0x3E9.
         IReadOnlyList<LibProsperoPkg.PFS.ProsperoInnerMetaBlockChunk> metaChunks = inner.MetadataBlocks;
         if (metaChunks.Count == 0 && inner.MetadataPlaintext.Length > 0)
@@ -794,12 +824,13 @@ public static class ProsperoNapsMeta
                 Co: metaCursor, Cs: cs, Ps: (uint)ps, C0: c0, C1: c1, Flag: flag,
                 IsHole: false, OwnerFlag: 0, Tail: Meta300KindId,
                 OnDiskOffset: (long)metaCursor, OnDiskLen: cs,
-                Plaintext: inner.MetadataPlaintext.AsMemory(metaPlainOffset, ps)));
+                Plaintext: inner.MetadataPlaintext.AsMemory(metaPlainOffset, ps),
+                LogicalOffset: checked(inner.MetaBaseLogical + metaPlainOffset)));
             metaCursor += cs;
             metaPlainOffset += ps;
         }
 
-        return blocks;
+        return blocks.OrderBy(block => block.LogicalOffset).ToList();
     }
 
     // ihsh preimage for a hole block: the plaintext (zero-filled) block content of the covered plaintext

@@ -50,6 +50,8 @@ internal static class Program
                 "unpack" => UnpackFile(args),
                 "list" => ListPfs(args),
                 "inspect-file" => InspectPfsFile(args),
+                "analyze-afid" => AnalyzeAfid(args),
+                "export-afid-map" => ExportAfidMap(args),
                 "hash-flt" => HashFlatPath(args),
                 "verify-phuc" => VerifyPhuc(args),
                 "verify" => VerifyFolder(args),
@@ -301,9 +303,9 @@ internal static class Program
 
     private static int BuildPackage(string[] args)
     {
-        if (args.Length is < 5 or > 12)
+        if (args.Length is < 5 or > 13)
             throw new ArgumentException(
-                "build-pkg requires <source-dir> <output-dir> <content-id> <app|ac|al> [passcode] [naps-cmac-key-hex|-] [naps-meta-18-file|-] [metadata-private-key.pem|-] [outer-pfs-seed-hex|-] [deterministic] [strict].");
+                "build-pkg requires <source-dir> <output-dir> <content-id> <app|ac|al> [passcode] [naps-cmac-key-hex|-] [naps-meta-18-file|-] [metadata-private-key.pem|-] [outer-pfs-seed-hex|-] [deterministic] [strict] [afid=<map.tsv>].");
         ProsperoPackageMode mode = args[4].ToLowerInvariant() switch
         {
             "app" => ProsperoPackageMode.Application,
@@ -319,12 +321,29 @@ internal static class Program
         byte[]? outerPfsSeed = args.Length >= 10 && args[9] != "-"
             ? Convert.FromHexString(args[9])
             : null;
-        string[] modes = args.Skip(10).Select(value => value.ToLowerInvariant()).ToArray();
-        if (modes.Any(value => value is not ("deterministic" or "strict")) ||
+        string[] trailing = args.Skip(10).ToArray();
+        string[] afidArguments = trailing
+            .Where(value => value.StartsWith("afid=", StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        string[] modes = trailing
+            .Where(value => !value.StartsWith("afid=", StringComparison.OrdinalIgnoreCase))
+            .Select(value => value.ToLowerInvariant())
+            .ToArray();
+        if (afidArguments.Length > 1 ||
+            modes.Any(value => value is not ("deterministic" or "strict")) ||
             modes.Distinct(StringComparer.Ordinal).Count() != modes.Length)
         {
             throw new ArgumentException(
-                "Trailing build-pkg modes may contain 'deterministic' and/or 'strict' once each.");
+                "Trailing build-pkg options may contain 'deterministic', 'strict', and " +
+                "'afid=<map.tsv>' once each.");
+        }
+        IReadOnlyDictionary<string, uint>? afidAssignments = null;
+        if (afidArguments.Length == 1)
+        {
+            string afidPath = afidArguments[0]["afid=".Length..];
+            if (string.IsNullOrWhiteSpace(afidPath))
+                throw new ArgumentException("The afid= option requires a TSV path.");
+            afidAssignments = ProsperoAfidMap.Load(afidPath);
         }
         bool deterministic = modes.Contains("deterministic", StringComparer.Ordinal);
         bool strict = modes.Contains("strict", StringComparer.Ordinal);
@@ -344,6 +363,7 @@ internal static class Program
                 NapsMeta18 = napsMeta18,
                 MetadataSigner = metadataSigner,
                 OuterPfsSeed = outerPfsSeed,
+                PublisherAfidAssignments = afidAssignments,
                 DeterministicBuild = deterministic,
                 RequirePublisherCompatibility = strict,
             },
@@ -960,6 +980,58 @@ internal static class Program
         }
         Console.WriteLine("selftest: file-backed NAPS writer matches the in-memory writer");
 
+        byte[] shufflePlain = new byte[0x18000];
+        for (int i = 0; i < shufflePlain.Length / 8; i++)
+        {
+            BinaryPrimitives.WriteUInt32LittleEndian(
+                shufflePlain.AsSpan(i * 8, 4), checked((uint)i));
+            BinaryPrimitives.WriteUInt32LittleEndian(
+                shufflePlain.AsSpan(i * 8 + 4, 4), checked((uint)(i * 17)));
+        }
+        byte[] shuffled = ProsperoPfsShuffle.Shuffle(
+            shufflePlain, ProsperoPfsShufflePattern.Shuffle44);
+        ProsperoNapsBuildResult shuffledBuild = ProsperoNapsImage.Pack(
+            shuffled,
+            new ProsperoNapsBuildOptions
+            {
+                Compress = false,
+                VerifyRoundTrip = true,
+            });
+        NapsLayoutCounts shuffledCounts = shuffledBuild.Layout.Counts with
+        {
+            NumShufflePatterns = 1,
+        };
+        var shuffledCbi = shuffledBuild.Layout.CblockInfos
+            .Select(entry => !entry.IsRunBase && !entry.IsTerminal
+                ? entry with { ShuffleIdx = 0 }
+                : entry)
+            .ToList();
+        var shuffledLayout = new NapsLayoutDocument
+        {
+            Counts = shuffledCounts,
+            Map = ProsperoNapsLayout.SectionMap(shuffledCounts),
+            OuterBlockDigests = shuffledBuild.Layout.OuterBlockDigests,
+            ShufflePatterns = [new byte[] { 4, 4, 0, 0, 0, 0, 0, 0 }],
+            FileOffsets = shuffledBuild.Layout.FileOffsets,
+            CblockInfoOffsetByUblock =
+                shuffledBuild.Layout.CblockInfoOffsetByUblock,
+            CblockInfos = shuffledCbi,
+            TrailingZeroBytes = shuffledBuild.Layout.TrailingZeroBytes,
+        };
+        byte[] shuffledLayoutBytes = ProsperoNapsLayout.BuildLayout(shuffledLayout);
+        NapsLayoutDocument parsedShuffledLayout =
+            ProsperoNapsLayout.Parse(shuffledLayoutBytes);
+        using var shuffledPhysical =
+            new MemoryStream(shuffledBuild.PackedImage, writable: false);
+        using var deshuffledLogical = new MemoryStream();
+        ProsperoNapsImage.Decompress(
+            shuffledPhysical, parsedShuffledLayout, deshuffledLogical);
+        if (!deshuffledLogical.ToArray().AsSpan().SequenceEqual(shufflePlain))
+            throw new InvalidDataException(
+                "NAPS shuffle-pattern table was not reversed during decode.");
+        Console.WriteLine(
+            "selftest: NAPS compact shuffle table and stored-span deshuffle passed");
+
         const string complexGp5 = """
             <?xml version="1.0" encoding="utf-8"?>
             <psproject fmt="gp5" version="1000">
@@ -1225,6 +1297,155 @@ internal static class Program
                 throw new InvalidDataException(
                     "File-backed and in-memory specialized inner-image assemblers differ.");
             }
+
+            IReadOnlyList<ProsperoPs5InnerFile> sparseInnerFiles =
+            [
+                new ProsperoPs5InnerFile { Path = "/data/a.bin", Data = [0x41, 0x42] },
+                new ProsperoPs5InnerFile { Path = "/data/b.bin", Data = [0x51, 0x52, 0x53] },
+                new ProsperoPs5InnerFile { Path = "/data/c.bin", Data = [0x61] },
+            ];
+            var sparseAfids = new Dictionary<string, uint>(StringComparer.Ordinal)
+            {
+                ["/data/a.bin"] = 0,
+                ["/data/b.bin"] = 2,
+                ["/data/c.bin"] = 4,
+            };
+            ProsperoPs5InnerImageResult sparseInner =
+                new ProsperoPs5InnerImageAssembler(0, 0, sparseAfids)
+                    .Build(sparseInnerFiles);
+            if (sparseInner.AfidLogicalOffsets.Count != 5 ||
+                sparseInner.SparseAfidHoles.Count != 2 ||
+                sparseInner.SparseAfidHoles[0] !=
+                    new ProsperoPs5SparseAfidHole(1, 2, 0x40000) ||
+                sparseInner.SparseAfidHoles[1] !=
+                    new ProsperoPs5SparseAfidHole(3, 0x40005, 0x40000) ||
+                !sparseInner.Placements.Select(placement => placement.Afid)
+                    .SequenceEqual([0u, 2u, 4u]) ||
+                sparseInner.DataEndLogical != 0x80006)
+            {
+                throw new InvalidDataException(
+                    "Explicit sparse AFID assignments produced invalid logical geometry.");
+            }
+            ProsperoPs5MetaNode sparseAfidNode = sparseInner.Nodes.Single(
+                node => node.Name == "afid_to_ino_table");
+            int sparseAfidOffset = checked((int)(
+                (long)sparseAfidNode.LogicalOffset - sparseInner.MetaBaseLogical));
+            byte[] sparseAfidTable =
+                sparseInner.MetadataPlaintext.AsSpan(sparseAfidOffset).ToArray();
+            int[] sparseAfidValues = Enumerable.Range(0, 8)
+                .Select(index => BinaryPrimitives.ReadInt32LittleEndian(
+                    sparseAfidTable.AsSpan(index * 4, 4)))
+                .ToArray();
+            Dictionary<uint, int> sparseInodes = sparseInner.Nodes
+                .Where(node => !node.IsDirectory && node.ParentInode >= 0)
+                .ToDictionary(node => node.Afid, node => checked((int)node.Inode));
+            int[] expectedSparseAfidValues =
+            [
+                7,
+                sparseInodes[0], -1, sparseInodes[2], -1, sparseInodes[4],
+                -1, -1,
+            ];
+            if (!sparseAfidValues.AsSpan().SequenceEqual(expectedSparseAfidValues))
+                throw new InvalidDataException(
+                    "afid_to_ino_table did not serialize explicit empty slots.");
+
+            byte[] sparseNapsBytes = ProsperoNwonlyNapsGenerator.Generate(sparseInner);
+            NapsLayoutDocument sparseNaps = ProsperoNapsLayout.Parse(sparseNapsBytes);
+            using var sparsePhysical = new MemoryStream(sparseInner.Image, writable: false);
+            using var sparseLogical = new MemoryStream();
+            ProsperoNapsImage.Decompress(sparsePhysical, sparseNaps, sparseLogical);
+            byte[] sparseMount = sparseLogical.ToArray();
+            if (!sparseMount.AsSpan(0, 2).SequenceEqual(new byte[] { 0x41, 0x42 }) ||
+                sparseMount.AsSpan(2, 0x40000).IndexOfAnyExcept((byte)0) >= 0 ||
+                !sparseMount.AsSpan(0x40002, 3).SequenceEqual(
+                    new byte[] { 0x51, 0x52, 0x53 }) ||
+                sparseMount.AsSpan(0x40005, 0x40000).IndexOfAnyExcept((byte)0) >= 0 ||
+                sparseMount[0x80005] != 0x61)
+            {
+                throw new InvalidDataException(
+                    "NAPS sparse AFID zero extents did not reconstruct the logical mount.");
+            }
+            byte[] sparseMeta18 = ProsperoNapsMeta.BuildMeta18(
+                checked((ulong)sparseInner.ImageLength),
+                new byte[0x10000],
+                [
+                    ("data/a.bin", 2),
+                    ("data/b.bin", 3),
+                    ("data/c.bin", 1),
+                    ("*PFSmetadata", sparseInner.MetadataPlaintext.LongLength),
+                ],
+                inner: sparseInner);
+            byte[] sparseMetaPlain = ProsperoNapsMeta.DecryptMeta18(sparseMeta18);
+            byte[] sparseFileRecord = FindMeta18Record(sparseMetaPlain, "file");
+            byte[] sparseI2ob = FindMeta18Record(sparseMetaPlain, "i2ob");
+            uint[] expectedFirstBlocks = [0u, 2u, 4u];
+            for (int i = 0; i < expectedFirstBlocks.Length; i++)
+            {
+                uint firstBlock = BinaryPrimitives.ReadUInt32LittleEndian(
+                    sparseFileRecord.AsSpan(i * 0x18 + 0x08, 4));
+                if (firstBlock != expectedFirstBlocks[i])
+                    throw new InvalidDataException(
+                        $"Sparse naps_meta_18 file[{i}] starts at block {firstBlock}, " +
+                        $"expected {expectedFirstBlocks[i]}.");
+            }
+            foreach (int holeBlock in new[] { 1, 3 })
+            {
+                ReadOnlySpan<byte> entry = sparseI2ob.AsSpan(holeBlock * 0x28, 0x28);
+                if (BinaryPrimitives.ReadUInt32LittleEndian(entry.Slice(0x08, 4)) != 0x10 ||
+                    BinaryPrimitives.ReadUInt32LittleEndian(entry.Slice(0x0C, 4)) != 0x40000 ||
+                    BinaryPrimitives.ReadUInt32LittleEndian(entry.Slice(0x10, 4)) != 8 ||
+                    BinaryPrimitives.ReadUInt32LittleEndian(entry.Slice(0x14, 4)) != 8 ||
+                    BinaryPrimitives.ReadUInt32LittleEndian(entry.Slice(0x24, 4)) != 0x40110000)
+                {
+                    throw new InvalidDataException(
+                        $"Sparse naps_meta_18 i2ob[{holeBlock}] has invalid zero-extent geometry.");
+                }
+            }
+            using (var sparseMountStream = new MemoryStream(sparseMount, writable: false))
+            using (var sparseMountReader =
+                new LibProsperoPkg.Util.StreamReader(sparseMountStream))
+            {
+                var sparsePfs = new PfsReader(
+                    sparseMountReader,
+                    superblockOffset: sparseInner.MetaBaseLogical,
+                    encryptedDataAlreadyDecrypted: true);
+                IReadOnlyDictionary<string, uint> recoveredSparseAfids =
+                    ProsperoAfidMap.FromPfs(sparsePfs);
+                string sparseMapPath = Path.Combine(regressionRoot, "sparse-afids.tsv");
+                ProsperoAfidMap.Save(sparseMapPath, recoveredSparseAfids);
+                IReadOnlyDictionary<string, uint> loadedSparseAfids =
+                    ProsperoAfidMap.Load(sparseMapPath);
+                if (loadedSparseAfids.Count != sparseAfids.Count ||
+                    sparseAfids.Any(pair =>
+                        !loadedSparseAfids.TryGetValue(pair.Key, out uint afid) ||
+                        afid != pair.Value))
+                {
+                    throw new InvalidDataException(
+                        "Sparse AFID TSV export/import did not preserve path assignments.");
+                }
+                string invalidMapPath = Path.Combine(
+                    regressionRoot, "invalid-sparse-afids.tsv");
+                bool duplicateNormalizedPathRejected = false;
+                try
+                {
+                    ProsperoAfidMap.Save(
+                        invalidMapPath,
+                        new Dictionary<string, uint>(StringComparer.Ordinal)
+                        {
+                            ["/data/a.bin"] = 0,
+                            ["data/a.bin"] = 1,
+                        });
+                }
+                catch (InvalidDataException)
+                {
+                    duplicateNormalizedPathRejected = true;
+                }
+                if (!duplicateNormalizedPathRejected || File.Exists(invalidMapPath))
+                    throw new InvalidDataException(
+                        "AFID TSV writer accepted duplicate normalized paths or left a partial file.");
+            }
+            Console.WriteLine(
+                "selftest: sparse AFID/FIDX, NAPS/meta18 zero extents and TSV round trip passed");
 
             const string deterministicContentId = "IV9999-PPSA00000_00-DETERMINISTIC000";
             const string deterministicPasscode = "00000000000000000000000000000000";
@@ -2464,6 +2685,106 @@ internal static class Program
         return 0;
     }
 
+    private static int AnalyzeAfid(string[] args)
+    {
+        if (args.Length < 2)
+            throw new ArgumentException(
+                "analyze-afid requires <image.pfs> [--offset auto|0x0].");
+        Dictionary<string, string> options = ReadOptions(args, 2);
+        EnsureOnlyOptions(options, "offset");
+        long superblockOffset = ResolvePfsSuperblockOffset(args[1], options);
+
+        using var mapped = MemoryMappedFile.CreateFromFile(
+            args[1], FileMode.Open, mapName: null, capacity: 0, MemoryMappedFileAccess.Read);
+        using var view = mapped.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
+        var reader = new PfsReader(
+            view, superblockOffset, encryptedDataAlreadyDecrypted: true);
+        PfsReader.File afidTable =
+            reader.GetSuperRoot().Get("afid_to_ino_table") as PfsReader.File
+            ?? throw new InvalidDataException(
+                "The PFS super-root has no afid_to_ino_table file.");
+        byte[] bytes = afidTable.ReadAllBytes();
+        if (bytes.Length < 12 || bytes.Length % 4 != 0)
+            throw new InvalidDataException(
+                $"afid_to_ino_table has invalid size 0x{bytes.Length:X}.");
+        int count = BinaryPrimitives.ReadInt32LittleEndian(bytes);
+        if (count < 0 || count > bytes.Length / 4 - 1)
+            throw new InvalidDataException(
+                $"afid_to_ino_table declares invalid entry count {count}.");
+
+        Dictionary<uint, PfsReader.File> filesByInode = reader.GetAllFiles()
+            .ToDictionary(file => file.ino);
+        int[] entries = new int[count];
+        for (int i = 0; i < entries.Length; i++)
+            entries[i] = BinaryPrimitives.ReadInt32LittleEndian(
+                bytes.AsSpan(checked((i + 1) * 4)));
+
+        int realCount = entries.Count(value => value >= 0);
+        int holeCount = entries.Length - realCount;
+        Console.WriteLine(
+            $"summary\tentries={entries.Length}\treal={realCount}\tholes={holeCount}");
+        Console.WriteLine(
+            "afid\tprevious-afid\tprevious-end\tnext-offset\tgap\t" +
+            "previous-size\tprevious-path\tnext-size\tnext-path");
+        for (int i = 0; i < entries.Length; i++)
+        {
+            if (entries[i] >= 0)
+                continue;
+            int previousIndex = i - 1;
+            while (previousIndex >= 0 && entries[previousIndex] < 0)
+                previousIndex--;
+            int nextIndex = i + 1;
+            while (nextIndex < entries.Length && entries[nextIndex] < 0)
+                nextIndex++;
+            if (previousIndex < 0 || nextIndex >= entries.Length)
+            {
+                Console.WriteLine(
+                    $"{i}\t{previousIndex}\t-\t-\t-\t-\t<boundary>\t-\t<boundary>");
+                continue;
+            }
+            if (!filesByInode.TryGetValue(
+                    checked((uint)entries[previousIndex]), out PfsReader.File? previous) ||
+                !filesByInode.TryGetValue(
+                    checked((uint)entries[nextIndex]), out PfsReader.File? next))
+            {
+                throw new InvalidDataException(
+                    $"AFID {i} references an inode absent from the user tree.");
+            }
+            long previousEnd = checked(previous.offset + previous.size);
+            long gap = checked(next.offset - previousEnd);
+            Console.WriteLine(
+                $"{i}\t{previousIndex}\t0x{previousEnd:X}\t0x{next.offset:X}\t" +
+                $"0x{gap:X}\t{previous.size}\t{previous.FullName}\t" +
+                $"{next.size}\t{next.FullName}");
+        }
+        return 0;
+    }
+
+    private static int ExportAfidMap(string[] args)
+    {
+        if (args.Length < 3)
+            throw new ArgumentException(
+                "export-afid-map requires <image.pfs> <output.tsv> [--offset auto|0x0].");
+        Dictionary<string, string> options = ReadOptions(args, 3);
+        EnsureOnlyOptions(options, "offset");
+        long superblockOffset = ResolvePfsSuperblockOffset(args[1], options);
+
+        using var mapped = MemoryMappedFile.CreateFromFile(
+            args[1], FileMode.Open, mapName: null, capacity: 0, MemoryMappedFileAccess.Read);
+        using var view = mapped.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
+        var reader = new PfsReader(
+            view, superblockOffset, encryptedDataAlreadyDecrypted: true);
+        IReadOnlyDictionary<string, uint> assignments = ProsperoAfidMap.FromPfs(reader);
+        ProsperoAfidMap.Save(args[2], assignments);
+        uint slotCount = assignments.Count == 0
+            ? 0
+            : checked(assignments.Values.Max() + 1);
+        Console.WriteLine(
+            $"exported {assignments.Count} paths, {slotCount - assignments.Count} sparse slots " +
+            $"to {Path.GetFullPath(args[2])}");
+        return 0;
+    }
+
     private static long ResolvePfsSuperblockOffset(
         string imagePath,
         Dictionary<string, string> options)
@@ -3106,12 +3427,14 @@ internal static class Program
         Console.WriteLine("        [--exclude \"sce_sys/**;movies/*.mp4\"] [--only-if-smaller false]");
         Console.WriteLine("        [--classic true]   (alias for --layout classic)");
         Console.WriteLine("  build-publisher-artifacts <source-folder> <output-dir> <content-id> <passcode> [cmac-key-hex]");
-        Console.WriteLine("  build-pkg <source-dir> <output-dir> <content-id> <app|ac|al> [passcode] [naps-cmac-key-hex|-] [naps-meta-18-file|-] [metadata-private-key.pem|-] [outer-pfs-seed-hex|-] [deterministic] [strict]");
+        Console.WriteLine("  build-pkg <source-dir> <output-dir> <content-id> <app|ac|al> [passcode] [naps-cmac-key-hex|-] [naps-meta-18-file|-] [metadata-private-key.pem|-] [outer-pfs-seed-hex|-] [deterministic] [strict] [afid=<map.tsv>]");
         Console.WriteLine("  pack  <input-file> <output.pfsc> [--compression zlib|kraken|none] [--level N]");
         Console.WriteLine("        [--min-savings-percent 0]");
         Console.WriteLine("  unpack <input-or-image> <output-file> [--offset 0x0]");
         Console.WriteLine("  list <image.pfs> [--offset auto|0x0]");
         Console.WriteLine("  inspect-file <image.pfs> <path> [--offset auto|0x0]");
+        Console.WriteLine("  analyze-afid <image.pfs> [--offset auto|0x0]");
+        Console.WriteLine("  export-afid-map <image.pfs> <output.tsv> [--offset auto|0x0]");
         Console.WriteLine("  hash-flt <path> [path ...]");
         Console.WriteLine("  verify-phuc <image.phuc>");
         Console.WriteLine("  verify <source-folder> [the same build options]");

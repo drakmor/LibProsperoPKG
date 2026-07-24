@@ -194,6 +194,9 @@ public sealed class ProsperoPkgBuildProperties
     /// </summary>
     public IProsperoNapsIntegrityProvider? NapsIntegrityProvider { get; init; }
 
+    /// <summary>Optional exact path-to-AFID assignment used to preserve sparse publisher layouts.</summary>
+    public IReadOnlyDictionary<string, uint>? PublisherAfidAssignments { get; init; }
+
     /// <summary>
     /// Optional expected raw 32-byte publisher <c>pfs-image-key</c>. The builder derives this
     /// value locally from primary id, passcode and seed; a supplied value must match.
@@ -570,7 +573,8 @@ public static class ProsperoPkgBuilder
         string napsLayoutPath = publisherTempStem + ".naps_pkg_layout.dat";
         string outerImagePath = publisherTempStem + ".outer.pfs";
         ProsperoPs5InnerImageResult inner =
-            new ProsperoPs5InnerImageAssembler(fileTime, 0)
+            new ProsperoPs5InnerImageAssembler(
+                fileTime, 0, props.PublisherAfidAssignments)
                 .BuildFromFsTreeToFile(innerRoot, packedImagePath);
         byte[] napsLayout = ProsperoNwonlyNapsGenerator.Generate(
             inner,

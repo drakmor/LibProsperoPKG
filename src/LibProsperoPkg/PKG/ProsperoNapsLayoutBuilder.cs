@@ -43,10 +43,12 @@ public sealed class NapsCblockPlanEntry
     /// <summary>Odd-chunk-present flag (1 for every real block, 0 only for the terminator).</summary>
     public byte Odd { get; init; }
 
-    /// <summary>KDE predictor selector (raw-full=4, raw-partial=0, Kraken=2, padding=4).</summary>
+    /// <summary>KDE predictor selector. The verified Publishing Tools 2.79 profile uses zero.</summary>
     public byte KdePredictor { get; init; }
 
-    /// <summary>Shuffle-pattern index (0 except the two Kraken metadata blocks which use 2).</summary>
+    /// <summary>
+    /// Zero-based shuffle-pattern index; the value equal to the table count selects identity.
+    /// </summary>
     public byte ShuffleIndex { get; init; }
 
     /// <summary>True for the single trailing terminator block (special sentinel fields).</summary>
@@ -115,8 +117,8 @@ public sealed class NapsFilePlacement
     /// <summary>True when the file is stored raw (block-split), false when Kraken-compressed (single block).</summary>
     public required bool StoreRaw { get; init; }
 
-    /// <summary>KDE predictor for a compressed file's block (default 2 = Kraken).</summary>
-    public byte CompressedKde { get; init; } = 2;
+    /// <summary>KDE predictor for a compressed file's block (zero in the verified profile).</summary>
+    public byte CompressedKde { get; init; }
 
     /// <summary>Per-256 KiB compression blocks for a Kraken-compressed file.</summary>
     public IReadOnlyList<ProsperoInnerDataBlockChunk> CompressionBlocks { get; init; } = Array.Empty<ProsperoInnerDataBlockChunk>();

@@ -133,6 +133,10 @@ This document describes the current LibProsperoPkg package-building and reading 
 - PSAL (`prospero_al`, content type `0x22`) uses its distinct direct CNT+SI profile: no FIH, PFS, IMAGE_KEY, PlayGo descriptor, or NAPS image. The reference nine-entry table and `0x20000` CNT geometry are reproduced when supplied with `param.json`, icon, and the existing backend-authored `license.dat`/`license.info`.
 - Reproducible package output is available through `DeterministicBuild`. Build-option timestamps now default to Unix epoch (and remain explicitly overridable); the flag derives the outer-PFS seed from content id/passcode, uses valid deterministic PKCS#1 v1.5 padding for RSA-wrapped metadata, and relies on ordinal input ordering. Independent PSAL and APP/PPR-NAPS builds produced byte-identical PKGs. The default non-deterministic mode continues to use a cryptographic RNG for seed and RSA padding.
 - `PprPfsKrakenTool selftest` includes a full deterministic APP/PPR-NAPS regression. It creates equivalent source trees in opposite host creation order, independently builds both finalized packages, requires byte-for-byte equality, and parses the result as `FullDebug`. The source trees now also carry the fixed protected `selfinfo`/`imageinfo`/delta/`psreserved` records, named `pubtoolinfo.dat`, and nested `uds/npbind.dat`; the test checks their actual serialized ids, flags, key indexes, name-table policy, decryption, and byte-exact extraction.
+- The same regression now covers explicit sparse AFID slots through the inode table, FIDX, NAPS
+  deduplicated zero extents and `naps_meta_18` file/i2ob geometry; AFID TSV save/load rejects
+  ambiguous normalized paths before creating a partial sidecar. A separate synthetic NAPS vector
+  verifies compact zero-based shuffle-table serialization and deshuffling of a stored structured span.
 - High-level outer/inner extraction is file-backed. Outer AES-XTS is transformed one 64-KiB block at a time, the packed `pfs_image.dat` inode is exposed as a seekable stream to the NAPS decoder, and only individual extracted files are buffered by `PfsReader`. `DecryptOuterPfs(package, output, passcode)` and `DecodeInnerPfs(package, output, passcode)` provide large-image file overloads; the byte-array overloads remain for convenience.
 - Publisher artifact creation is also file-backed: `BuildFileBacked` streams NAPS in 256-KiB units, writes and hashes the outer PFS in 64-KiB units, and applies AES-XTS through temporary files with atomic final replacement. The normal `build-pkg` path uses the same file-backed outer writer and copies the result into CNT instead of retaining a second complete outer-image array.
 - The specialized publisher `ProsperoPs5InnerImageAssembler` now has `BuildToFile` and `BuildFromFsTreeToFile`. The normal package path writes each Kraken/stored payload to its final physical offset immediately, releases the compressed buffer, then appends block-info and metadata. NAPS CMAC, `obdg`, outer-PFS input, and optional integrity providers consume that file. The in-memory compatibility methods remain byte-identical. Per-file plaintext arrays are still retained because `ihsh/rhsh` construction consumes them.
@@ -161,9 +165,19 @@ This document describes the current LibProsperoPkg package-building and reading 
 - The native derivation/wrapping algorithm for the protected 0x800-byte publisher CNT `IMAGE_KEY` is not yet reproduced. Reference entries contain eight independent non-empty 0x100-byte regions; the older research fallback that concatenates RSA-3072 ciphertexts across this boundary is not treated as publisher-compatible. Exact bytes can be supplied through `PublisherImageKey` or `pkg_image_key.bin`, and strict mode requires them. Dynamic capture confirms that `sc2 --build` returns the complete CNT prefix: `ENTRY_KEYS` at `+0x2000`, `IMAGE_KEY` at `+0x2B80`, while `--fixup` changes only `body_digest` at `+0x160`, package digest at `+0xFE0`, and the RSA-3072 signature at `+0x1000`. Build probes further show that `ENTRY_KEYS` index 1 alone uses `primary-id`; its other six records and seed digest use `content-id`. This distinction is implemented by `KeysEntry`. `IMAGE_KEY` changes with primary id, passcode, and PFS-image seed, but not content id or entry digests; the exact eight-region wrapper remains open. `PublisherEntryKeys`/`pkg_entry_keys.bin` can preserve the complete 0xB80-byte wrapped-key record too. `ProsperoPublishingSidecar.ExportReusableInputs` and the `export-publisher-inputs` CLI command preserve both raw CNT entries plus SI `naps_meta_18.dat` for an exact rebuild of the same protected context; this is preservation, not derivation or portability to another entitlement.
 - Retail install-metadata archives are not implemented. The retail variant is encrypted and is not produced by the library.
 - On-console installation acceptance is not guaranteed. Library code verifies structure and round-tripping; acceptance depends on console mode and firmware.
-- The baseline NAPS streaming outer producer and direct CNT/FIH wiring are implemented. Reference-equivalent deduplication runs, predictor/shuffle selection, and update/base reuse remain.
+- The baseline NAPS streaming outer producer and direct CNT/FIH wiring are implemented. Sparse
+  AFID/FIDX preservation is supported through an explicit path-to-AFID map: missing numeric slots
+  become `-1` records and interleaved 256-KiB deduplicated zero extents in PFS, NAPS, and
+  `naps_meta_18`. `ProsperoAfidMap` exports/imports a stable TSV map, and `export-afid-map` reads it
+  from a decrypted reference image. Automatic reconstruction of an unavailable global publisher
+  manifest, KDE-predictor selection, and update/base reuse remain.
 - Publishing Tools 2.79 debug/AC does not enable keyed NAPS `OuterBlockDigest` generation: the config flag at `+0x70` remains zero, `PackageNAPSMetadataInsertCMAC` is skipped, and all stored eight-byte tags are zero. The separate 16-byte input at `+0x74` is used only when another caller explicitly enables that mode; it is not derived from EKPFS, the outer XTS pair, or the PFS sign key. Callers can still provide it through `OuterBlockCmacKey`.
-- The current NAPS decoder intentionally rejects non-zero `KdePredictor` and non-zero shuffle profiles. The tested publisher packages use predictor/shuffle zero; other publisher modes still require reference vectors and inverse transforms.
+- The NAPS decoder resolves the compact zero-based `ShuffleIdx` through the serialized 8-byte
+  shuffle-pattern table and reverses all 12 known non-identity field-width transforms after either a stored
+  or Kraken span. The value equal to the table count is the identity sentinel. Invalid indexes
+  and unknown descriptors fail explicitly. Non-zero
+  `KdePredictor` remains unsupported because the tested publisher packages use predictor zero
+  and no predictor reference vector is available.
 - PPR direct-offset inodes are decoded as a single contiguous extent. Additional tail fields or fragmented/extents profiles, if emitted for large/base/patch packages, still require corpus coverage.
 - The inner-PFS filter treats `sce_sys/param.json` as CNT entry 0x2000 explicitly. Unlike most
   outer system entries, it has no `EntryNames` enum mapping, so the earlier generic filter could
@@ -214,8 +228,8 @@ This document describes the current LibProsperoPkg package-building and reading 
 | Deterministic package build | Implemented for PSAL and APP/PPR-NAPS; independently repeated builds are byte-identical |
 | File-backed APP/PPR-NAPS extraction | Implemented; bounded outer-XTS memory and stream-to-file NAPS decode |
 | NAPS layout parser and serializer | Implemented; confirmed field semantics and strict validation |
-| NAPS image planner and decoder | Implemented for raw/Kraken publisher profiles with predictor/shuffle zero; tested end to end on six publisher packages |
-| NAPS streaming outer producer | Baseline monotonic Kraken/stored writer implemented, round-trip checked, and wired into CNT/FIH; dedup/shuffle/update profiles remain |
+| NAPS image planner and decoder | Implemented for raw/Kraken spans, sparse deduplicated zeros, identity and all 12 table-described non-identity shuffle transforms; non-zero KDE predictor still needs a reference vector |
+| NAPS streaming outer producer | Baseline monotonic Kraken/stored writer implemented and wired into CNT/FIH; explicit sparse AFID dedup-zero profiles round-trip, while KDE-predictor/shuffle selection and update/base reuse remain |
 | Retail install-metadata archive | Not implemented |
 | Retail finalized image (`0x80`) | Not implemented |
 | On-console acceptance guarantee | Not implemented; depends on console mode and firmware |

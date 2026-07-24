@@ -69,6 +69,13 @@ public sealed class ProsperoPs5InnerImageResult
     /// <summary>Per-file on-disk/logical placement (afid order), for naps generation.</summary>
     public IReadOnlyList<ProsperoPs5InnerPlacement> Placements { get; init; } = Array.Empty<ProsperoPs5InnerPlacement>();
 
+    /// <summary>
+    /// Explicit empty AFID slots. Each slot covers one logical 256-KiB zero extent and is represented
+    /// as <c>-1</c> in <c>afid_to_ino_table</c>.
+    /// </summary>
+    public IReadOnlyList<ProsperoPs5SparseAfidHole> SparseAfidHoles { get; init; } =
+        Array.Empty<ProsperoPs5SparseAfidHole>();
+
     /// <summary>On-disk byte offset of the block-info table (block 75).</summary>
     public long BlockInfoOnDiskOffset { get; init; }
 
@@ -95,6 +102,8 @@ public sealed class ProsperoPs5InnerImageResult
 /// <summary>One file's on-disk + logical placement in the assembled inner image (afid order).</summary>
 public readonly struct ProsperoPs5InnerPlacement
 {
+    /// <summary>AFID slot used by the inode/FIDX tables.</summary>
+    public uint Afid { get; init; }
     /// <summary>On-disk (compressed-image) byte offset.</summary>
     public long OnDiskOffset { get; init; }
     /// <summary>Uncompressed logical byte offset in the mount.</summary>
@@ -114,6 +123,10 @@ public readonly struct ProsperoPs5InnerPlacement
     /// <summary>Per-256 KiB Kraken/storage blocks when this file is stored compressed.</summary>
     public IReadOnlyList<ProsperoInnerDataBlockChunk>? CompressionBlocks { get; init; }
 }
+
+/// <summary>One intentionally empty AFID slot represented by a logical 256-KiB zero extent.</summary>
+public readonly record struct ProsperoPs5SparseAfidHole(
+    uint Afid, long LogicalOffset, long Size);
 
 /// <summary>Compression geometry for one 256 KiB logical block of an inner payload file.</summary>
 public readonly record struct ProsperoInnerDataBlockChunk(
@@ -137,13 +150,21 @@ public sealed class ProsperoPs5InnerImageAssembler
 
     private readonly long _timeSec;
     private readonly uint _timeNsec;
+    private readonly IReadOnlyDictionary<string, uint>? _explicitAfids;
 
     /// <param name="buildTimeSec">Build timestamp seconds (package c_date/c_time — a deterministic build input).</param>
     /// <param name="buildTimeNsec">Build timestamp nanoseconds fraction.</param>
-    public ProsperoPs5InnerImageAssembler(long buildTimeSec, uint buildTimeNsec)
+    /// <param name="explicitAfids">
+    /// Optional exact path-to-AFID map. Unassigned slot numbers become sparse 256-KiB zero extents.
+    /// </param>
+    public ProsperoPs5InnerImageAssembler(
+        long buildTimeSec,
+        uint buildTimeNsec,
+        IReadOnlyDictionary<string, uint>? explicitAfids = null)
     {
         _timeSec = buildTimeSec;
         _timeNsec = buildTimeNsec;
+        _explicitAfids = explicitAfids;
     }
 
     // ---- Internal tree model -----------------------------------------------------------------------
@@ -307,8 +328,70 @@ public sealed class ProsperoPs5InnerImageAssembler
                     afidOrder.Add(f);
         // Any files directly in uroot come after the sce_sys subtree, ordinal (already covered by the
         // loop above because uroot is in dirsPreOrder and is not under sce_sys).
-        for (uint a = 0; a < afidOrder.Count; a++)
-            afidOrder[(int)a].Afid = a;
+        List<FileNode?> afidSlots;
+        if (_explicitAfids is null)
+        {
+            afidSlots = afidOrder.Cast<FileNode?>().ToList();
+            for (uint a = 0; a < afidOrder.Count; a++)
+                afidOrder[(int)a].Afid = a;
+        }
+        else
+        {
+            var normalized = new Dictionary<string, uint>(StringComparer.Ordinal);
+            foreach ((string path, uint afid) in _explicitAfids)
+            {
+                string normalizedPath = NormalizeAfidPath(path);
+                if (!normalized.TryAdd(normalizedPath, afid))
+                    throw new InvalidDataException(
+                        $"The explicit AFID map contains duplicate path '{normalizedPath}'.");
+            }
+            if (normalized.Count != afidOrder.Count)
+                throw new InvalidDataException(
+                    $"The explicit AFID map contains {normalized.Count} paths but the inner image " +
+                    $"contains {afidOrder.Count} files.");
+
+            uint maxAfid = 0;
+            foreach (FileNode file in afidOrder)
+            {
+                if (!normalized.TryGetValue(file.FullPath, out uint afid))
+                    throw new InvalidDataException(
+                        $"The explicit AFID map has no assignment for '{file.FullPath}'.");
+                file.Afid = afid;
+                maxAfid = Math.Max(maxAfid, afid);
+            }
+            if (afidOrder.Count == 0)
+            {
+                afidSlots = [];
+            }
+            else
+            {
+                const uint MaxSupportedAfid = 10_000_000;
+                if (maxAfid > MaxSupportedAfid)
+                    throw new InvalidDataException(
+                        $"The explicit AFID map requires slot {maxAfid}, exceeding the supported " +
+                        $"{MaxSupportedAfid}-slot diagnostic limit.");
+                afidSlots = Enumerable.Repeat<FileNode?>(
+                    null, checked((int)maxAfid + 1)).ToList();
+                foreach (FileNode file in afidOrder)
+                {
+                    if (afidSlots[(int)file.Afid] is not null)
+                        throw new InvalidDataException(
+                            $"The explicit AFID map assigns slot {file.Afid} more than once.");
+                    afidSlots[(int)file.Afid] = file;
+                }
+            }
+        }
+        afidOrder = afidSlots
+            .Where(file => file is not null)
+            .Select(file => file!)
+            .ToList();
+
+        static string NormalizeAfidPath(string path)
+        {
+            ArgumentException.ThrowIfNullOrWhiteSpace(path);
+            string normalized = path.Trim().Replace('\\', '/');
+            return normalized.StartsWith('/') ? normalized : "/" + normalized;
+        }
 
         static int SystemAfidRank(FileNode file)
         {
@@ -326,13 +409,22 @@ public sealed class ProsperoPs5InnerImageAssembler
             : new FileStream(
                 outputPath, FileMode.Create, FileAccess.ReadWrite, FileShare.None,
                 bufferSize: 1 << 20, FileOptions.SequentialScan);
-        var afidOffsets = new long[afidOrder.Count];
+        var afidOffsets = new long[afidSlots.Count];
+        var sparseAfidHoles = new List<ProsperoPs5SparseAfidHole>();
         try
         {
-            foreach (var f in afidOrder)
+            for (int afid = 0; afid < afidSlots.Count; afid++)
             {
+                FileNode? f = afidSlots[afid];
+                afidOffsets[afid] = cursor;
+                if (f is null)
+                {
+                    sparseAfidHoles.Add(new ProsperoPs5SparseAfidHole(
+                        checked((uint)afid), cursor, 0x40000));
+                    cursor = checked(cursor + 0x40000);
+                    continue;
+                }
                 f.LogicalOffset = cursor;
-                afidOffsets[f.Afid] = cursor;
                 cursor += f.Data.Length;
                 // Keystone and executable modules are stored raw; every other file is Kraken-compressed and
                 // packed unless the compressed result does not save at least the store threshold. Compress once
@@ -400,7 +492,7 @@ public sealed class ProsperoPs5InnerImageAssembler
 
         // ---- 5. Build variable-size metadata payloads and resolve their logical extents. -----------
         List<byte[]> metadataPayloads = BuildMetadataPayloads(
-            dirsPreOrder, fileNodes, afidOrder,
+            dirsPreOrder, fileNodes, afidSlots,
             inodeFltInode, aprFltInode, afidTableInode, uroot);
 
         // ---- 6. Build the metadata nodes in inode order. ------------------------------------------
@@ -413,15 +505,14 @@ public sealed class ProsperoPs5InnerImageAssembler
 
         // ---- 8. Assemble the data-first image. ----------------------------------------------------
         byte[] image = BuildImage(
-            afidOrder, metaPlain, outputPath, fileBackedDataEnd,
+            afidOrder, metaPlain, cursor, outputPath, fileBackedDataEnd,
             out long imageLength, out long blockInfoOnDisk, out long metadataOnDisk,
             out byte[] compressedMeta, out var metaBlocks);
 
         long metaBaseLogical = ndblock * ProsperoPs5InnerImageBuilder.BlockSize - metaPlain.Length;
-        long dataEndLogical = afidOrder.Count == 0 ? 0
-            : afidOrder[^1].LogicalOffset + afidOrder[^1].Data.Length;
         var placements = afidOrder.Select(f => new ProsperoPs5InnerPlacement
         {
+            Afid = f.Afid,
             OnDiskOffset = f.OnDiskOffset,
             LogicalOffset = f.LogicalOffset,
             OnDiskSize = f.OnDiskSize,
@@ -441,11 +532,12 @@ public sealed class ProsperoPs5InnerImageAssembler
             Ndblock = ndblock,
             AfidLogicalOffsets = afidOffsets,
             Placements = placements,
+            SparseAfidHoles = sparseAfidHoles,
             BlockInfoOnDiskOffset = blockInfoOnDisk,
             MetadataOnDiskOffset = metadataOnDisk,
             CompressedMetadata = compressedMeta,
             MetadataBlocks = metaBlocks,
-            DataEndLogical = dataEndLogical,
+            DataEndLogical = cursor,
             MetaBaseLogical = metaBaseLogical,
         };
     }
@@ -706,7 +798,7 @@ public sealed class ProsperoPs5InnerImageAssembler
     // ---- Metadata plaintext + FLT + afid table -----------------------------------------------------
 
     private List<byte[]> BuildMetadataPayloads(
-        List<Dir> dirsPreOrder, List<FileNode> fileNodes, List<FileNode> afidOrder,
+        List<Dir> dirsPreOrder, List<FileNode> fileNodes, IReadOnlyList<FileNode?> afidSlots,
         uint inodeFltInode, uint aprFltInode, uint afidTableInode, Dir uroot)
     {
         // Flat-path tables. inode_flat_path_table = every path (files + dirs) -> {inode, dir flag, subtree
@@ -744,9 +836,10 @@ public sealed class ProsperoPs5InnerImageAssembler
         // NAPS FIDX stream: one nonterminal record per AFID payload, plus the block-info/hole
         // boundary and the metadata boundary.  The final mount boundary is excluded.  The same
         // value is stored in the publisher FIH +0x94/+0x98 fields.
-        int napsFileCount = checked(afidOrder.Count + 2);
+        int napsFileCount = checked(afidSlots.Count + 2);
         var afidTable = new List<int> { napsFileCount };
-        foreach (var f in afidOrder) afidTable.Add((int)f.Inode);
+        foreach (FileNode? file in afidSlots)
+            afidTable.Add(file is null ? -1 : checked((int)file.Inode));
         afidTable.Add(-1); afidTable.Add(-1);
         byte[] afidBytes = new byte[afidTable.Count * 4];
         for (int i = 0; i < afidTable.Count; i++)
@@ -813,7 +906,8 @@ public sealed class ProsperoPs5InnerImageAssembler
     }
 
     private byte[] BuildImage(
-        List<FileNode> afidOrder, byte[] metaPlain, string? outputPath, long prewrittenDataEnd,
+        List<FileNode> afidOrder, byte[] metaPlain, long logicalDataEnd,
+        string? outputPath, long prewrittenDataEnd,
         out long imageLength, out long blockInfoOnDisk, out long metadataOnDisk, out byte[] compressedMeta,
         out IReadOnlyList<ProsperoInnerMetaBlockChunk> metaBlocks)
     {
@@ -862,10 +956,7 @@ public sealed class ProsperoPs5InnerImageAssembler
         // The 256-byte block-info table sits between the data files and the metadata block,
         // block-aligned. Its final entry encodes the logical end of all afid payloads,
         // including sce_sys/pfs-version.dat.
-        long afidDataEnd = 0;
-        foreach (var f in afidOrder)
-            afidDataEnd += f.Data.Length;
-        byte[] blockInfo = BuildBlockInfoTable(afidDataEnd);
+        byte[] blockInfo = BuildBlockInfoTable(logicalDataEnd);
         pos = AlignUp(pos, BLK);
         blockInfoOnDisk = pos;
         pos += blockInfo.Length;
