@@ -58,6 +58,7 @@ The primary entry point.
 | `ProsperoPkgBuilder` | Build the outer PFS + `\x7FCNT` metadata container. |
 | `ProsperoPkgReader` | `DetectType(path/stream)` and `Read(path/stream)` for existing packages. |
 | `ProsperoPackageArchive` | High-level finalized-package reader. `DecryptOuterPfs` verifies/decrypts the outer image; `ExtractOuterFiles` extracts its files; `DecodeInnerPfs` resolves and decompresses NAPS into the logical PPR-PFS image; `ExtractInnerFiles` performs the full package-to-files operation. The `DecryptOuterPfs(package, output, passcode)` and `DecodeInnerPfs(package, output, passcode)` overloads are file-backed and support images larger than a managed array; high-level extraction uses that bounded-memory path automatically. |
+| `ProsperoPublishingSidecar` | Loads conventional protected publisher inputs next to the host executable. `ReadPublisherImageKey`, `TryReadNapsMeta18`, and `ExportReusableInputs` preserve raw `pkg_image_key.bin` and SI `naps_meta_18.dat` from an existing package for an exact rebuild of the same publisher context. They do not derive a new `IMAGE_KEY` or recover the separate `sc2 estimate` PFS-image key. |
 | `ProsperoPkgWriter` | Low-level container writer (`ProsperoPkgWriterEntry`, `ProsperoPkgWriterOptions`). |
 | `ProsperoFihBuilder` | Wrap a `\x7FCNT` into a finalized `\x7FFIH` debug image. |
 | `ProsperoPkgSigner` | RSA-3072 metadata signing and EKPFS/PFS key derivation. |

@@ -74,8 +74,8 @@ The bundled tool can select the filesystem layout independently from per-file co
 
 Compression can be `none`, `zlib`, or `kraken`. Kraken levels are `-4..9`; zlib levels are
 `0..9`. `-Exclude 'sce_sys/**','movies/*.mp4'` keeps matching files in the image but stores
-them raw. Direct-root `ppr + zlib` is rejected because it requires a separate PFSC v2 zlib
-writer; use the classic layout for zlib.
+them raw. Direct-root `ppr + zlib` is rejected because the runtime PFSv2/v3 container uses
+Kraken and is distinct from classic PFSC/zlib; use the classic layout for zlib.
 
 The dedicated PHUC command accepts either a prepared game folder or an existing `pfs_image.dat`.
 For an existing image it validates PFS v2, block geometry, encryption state, and the inner
@@ -195,6 +195,11 @@ the outer-PFS superblock at `+0x370`; a separately supplied `OuterPfsSeed` must 
 The protected CNT `IMAGE_KEY` can be supplied as `PublisherImageKey` or the raw
 `pkg_image_key.bin` sidecar; the built-in fallback preserves package geometry but is not
 claimed to reproduce the publisher/sc2 key wrapper.
+`naps_meta_18.dat` is likewise loaded automatically when placed next to the executable.
+For an exact rebuild of the same protected publisher context, run
+`export-publisher-inputs <reference.pkg> <sidecar-dir>` to preserve both blobs without
+manually locating the embedded CNT or SI ZIP. This does not recover the separate
+`sc2 estimate` PFS-image key and does not make an `IMAGE_KEY` portable to another entitlement.
 The verified Publishing Tools 2.79 debug/AC profile disables keyed NAPS outer-block CMAC and
 stores zero tags; `NapsOuterBlockCmacKey` remains available for other explicitly keyed profiles.
 Retail finalization and retail encrypted install metadata are not generated. A console running

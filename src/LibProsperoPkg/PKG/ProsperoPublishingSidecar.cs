@@ -2,7 +2,10 @@
 // Copyright (C) 2026 SvenGDK
 
 using System;
+using System.Collections.Generic;
 using System.IO;
+using System.IO.Compression;
+using System.Linq;
 
 namespace LibProsperoPkg.PKG;
 
@@ -27,6 +30,9 @@ public static class ProsperoPublishingSidecar
 
     /// <summary>Default raw 0x800-byte publisher CNT IMAGE_KEY sidecar.</summary>
     public const string PublisherImageKeyFileName = "pkg_image_key.bin";
+
+    /// <summary>Default publisher-authored encrypted NAPS metadata sidecar.</summary>
+    public const string NapsMeta18FileName = "naps_meta_18.dat";
 
     /// <summary>Returns the absolute sidecar directory used by default.</summary>
     public static string DefaultDirectory => Path.GetFullPath(AppContext.BaseDirectory);
@@ -78,6 +84,113 @@ public static class ProsperoPublishingSidecar
     /// <summary>Loads the raw 0x800-byte <c>pkg_image_key.bin</c> sidecar when present.</summary>
     public static byte[]? TryLoadPublisherImageKey(string? directory = null) =>
         TryLoadRawSidecar(PublisherImageKeyFileName, 0x800, directory);
+
+    /// <summary>
+    /// Loads a publisher-authored <c>naps_meta_18.dat</c> sidecar when present.
+    /// The payload is intentionally kept encrypted and is validated by the SI/NAPS parser later.
+    /// </summary>
+    public static byte[]? TryLoadNapsMeta18(string? directory = null)
+    {
+        string path = GetPath(NapsMeta18FileName, directory);
+        return File.Exists(path) ? File.ReadAllBytes(path) : null;
+    }
+
+    /// <summary>
+    /// Reads the protected raw 0x800-byte CNT <c>IMAGE_KEY</c> entry from an existing publisher
+    /// package. The bytes are not decrypted or rewrapped and can therefore be preserved exactly
+    /// when rebuilding the same publisher context.
+    /// </summary>
+    public static byte[] ReadPublisherImageKey(string packagePath)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(packagePath);
+        using var input = File.OpenRead(packagePath);
+        ProsperoPkg package = ProsperoPkgReader.Read(input);
+        ProsperoPkgEntry entry = package.Entries.SingleOrDefault(
+            candidate => candidate.RawId == (uint)EntryId.IMAGE_KEY)
+            ?? throw new InvalidDataException("The package does not contain a CNT IMAGE_KEY entry.");
+        if (entry.DataSize != 0x800)
+            throw new InvalidDataException(
+                $"Publisher CNT IMAGE_KEY must contain exactly 0x800 bytes, not 0x{entry.DataSize:X}.");
+
+        long cntBase = package.Fih is null ? 0 : checked((long)package.Fih.EmbeddedCntOffset);
+        long offset = checked(cntBase + entry.DataOffset);
+        if (offset < 0 || offset > input.Length - entry.DataSize)
+            throw new InvalidDataException("The CNT IMAGE_KEY range is outside the package.");
+
+        byte[] value = new byte[entry.DataSize];
+        input.Position = offset;
+        input.ReadExactly(value);
+        return value;
+    }
+
+    /// <summary>
+    /// Reads <c>common/etc/naps_meta_18.dat</c> from the trailing publisher SI ZIP.
+    /// Returns <see langword="null"/> when the package has no SI segment or that member is absent.
+    /// </summary>
+    public static byte[]? TryReadNapsMeta18(string packagePath)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(packagePath);
+        using var input = File.OpenRead(packagePath);
+        ProsperoPackageMap map = ProsperoPackageArchive.Inspect(input);
+        if (map.SupplementSize == 0)
+            return null;
+        if (map.SupplementSize > int.MaxValue)
+            throw new InvalidDataException("The package SI segment is too large to inspect in memory.");
+
+        byte[] supplement = new byte[checked((int)map.SupplementSize)];
+        input.Position = map.SupplementOffset;
+        input.ReadExactly(supplement);
+        using var memory = new MemoryStream(supplement, writable: false);
+        using var zip = new ZipArchive(memory, ZipArchiveMode.Read, leaveOpen: false);
+        ZipArchiveEntry? member = zip.Entries.SingleOrDefault(entry =>
+            string.Equals(
+                entry.FullName.Replace('\\', '/'),
+                "common/etc/naps_meta_18.dat",
+                StringComparison.OrdinalIgnoreCase));
+        if (member is null)
+            return null;
+        if (member.Length > int.MaxValue)
+            throw new InvalidDataException("The SI naps_meta_18.dat member is too large.");
+
+        using Stream source = member.Open();
+        using var result = new MemoryStream(checked((int)member.Length));
+        source.CopyTo(result);
+        return result.ToArray();
+    }
+
+    /// <summary>
+    /// Exports reusable protected publisher inputs from an existing package under their conventional
+    /// sidecar names. Existing files are rejected unless <paramref name="overwrite"/> is true.
+    /// This does not recover the separate <c>sc2 estimate</c> PFS-image key.
+    /// </summary>
+    public static IReadOnlyList<string> ExportReusableInputs(
+        string packagePath,
+        string outputDirectory,
+        bool overwrite = false)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(outputDirectory);
+        byte[] imageKey = ReadPublisherImageKey(packagePath);
+        byte[]? napsMeta18 = TryReadNapsMeta18(packagePath);
+        string directory = Path.GetFullPath(outputDirectory);
+        var outputs = new List<(string Path, byte[] Data)>
+        {
+            (Path.Combine(directory, PublisherImageKeyFileName), imageKey),
+        };
+        if (napsMeta18 is not null)
+            outputs.Add((Path.Combine(directory, NapsMeta18FileName), napsMeta18));
+
+        if (!overwrite)
+        {
+            string? existing = outputs.Select(output => output.Path).FirstOrDefault(File.Exists);
+            if (existing is not null)
+                throw new IOException($"Refusing to overwrite existing publisher sidecar: {existing}");
+        }
+
+        Directory.CreateDirectory(directory);
+        foreach ((string path, byte[] data) in outputs)
+            File.WriteAllBytes(path, data);
+        return outputs.Select(output => output.Path).ToArray();
+    }
 
     private static byte[]? TryLoadRawSidecar(string fileName, int expectedLength, string? directory)
     {

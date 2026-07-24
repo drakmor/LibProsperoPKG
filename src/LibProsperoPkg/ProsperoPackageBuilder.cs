@@ -475,6 +475,8 @@ public static class ProsperoPackageBuilder
         byte[]? napsPfsImageSeed = options.NapsPfsImageSeed;
         byte[]? publisherImageKey = options.PublisherImageKey
             ?? ProsperoPublishingSidecar.TryLoadPublisherImageKey();
+        byte[]? napsMeta18 = options.NapsMeta18
+            ?? ProsperoPublishingSidecar.TryLoadNapsMeta18();
         if (napsPfsImageKey is null && napsPfsImageSeed is null)
         {
             napsPfsImageKey = ProsperoPublishingSidecar.TryLoadNapsPfsImageKey();
@@ -505,6 +507,10 @@ public static class ProsperoPackageBuilder
             log(
                 $"Loaded {ProsperoPublishingSidecar.PublisherImageKeyFileName} from " +
                 $"{ProsperoPublishingSidecar.DefaultDirectory}.");
+        if (options.NapsMeta18 is null && napsMeta18 is not null)
+            log(
+                $"Loaded {ProsperoPublishingSidecar.NapsMeta18FileName} from " +
+                $"{ProsperoPublishingSidecar.DefaultDirectory}.");
 
         string finalPath = Path.Combine(options.OutputFolder, ComposePkgFileName(options.ContentId, options.Version));
         // PSAL is already a complete direct CNT+SI package and has no FIH/PFS layer.
@@ -530,7 +536,7 @@ public static class ProsperoPackageBuilder
             InnerCompression = options.InnerCompression,
             UsePublisherPprNaps = options.UsePublisherPprNaps,
             NapsOuterBlockCmacKey = napsCmacKey,
-            NapsMeta18 = options.NapsMeta18,
+            NapsMeta18 = napsMeta18,
             NapsIntegrityProvider = options.NapsIntegrityProvider,
             NapsPfsImageKey = napsPfsImageKey,
             NapsPfsImageSeed = napsPfsImageSeed,
@@ -550,7 +556,7 @@ public static class ProsperoPackageBuilder
             if (usesNaps && publisherImageKey is null)
                 missing.Add("a publisher-authored 0x800-byte IMAGE_KEY blob");
             if (usesNaps &&
-                options.NapsMeta18 is null &&
+                napsMeta18 is null &&
                 options.NapsIntegrityProvider is null &&
                 napsPfsImageKey is null)
             {
@@ -573,7 +579,7 @@ public static class ProsperoPackageBuilder
             warnings.Add(
                 "Publisher IMAGE_KEY blob was not supplied; the generated research fallback is not known to match the protected sc2 output.");
         if (usesNaps &&
-            options.NapsMeta18 is null &&
+            napsMeta18 is null &&
             options.NapsIntegrityProvider is null &&
             napsPfsImageKey is null)
         {

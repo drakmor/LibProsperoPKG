@@ -301,8 +301,7 @@ public static class ProsperoPackageArchive
         {
             if (!includeEncrypted && entry.Encrypted) continue;
             string? knownName = null;
-            if (entry.Encrypted && passcode is not null)
-                EntryNames.IdToName.TryGetValue((EntryId)entry.RawId, out knownName);
+            EntryNames.IdToName.TryGetValue((EntryId)entry.RawId, out knownName);
             string name = !string.IsNullOrWhiteSpace(entry.Name)
                 ? NormalizeRelativePath(entry.Name!)
                 : !string.IsNullOrWhiteSpace(knownName)

@@ -499,7 +499,9 @@ public static class ProsperoPfsLayout
         if (compression == PfsFileCompressionMethod.Zlib && options.CompressionLevel is < 0 or > 9)
             throw new ArgumentOutOfRangeException(nameof(options.CompressionLevel), "Zlib level must be in the range 0..9.");
         if (options.UsePublisherPprLayout && compression == PfsFileCompressionMethod.Zlib)
-            throw new NotSupportedException("The publisher direct-root layout requires PFSC v2 zlib, which is not implemented. Use --layout classic with zlib, or select kraken/none.");
+            throw new NotSupportedException(
+                "The publisher direct-root runtime format uses PFSv2/v3 Kraken, not the distinct " +
+                "classic PFSC/zlib container. Use --layout classic with zlib, or select kraken/none.");
     }
 
     private static Regex[] CompilePathGlobs(IReadOnlyCollection<string> patterns)

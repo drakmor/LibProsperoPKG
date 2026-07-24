@@ -77,6 +77,7 @@ internal static class Program
                 "extract-pkg-inner" => ExtractPackageInner(args),
                 "extract-pkg-cnt" => ExtractPackageCnt(args),
                 "extract-pkg-si" => ExtractPackageSi(args),
+                "export-publisher-inputs" => ExportPublisherInputs(args),
                 "probe-entry-crypto" => ProbeEntryCrypto(args),
                 "selftest" => SelfTest(args),
                 "selftest-large-outer" => SelfTestLargeOuter(args),
@@ -693,6 +694,25 @@ internal static class Program
         return 0;
     }
 
+    private static int ExportPublisherInputs(string[] args)
+    {
+        if (args.Length is < 3 or > 4 ||
+            (args.Length == 4 && !string.Equals(args[3], "--overwrite", StringComparison.Ordinal)))
+        {
+            throw new ArgumentException(
+                "export-publisher-inputs requires <package.pkg> <output-dir> [--overwrite].");
+        }
+
+        IReadOnlyList<string> paths = ProsperoPublishingSidecar.ExportReusableInputs(
+            args[1], args[2], overwrite: args.Length == 4);
+        foreach (string path in paths)
+            Console.WriteLine(path);
+        Console.WriteLine(
+            "Exported protected inputs for exact preservation; the separate sc2 estimate " +
+            "pfs-image-key cannot be recovered from the package.");
+        return 0;
+    }
+
     private static int ProbeEntryCrypto(string[] args)
     {
         if (args.Length != 4)
@@ -1209,6 +1229,34 @@ internal static class Program
             {
                 throw new InvalidDataException(
                     "Caller-supplied publisher IMAGE_KEY was not preserved verbatim.");
+            }
+            string exportedInputsDirectory = Path.Combine(regressionRoot, "exported-publisher-inputs");
+            IReadOnlyList<string> exportedInputs =
+                ProsperoPublishingSidecar.ExportReusableInputs(
+                    build1.OutputPath, exportedInputsDirectory);
+            string exportedImageKeyPath = Path.Combine(
+                exportedInputsDirectory, ProsperoPublishingSidecar.PublisherImageKeyFileName);
+            string exportedMeta18Path = Path.Combine(
+                exportedInputsDirectory, ProsperoPublishingSidecar.NapsMeta18FileName);
+            if (exportedInputs.Count != 2 ||
+                !File.ReadAllBytes(exportedImageKeyPath).AsSpan()
+                    .SequenceEqual(deterministicPublisherImageKey) ||
+                !File.Exists(exportedMeta18Path) ||
+                File.ReadAllBytes(exportedMeta18Path).Length == 0)
+            {
+                throw new InvalidDataException(
+                    "Publisher IMAGE_KEY/naps_meta_18 sidecar export did not preserve package inputs.");
+            }
+            string extractedCntDirectory = Path.Combine(regressionRoot, "extracted-cnt");
+            IReadOnlyList<string> extractedCntEntries =
+                ProsperoPackageArchive.ExtractCntEntries(
+                    build1.OutputPath, extractedCntDirectory, includeEncrypted: false);
+            if (!extractedCntEntries.Contains(".image_key", StringComparer.Ordinal) ||
+                !File.ReadAllBytes(Path.Combine(extractedCntDirectory, ".image_key")).AsSpan()
+                    .SequenceEqual(deterministicPublisherImageKey))
+            {
+                throw new InvalidDataException(
+                    "Known unencrypted CNT entry names were not resolved during raw extraction.");
             }
 
             string streamedOuterPath = Path.Combine(regressionRoot, "outer.pfs");
@@ -2490,6 +2538,7 @@ internal static class Program
         Console.WriteLine("  extract-pkg-inner <package.pkg> <output-dir> [passcode]");
         Console.WriteLine("  extract-pkg-cnt <package.pkg> <output-dir> [passcode]");
         Console.WriteLine("  extract-pkg-si <package.pkg> <output-dir>");
+        Console.WriteLine("  export-publisher-inputs <package.pkg> <output-dir> [--overwrite]");
         Console.WriteLine("  probe-entry-crypto <package.pkg> <entry-id-hex> <passcode>");
         Console.WriteLine("  selftest");
         Console.WriteLine("  selftest-large-outer");
