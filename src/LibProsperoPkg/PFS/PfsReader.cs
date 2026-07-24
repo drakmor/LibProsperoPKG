@@ -136,6 +136,18 @@ public class PfsReader
     public PfsReader(MemoryMappedViewAccessor r, ulong pfs_flags = 0, byte[] ekpfs = null, byte[] tweak = null, byte[] data = null)
     : this(new MemoryMappedViewAccessor_(r), pfs_flags, ekpfs, tweak, data, 0)
     { }
+    public PfsReader(
+        MemoryMappedViewAccessor r,
+        long superblockOffset,
+        bool encryptedDataAlreadyDecrypted = false,
+        ulong pfs_flags = 0,
+        byte[] ekpfs = null,
+        byte[] tweak = null,
+        byte[] data = null)
+        : this(
+            new MemoryMappedViewAccessor_(r), pfs_flags, ekpfs, tweak, data,
+            superblockOffset, encryptedDataAlreadyDecrypted)
+    { }
     public PfsReader(IMemoryReader r, ulong pfs_flags = 0, byte[] ekpfs = null, byte[] tweak = null, byte[] data = null, long superblockOffset = 0, bool encryptedDataAlreadyDecrypted = false)
     {
         if (superblockOffset < 0) throw new ArgumentOutOfRangeException(nameof(superblockOffset));

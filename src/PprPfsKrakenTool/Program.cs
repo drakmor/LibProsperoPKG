@@ -792,6 +792,40 @@ internal static class Program
         }
         Console.WriteLine("selftest: imagedigs.dat digest byte order passed");
 
+        List<ProsperoPs5MetaNode> inodeBoundaryNodes = Enumerable.Range(0, 391)
+            .Select(i => new ProsperoPs5MetaNode
+            {
+                Inode = (uint)i,
+                Mode = i == 390 ? (ushort)0x816D : (ushort)0x416D,
+                Nlink = 1,
+                Flags = 0x10,
+                Size = 1,
+                LogicalOffset = checked((ulong)i * ProsperoPs5InnerMetadata.BlockSize),
+            })
+            .ToList();
+        byte[] inodeBoundaryMetadata = new ProsperoPs5InnerMetadata(0, 0).Build(
+            inodeBoundaryNodes,
+            ndblock: 4,
+            [Array.Empty<byte>()]);
+        int secondInodeBlock = 2 * ProsperoPs5InnerMetadata.BlockSize;
+        if (inodeBoundaryMetadata.Length != 4 * ProsperoPs5InnerMetadata.BlockSize ||
+            BinaryPrimitives.ReadInt64LittleEndian(inodeBoundaryMetadata.AsSpan(0x40)) != 2 ||
+            BinaryPrimitives.ReadInt64LittleEndian(inodeBoundaryMetadata.AsSpan(0x58)) != 0x20000 ||
+            BinaryPrimitives.ReadInt64LittleEndian(inodeBoundaryMetadata.AsSpan(0xB0)) != 2 ||
+            BinaryPrimitives.ReadUInt16LittleEndian(
+                inodeBoundaryMetadata.AsSpan(secondInodeBlock)) != 0x816D ||
+            BinaryPrimitives.ReadUInt64LittleEndian(
+                inodeBoundaryMetadata.AsSpan(secondInodeBlock + 0x60)) !=
+                390UL * ProsperoPs5InnerMetadata.BlockSize ||
+            !inodeBoundaryMetadata.AsSpan(
+                    2 * ProsperoPs5InnerMetadata.BlockSize - 16, 16)
+                .SequenceEqual(new byte[16]))
+        {
+            throw new InvalidDataException(
+                "PPR inode table did not preserve the 390-inode block boundary.");
+        }
+        Console.WriteLine("selftest: multi-block PPR inode table geometry passed");
+
         byte[] cbcCfbPlaintext = Convert.FromHexString(
             "6BC1BEE22E409F96E93D7E117393172A" +
             "AE2D8A571E03AC9C9EB76FAC45AF8E51" +
@@ -1086,6 +1120,28 @@ internal static class Program
             ];
             var innerAssembler = new ProsperoPs5InnerImageAssembler(0, 0);
             ProsperoPs5InnerImageResult memoryInner = innerAssembler.Build(innerFiles);
+            int specializedInodeBlocks = checked(
+                (memoryInner.Nodes.Count + ProsperoPs5InnerMetadata.InodesPerBlock - 1) /
+                ProsperoPs5InnerMetadata.InodesPerBlock);
+            long specializedDataEndBlocks = checked(
+                (memoryInner.DataEndLogical + ProsperoPs5InnerMetadata.BlockSize - 1) /
+                ProsperoPs5InnerMetadata.BlockSize);
+            int trailingMetadataOffset = checked(
+                memoryInner.MetadataPlaintext.Length -
+                ProsperoPs5InnerMetadata.BlockSize);
+            if (memoryInner.MetaBaseLogical / ProsperoPs5InnerMetadata.BlockSize -
+                    specializedDataEndBlocks != 60 ||
+                BinaryPrimitives.ReadInt64LittleEndian(
+                    memoryInner.MetadataPlaintext.AsSpan(0x40)) != specializedInodeBlocks ||
+                memoryInner.MetadataPlaintext.LongLength !=
+                    memoryInner.Ndblock * ProsperoPs5InnerMetadata.BlockSize -
+                    memoryInner.MetaBaseLogical ||
+                memoryInner.MetadataPlaintext.AsSpan(trailingMetadataOffset)
+                    .IndexOfAnyExcept((byte)0) >= 0)
+            {
+                throw new InvalidDataException(
+                    "Specialized inner-image metadata reserve or inode geometry is invalid.");
+            }
             string fileInnerPath = Path.Combine(regressionRoot, "file-backed-inner.dat");
             ProsperoPs5InnerImageResult fileInner =
                 innerAssembler.BuildToFile(innerFiles, fileInnerPath);
@@ -2057,13 +2113,22 @@ internal static class Program
 
     private static int ListPfs(string[] args)
     {
-        if (args.Length != 2)
-            throw new ArgumentException("list requires <image.pfs>.");
+        if (args.Length < 2)
+            throw new ArgumentException("list requires <image.pfs> [--offset auto|0x0].");
+        Dictionary<string, string> options = ReadOptions(args, 2);
+        EnsureOnlyOptions(options, "offset");
+        long superblockOffset = ResolvePfsSuperblockOffset(args[1], options);
 
         using var mapped = MemoryMappedFile.CreateFromFile(
             args[1], FileMode.Open, mapName: null, capacity: 0, MemoryMappedFileAccess.Read);
         using var view = mapped.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
-        var reader = new PfsReader(view);
+        var reader = new PfsReader(
+            view, superblockOffset, encryptedDataAlreadyDecrypted: true);
+        Console.WriteLine($"superblock\t0x{superblockOffset:X}");
+        Console.WriteLine(
+            $"pfs\tversion={reader.Header.Version} mode=0x{(ushort)reader.Header.Mode:X4} " +
+            $"blocks={reader.Header.Ndblock} dinodes={reader.Header.DinodeCount} " +
+            $"dinode-blocks={reader.Header.DinodeBlockCount}");
         Console.WriteLine("state\tstored\tlogical\tpath");
         foreach (PfsReader.File file in reader.GetAllFiles().OrderBy(file => file.FullName, StringComparer.Ordinal))
         {
@@ -2075,15 +2140,54 @@ internal static class Program
         return 0;
     }
 
+    private static long ResolvePfsSuperblockOffset(
+        string imagePath,
+        Dictionary<string, string> options)
+    {
+        if (options.TryGetValue("offset", out string? requested) &&
+            !string.Equals(requested, "auto", StringComparison.OrdinalIgnoreCase))
+            return ParseLong(requested);
+
+        using var input = new FileStream(
+            imagePath, FileMode.Open, FileAccess.Read, FileShare.Read,
+            bufferSize: 4096, FileOptions.RandomAccess);
+        Span<byte> header = stackalloc byte[0x48];
+        long lastBlock = (input.Length - header.Length) & ~0xFFFFL;
+        for (long offset = lastBlock; offset >= 0; offset -= 0x10000)
+        {
+            input.Position = offset;
+            input.ReadExactly(header);
+            if (BinaryPrimitives.ReadInt64LittleEndian(header) != PfsHeader.VersionPs5 ||
+                BinaryPrimitives.ReadInt64LittleEndian(header[8..]) != 20130315 ||
+                BinaryPrimitives.ReadUInt32LittleEndian(header[0x20..]) != 0x10000)
+                continue;
+
+            long blocks = BinaryPrimitives.ReadInt64LittleEndian(header[0x38..]);
+            long dinodes = BinaryPrimitives.ReadInt64LittleEndian(header[0x30..]);
+            long inodeBlocks = BinaryPrimitives.ReadInt64LittleEndian(header[0x40..]);
+            if (blocks <= 0 || blocks > input.Length / 0x10000 ||
+                dinodes <= 0 || inodeBlocks <= 0)
+                continue;
+            return offset;
+        }
+        throw new InvalidDataException(
+            "No block-aligned PS5 PFS v2 superblock was found in the image.");
+    }
+
     private static int InspectPfsFile(string[] args)
     {
-        if (args.Length != 3)
-            throw new ArgumentException("inspect-file requires <image.pfs> and <path>.");
+        if (args.Length < 3)
+            throw new ArgumentException(
+                "inspect-file requires <image.pfs> <path> [--offset auto|0x0].");
+        Dictionary<string, string> options = ReadOptions(args, 3);
+        EnsureOnlyOptions(options, "offset");
+        long superblockOffset = ResolvePfsSuperblockOffset(args[1], options);
 
         using var mapped = MemoryMappedFile.CreateFromFile(
             args[1], FileMode.Open, mapName: null, capacity: 0, MemoryMappedFileAccess.Read);
         using var view = mapped.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
-        var reader = new PfsReader(view);
+        var reader = new PfsReader(
+            view, superblockOffset, encryptedDataAlreadyDecrypted: true);
         string imagePath = args[2].TrimStart('/', '\\');
         PfsReader.File file = reader.GetFile(imagePath)
             ?? throw new FileNotFoundException($"File is not present in the PFS image: {args[2]}");
@@ -2104,9 +2208,11 @@ internal static class Program
         if (!pfs.Mode.HasFlag(PfsMode.Signed))
         {
             const int inodeSize = 0xA8;
+            int inodesPerBlock = checked((int)pfs.BlockSize / inodeSize);
             var inode = new byte[inodeSize];
-            long inodeOffset = checked((long)pfs.InodeBlockSig.StartBlock * pfs.BlockSize
-                + file.ino * inodeSize);
+            long inodeOffset = checked(
+                ((long)pfs.InodeBlockSig.StartBlock + file.ino / inodesPerBlock) * pfs.BlockSize
+                + file.ino % inodesPerBlock * inodeSize);
             view.ReadArray(inodeOffset, inode, 0, inode.Length);
             Console.WriteLine($"inode.offset=0x{inodeOffset:X}");
             Console.WriteLine($"inode.mode=0x{BinaryPrimitives.ReadUInt16LittleEndian(inode.AsSpan(0x00)):X4}");
@@ -2115,8 +2221,18 @@ internal static class Program
             Console.WriteLine($"inode.size_compressed={BinaryPrimitives.ReadInt64LittleEndian(inode.AsSpan(0x10))}");
             Console.WriteLine($"inode.unk1=0x{BinaryPrimitives.ReadUInt64LittleEndian(inode.AsSpan(0x50)):X16}");
             Console.WriteLine($"inode.unk2=0x{BinaryPrimitives.ReadUInt64LittleEndian(inode.AsSpan(0x58)):X16}");
-            Console.WriteLine($"inode.blocks={BinaryPrimitives.ReadUInt32LittleEndian(inode.AsSpan(0x60))}");
-            Console.WriteLine($"inode.start_block={BinaryPrimitives.ReadInt32LittleEndian(inode.AsSpan(0x64))}");
+            if (pfs.Mode.HasFlag(PfsMode.PprDirectOffsets))
+            {
+                Console.WriteLine($"inode.data_offset=0x{BinaryPrimitives.ReadUInt64LittleEndian(inode.AsSpan(0x60)):X}");
+                Console.WriteLine($"inode.afid={BinaryPrimitives.ReadInt32LittleEndian(inode.AsSpan(0x68))}");
+                Console.WriteLine($"inode.parent={BinaryPrimitives.ReadInt32LittleEndian(inode.AsSpan(0x6C))}");
+                Console.WriteLine($"inode.dirent_offset={BinaryPrimitives.ReadInt32LittleEndian(inode.AsSpan(0x70))}");
+            }
+            else
+            {
+                Console.WriteLine($"inode.blocks={BinaryPrimitives.ReadUInt32LittleEndian(inode.AsSpan(0x60))}");
+                Console.WriteLine($"inode.start_block={BinaryPrimitives.ReadInt32LittleEndian(inode.AsSpan(0x64))}");
+            }
             Console.WriteLine($"inode.raw={Convert.ToHexString(inode)}");
         }
 
@@ -2670,8 +2786,8 @@ internal static class Program
         Console.WriteLine("  pack  <input-file> <output.pfsc> [--compression zlib|kraken|none] [--level N]");
         Console.WriteLine("        [--min-savings-percent 0]");
         Console.WriteLine("  unpack <input-or-image> <output-file> [--offset 0x0]");
-        Console.WriteLine("  list <image.pfs>");
-        Console.WriteLine("  inspect-file <image.pfs> <path>");
+        Console.WriteLine("  list <image.pfs> [--offset auto|0x0]");
+        Console.WriteLine("  inspect-file <image.pfs> <path> [--offset auto|0x0]");
         Console.WriteLine("  hash-flt <path> [path ...]");
         Console.WriteLine("  verify-phuc <image.phuc>");
         Console.WriteLine("  verify <source-folder> [the same build options]");

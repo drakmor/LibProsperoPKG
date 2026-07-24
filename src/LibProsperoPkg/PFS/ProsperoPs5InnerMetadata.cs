@@ -71,6 +71,8 @@ public sealed class ProsperoPs5InnerMetadata
 {
     /// <summary>The inner-image block size (64 KiB).</summary>
     public const int BlockSize = 0x10000;
+    public const int InodeSize = 0xA8;
+    public const int InodesPerBlock = BlockSize / InodeSize; // 390; 16 padding bytes per block.
 
     private readonly long _timeSec;
     private readonly uint _timeNsec;
@@ -105,7 +107,8 @@ public sealed class ProsperoPs5InnerMetadata
     }
 
     /// <summary>Builds the superblock block (block 0).</summary>
-    private byte[] BuildSuperblock(int inodeCount, long ndblock, long metadataStartBlock)
+    private byte[] BuildSuperblock(
+        int inodeCount, int inodeBlockCount, long ndblock, long metadataStartBlock)
     {
         byte[] sb = new byte[0x369];
         BinaryPrimitives.WriteInt64LittleEndian(sb, 2);                           // version
@@ -116,14 +119,16 @@ public sealed class ProsperoPs5InnerMetadata
         BinaryPrimitives.WriteInt64LittleEndian(sb.AsSpan(0x28), 1);              // NBlock
         BinaryPrimitives.WriteInt64LittleEndian(sb.AsSpan(0x30), inodeCount);     // DinodeCount
         BinaryPrimitives.WriteInt64LittleEndian(sb.AsSpan(0x38), ndblock);        // Ndblock
-        BinaryPrimitives.WriteInt64LittleEndian(sb.AsSpan(0x40), 1);              // DinodeBlockCount
-        BinaryPrimitives.WriteUInt32LittleEndian(sb.AsSpan(0x50), BlockSize);
-        BinaryPrimitives.WriteUInt32LittleEndian(sb.AsSpan(0x54), 0x10);
-        BinaryPrimitives.WriteUInt32LittleEndian(sb.AsSpan(0x58), BlockSize);
-        BinaryPrimitives.WriteUInt32LittleEndian(sb.AsSpan(0x60), BlockSize);
+        BinaryPrimitives.WriteInt64LittleEndian(sb.AsSpan(0x40), inodeBlockCount); // DinodeBlockCount
+        BinaryPrimitives.WriteUInt16LittleEndian(sb.AsSpan(0x50), 0);             // inode-table mode
+        BinaryPrimitives.WriteUInt16LittleEndian(sb.AsSpan(0x52), 1);             // nlink
+        BinaryPrimitives.WriteUInt32LittleEndian(sb.AsSpan(0x54), 0x10);          // readonly
+        long inodeTableSize = checked((long)inodeBlockCount * BlockSize);
+        BinaryPrimitives.WriteInt64LittleEndian(sb.AsSpan(0x58), inodeTableSize);
+        BinaryPrimitives.WriteInt64LittleEndian(sb.AsSpan(0x60), inodeTableSize);
         for (int t = 0; t < 4; t++) BinaryPrimitives.WriteInt64LittleEndian(sb.AsSpan(0x68 + t * 8), _timeSec);
         for (int t = 0; t < 4; t++) BinaryPrimitives.WriteUInt32LittleEndian(sb.AsSpan(0x88 + t * 4), _timeNsec);
-        BinaryPrimitives.WriteInt64LittleEndian(sb.AsSpan(0xb0), 1);
+        BinaryPrimitives.WriteInt64LittleEndian(sb.AsSpan(0xb0), inodeBlockCount);
         // InodeBlockSig.db[0].block: the inode table immediately follows this superblock.
         BinaryPrimitives.WriteInt64LittleEndian(sb.AsSpan(0xd8), checked(metadataStartBlock + 1));
         sb[0x368] = 1;
@@ -145,23 +150,42 @@ public sealed class ProsperoPs5InnerMetadata
     /// </summary>
     public byte[] Build(IReadOnlyList<ProsperoPs5MetaNode> inodes, long ndblock, IReadOnlyList<byte[]> blocks)
     {
-        int totalBlocks = 2 + blocks.Count;
+        int inodeBlockCount = checked((inodes.Count + InodesPerBlock - 1) / InodesPerBlock);
+        int payloadBlockCount = 0;
+        foreach (byte[] block in blocks)
+            payloadBlockCount = checked(payloadBlockCount + AllocatedBlocks(block.Length));
+        int totalBlocks = checked(1 + inodeBlockCount + payloadBlockCount);
         // round the number of blocks up so the metadata region is a whole number of blocks
         byte[] outBuf = new byte[totalBlocks * BlockSize];
         long metadataStartBlock = checked(ndblock - totalBlocks);
         if (metadataStartBlock < 0)
             throw new ArgumentException("Metadata region exceeds the declared inner mount.", nameof(ndblock));
 
-        BuildSuperblock(inodes.Count, ndblock, metadataStartBlock).CopyTo(outBuf, 0);
+        BuildSuperblock(inodes.Count, inodeBlockCount, ndblock, metadataStartBlock).CopyTo(outBuf, 0);
 
-        // inode table at block 1
+        // Inodes never straddle a block. 390 * 0xA8 = 0xFFF0, leaving 16 padding bytes
+        // at the end of every inode-table block.
         for (int i = 0; i < inodes.Count; i++)
-            WriteInode(outBuf.AsSpan(BlockSize + i * 0xA8, 0xA8), inodes[i]);
+        {
+            int inodeBlock = i / InodesPerBlock;
+            int inodeSlot = i % InodesPerBlock;
+            int offset = checked((1 + inodeBlock) * BlockSize + inodeSlot * InodeSize);
+            WriteInode(outBuf.AsSpan(offset, InodeSize), inodes[i]);
+        }
 
-        // remaining blocks
+        // Remaining metadata payloads are block-aligned extents. Large FLT/AFID tables and
+        // directories may occupy several consecutive blocks.
+        int payloadOffset = checked((1 + inodeBlockCount) * BlockSize);
         for (int b = 0; b < blocks.Count; b++)
-            blocks[b].CopyTo(outBuf, (2 + b) * BlockSize);
+        {
+            blocks[b].CopyTo(outBuf, payloadOffset);
+            payloadOffset = checked(
+                payloadOffset + AllocatedBlocks(blocks[b].Length) * BlockSize);
+        }
 
         return outBuf;
     }
+
+    private static int AllocatedBlocks(int length) =>
+        Math.Max(1, checked((length + BlockSize - 1) / BlockSize));
 }

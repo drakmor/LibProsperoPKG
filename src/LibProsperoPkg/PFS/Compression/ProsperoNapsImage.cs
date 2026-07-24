@@ -581,7 +581,13 @@ public static class ProsperoNapsImage
             pfsImage.ReadExactly(payload);
 
             var output = new byte[span.UncompressedLength];
-            if (span.CompressedLength == span.UncompressedLength)
+            if (IsDeduplicatedZeroSpan(span))
+            {
+                // NAPS represents a logical zero/hole ublock by pointing at the shared 16-byte
+                // block-info record.  The bytes at StoredOffset are a deduplication token, not a
+                // Kraken stream and must not be copied to the logical image.
+            }
+            else if (span.CompressedLength == span.UncompressedLength)
             {
                 payload.CopyTo(output, 0);
             }
@@ -600,6 +606,21 @@ public static class ProsperoNapsImage
             destination.Write(output);
         }
         destination.Position = 0;
+    }
+
+    private static bool IsDeduplicatedZeroSpan(ProsperoNapsSpan span)
+    {
+        // naps_meta_300 describes this form as flag 0x40110000, cs=0x10,
+        // c0=c1=8.  In CblockInfo that becomes modes 1/1 with no
+        // predictor/shuffle.  Requiring a logical size larger than the token keeps a legitimate
+        // 16-byte raw span from being mistaken for a hole.
+        return span.CompressedLength == 0x10
+            && span.FirstChunkCompressedLength == 8
+            && span.UncompressedLength > 0x10
+            && span.Even == 1
+            && span.Odd == 1
+            && span.KdePredictor == 0
+            && span.ShuffleIndex == 0;
     }
 
     private static int ResolveCblockInfoIndex(NapsLayoutDocument layout, long uncompressedOffset)

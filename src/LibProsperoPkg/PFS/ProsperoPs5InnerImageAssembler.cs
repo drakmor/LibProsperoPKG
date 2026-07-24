@@ -398,15 +398,20 @@ public sealed class ProsperoPs5InnerImageAssembler
         // ---- 4. Dirents (with byte offsets). -------------------------------------------------------
         BuildDirents(uroot);
 
-        // ---- 5. Build the metadata nodes in inode order. ------------------------------------------
-        var nodes = BuildNodes(uroot, dirsPreOrder, fileNodes, logicalDataBlocks,
-            superRootInode, inodeFltInode, aprFltInode, afidTableInode, out long ndblock);
-
-        // ---- 6. Build metadata plaintext. ----------------------------------------------------------
-        byte[] metaPlain = BuildMetadataPlaintext(nodes, dirsPreOrder, fileNodes, afidOrder, ndblock,
+        // ---- 5. Build variable-size metadata payloads and resolve their logical extents. -----------
+        List<byte[]> metadataPayloads = BuildMetadataPayloads(
+            dirsPreOrder, fileNodes, afidOrder,
             inodeFltInode, aprFltInode, afidTableInode, uroot);
 
-        // ---- 7. Assemble the data-first image. ----------------------------------------------------
+        // ---- 6. Build the metadata nodes in inode order. ------------------------------------------
+        var nodes = BuildNodes(uroot, dirsPreOrder, fileNodes, logicalDataBlocks,
+            superRootInode, inodeFltInode, aprFltInode, afidTableInode,
+            metadataPayloads, out long ndblock);
+
+        // ---- 7. Build metadata plaintext. ----------------------------------------------------------
+        byte[] metaPlain = BuildMetadataPlaintext(nodes, metadataPayloads, ndblock);
+
+        // ---- 8. Assemble the data-first image. ----------------------------------------------------
         byte[] image = BuildImage(
             afidOrder, metaPlain, outputPath, fileBackedDataEnd,
             out long imageLength, out long blockInfoOnDisk, out long metadataOnDisk,
@@ -569,34 +574,38 @@ public sealed class ProsperoPs5InnerImageAssembler
 
     private List<ProsperoPs5MetaNode> BuildNodes(
         Dir uroot, List<Dir> dirsPreOrder, List<FileNode> fileNodes, long logicalDataBlocks,
-        uint superRootInode, uint inodeFltInode, uint aprFltInode, uint afidTableInode, out long ndblock)
+        uint superRootInode, uint inodeFltInode, uint aprFltInode, uint afidTableInode,
+        IReadOnlyList<byte[]> metadataPayloads, out long ndblock)
     {
-        // Metadata-region layout (in the logical mount, after the data region): one block each for the
-        // super-root dirents, the inode/apr flat-path tables, the afid table, then every directory's
-        // dirent block (uroot, sub-directories in pre-order). Their logical offsets are consecutive
-        // 64 KiB blocks starting at the metadata-region base.
-        int metadataDataBlocks =
-            1 /*super-root dirents*/ + 3 /*flt/apr/afid*/ +
-            dirsPreOrder.Count /*dir dirents*/;
-        // Publisher reserves a minimum ten-block plaintext metadata window. Smaller trees are
-        // zero-padded to ten blocks; larger trees grow naturally instead of always gaining one
-        // extra trailing block.
-        const int MinimumMetadataBlocks = 10;
-        int metadataTotalBlocks = Math.Max(
-            MinimumMetadataBlocks,
-            2 /*superblock + inode table*/ + metadataDataBlocks);
-        // PFSv3 mount geometry: after the logical data region the mount leaves a fixed 61-block
-        // reserve plus the two-block pre-metadata gap observed in publisher images, then the metadata
-        // plaintext (superblock + inode table + payload blocks). The payload starts two blocks after the
-        // superblock. Ndblock is the end of the complete metadata region.
-        const long MetadataReserveBlocks = 61;
-        const long PreMetadataGapBlocks = 2;
-        long metadataStartBlock = logicalDataBlocks + MetadataReserveBlocks + PreMetadataGapBlocks;
-        long metadataPayloadStartBlock = metadataStartBlock + 2;
+        if (metadataPayloads.Count != 4 + dirsPreOrder.Count)
+            throw new InvalidDataException("Inner metadata payload count does not match the filesystem tree.");
+
+        static int PayloadBlocks(byte[] payload) =>
+            Math.Max(1, checked((payload.Length + BlockSize - 1) / BlockSize));
+        int metadataDataBlocks = metadataPayloads.Sum(PayloadBlocks);
+        int inodeCount = checked(4 + dirsPreOrder.Count + fileNodes.Count);
+        int inodeBlocks = checked(
+            (inodeCount + ProsperoPs5InnerMetadata.InodesPerBlock - 1) /
+            ProsperoPs5InnerMetadata.InodesPerBlock);
+        // The reference data-first image keeps 60 logical blocks between the aligned end of the
+        // AFID file extents and the superblock. Metadata consists of the superblock, the block-packed
+        // inode table, the variable payload extents, and one trailing reserved block.
+        const long MetadataReserveBlocks = 60;
+        const int TrailingMetadataBlocks = 1;
+        int metadataTotalBlocks = checked(
+            1 /* superblock */ + inodeBlocks + metadataDataBlocks + TrailingMetadataBlocks);
+        long metadataStartBlock = logicalDataBlocks + MetadataReserveBlocks;
+        long metadataPayloadStartBlock = metadataStartBlock + 1 + inodeBlocks;
         long metaBase = metadataPayloadStartBlock * BlockSize;
         ndblock = metadataStartBlock + metadataTotalBlocks;
 
+        var payloadOffsets = new long[metadataPayloads.Count];
         long b = metaBase;
+        for (int i = 0; i < metadataPayloads.Count; i++)
+        {
+            payloadOffsets[i] = b;
+            b = checked(b + (long)PayloadBlocks(metadataPayloads[i]) * BlockSize);
+        }
         var nodes = new List<ProsperoPs5MetaNode>();
 
         // inode 0: super-root directory.
@@ -608,23 +617,26 @@ public sealed class ProsperoPs5InnerImageAssembler
             Mode = 0x416d,
             Nlink = 1,
             Flags = 0x00020010,
-            Size = BlockSize,
-            LogicalOffset = (ulong)b,
+            Size = (long)PayloadBlocks(metadataPayloads[0]) * BlockSize,
+            LogicalOffset = (ulong)payloadOffsets[0],
             ParentInode = -1,
             DirentOffset = -1,
         });
-        b += BlockSize;
-
-        // inodes 1..3: the internal metadata files (flat-path tables + afid table). Sizes are filled in
-        // by BuildMetadataPlaintext; here we only need the logical offsets + inode fields. The names are the
-        // fixed PFS-internal identifiers (used for the pfsimage.xml introspection; not written as dirents).
-        nodes.Add(MetaFileNode(inodeFltInode, (ulong)b, 0x00020010, "inode_flat_path_table")); b += BlockSize;
-        nodes.Add(MetaFileNode(aprFltInode, (ulong)b, 0x00020010, "apr_flat_path_table")); b += BlockSize;
-        nodes.Add(MetaFileNode(afidTableInode, (ulong)b, 0x00020010, "afid_to_ino_table")); b += BlockSize;
+        // inodes 1..3: the internal metadata files (flat-path tables + afid table).
+        nodes.Add(MetaFileNode(
+            inodeFltInode, (ulong)payloadOffsets[1], metadataPayloads[1].LongLength,
+            0x00020010, "inode_flat_path_table"));
+        nodes.Add(MetaFileNode(
+            aprFltInode, (ulong)payloadOffsets[2], metadataPayloads[2].LongLength,
+            0x00020010, "apr_flat_path_table"));
+        nodes.Add(MetaFileNode(
+            afidTableInode, (ulong)payloadOffsets[3], metadataPayloads[3].LongLength,
+            0x00020010, "afid_to_ino_table"));
 
         // inode 4: uroot; then sub-directories pre-order.
-        foreach (var d in dirsPreOrder)
+        for (int dirIndex = 0; dirIndex < dirsPreOrder.Count; dirIndex++)
         {
+            Dir d = dirsPreOrder[dirIndex];
             bool isUroot = d == uroot;
             bool isSystemTree = d.FullPath.Equals("sce_sys", StringComparison.Ordinal)
                 || d.FullPath.StartsWith("sce_sys/", StringComparison.Ordinal);
@@ -639,12 +651,11 @@ public sealed class ProsperoPs5InnerImageAssembler
                 Mode = (ushort)(isUroot || !isSystemTree ? 0x416d : 0x4168),
                 Nlink = (ushort)(2 + d.SubDirs.Count + (isUroot ? 1 : 0)),
                 Flags = (uint)(isUroot || !isSystemTree ? 0x00000010 : 0x00020010),
-                Size = BlockSize,
-                LogicalOffset = (ulong)b,
+                Size = (long)PayloadBlocks(metadataPayloads[4 + dirIndex]) * BlockSize,
+                LogicalOffset = (ulong)payloadOffsets[4 + dirIndex],
                 ParentInode = isUroot ? -1 : (int)d.Parent!.Inode,
                 DirentOffset = isUroot ? -1 : d.DirentOffsetInParent,
             });
-            b += BlockSize;
         }
 
         // Regular files (inode order = fileNodes order).
@@ -674,7 +685,8 @@ public sealed class ProsperoPs5InnerImageAssembler
         return nodes.OrderBy(n => n.Inode).ToList();
     }
 
-    private ProsperoPs5MetaNode MetaFileNode(uint inode, ulong logOff, uint flags, string name = "") => new()
+    private ProsperoPs5MetaNode MetaFileNode(
+        uint inode, ulong logOff, long size, uint flags, string name = "") => new()
     {
         Name = name,
         Inode = inode,
@@ -682,6 +694,7 @@ public sealed class ProsperoPs5InnerImageAssembler
         Mode = 0x816d,
         Nlink = 1,
         Flags = flags,
+        Size = size,
         LogicalOffset = logOff,
         ParentInode = -1,
         DirentOffset = -1,
@@ -692,9 +705,8 @@ public sealed class ProsperoPs5InnerImageAssembler
 
     // ---- Metadata plaintext + FLT + afid table -----------------------------------------------------
 
-    private byte[] BuildMetadataPlaintext(
-        List<ProsperoPs5MetaNode> nodes, List<Dir> dirsPreOrder, List<FileNode> fileNodes,
-        List<FileNode> afidOrder, long ndblock,
+    private List<byte[]> BuildMetadataPayloads(
+        List<Dir> dirsPreOrder, List<FileNode> fileNodes, List<FileNode> afidOrder,
         uint inodeFltInode, uint aprFltInode, uint afidTableInode, Dir uroot)
     {
         // Flat-path tables. inode_flat_path_table = every path (files + dirs) -> {inode, dir flag, subtree
@@ -740,16 +752,8 @@ public sealed class ProsperoPs5InnerImageAssembler
         for (int i = 0; i < afidTable.Count; i++)
             BitConverter.GetBytes(afidTable[i]).CopyTo(afidBytes, i * 4);
 
-        // Fill in the internal-file sizes on their nodes.
-        foreach (var n in nodes)
-        {
-            if (n.Inode == inodeFltInode) n.Size = inodeFltBytes.Length;
-            else if (n.Inode == aprFltInode) n.Size = aprFltBytes.Length;
-            else if (n.Inode == afidTableInode) n.Size = afidBytes.Length;
-        }
-
-        // Ordered metadata blocks after the superblock (block 0) + inode table (block 1):
-        //   [super-root dirents][inode_flt][apr_flt][afid][uroot dirents][sub-dir dirents...][padding]
+        // Ordered block-aligned metadata extents after the superblock and inode table:
+        // [super-root dirents][inode_flt][apr_flt][afid][uroot dirents][sub-dir dirents...].
         var blocks = new List<byte[]>
         {
             DirentBytes(SuperRootDirents(inodeFltInode, aprFltInode, afidTableInode, uroot.Inode)),
@@ -757,12 +761,16 @@ public sealed class ProsperoPs5InnerImageAssembler
         };
         foreach (var d in dirsPreOrder)
             blocks.Add(DirentBytes(d.Dirents));
-        const int MinimumMetadataBlocks = 10;
-        while (2 + blocks.Count < MinimumMetadataBlocks)
-            blocks.Add(Array.Empty<byte>());
+        return blocks;
+    }
 
+    private byte[] BuildMetadataPlaintext(
+        List<ProsperoPs5MetaNode> nodes, List<byte[]> metadataPayloads, long ndblock)
+    {
+        // One final zero extent follows all variable metadata payloads in the reference image.
+        var extents = new List<byte[]>(metadataPayloads) { Array.Empty<byte>() };
         var meta = new ProsperoPs5InnerMetadata(_timeSec, _timeNsec);
-        return meta.Build(nodes, ndblock, blocks);
+        return meta.Build(nodes, ndblock, extents);
     }
 
     private static IEnumerable<PfsDirent> SuperRootDirents(uint inodeFlt, uint aprFlt, uint afid, uint uroot) => new[]
