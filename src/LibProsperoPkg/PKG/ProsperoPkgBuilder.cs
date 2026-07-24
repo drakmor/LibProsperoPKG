@@ -195,6 +195,9 @@ public sealed class ProsperoPkgBuildProperties
     /// </summary>
     public byte[]? NapsPfsImageSeed { get; init; }
 
+    /// <summary>Optional publisher-authored raw 0x800-byte CNT IMAGE_KEY entry.</summary>
+    public byte[]? PublisherImageKey { get; init; }
+
     /// <summary>
     /// Optional fixed 16-byte outer-PFS seed. When omitted, the seed is derived in
     /// <see cref="DeterministicBuild"/> mode and generated with a cryptographic RNG otherwise.
@@ -304,6 +307,9 @@ public static class ProsperoPkgBuilder
             throw new ArgumentException("NAPS pfs-image-key must contain exactly 32 bytes.", nameof(props));
         if (props.NapsPfsImageSeed is { Length: not 16 })
             throw new ArgumentException("NAPS pfs-image-seed must contain exactly 16 bytes.", nameof(props));
+        if (props.PublisherImageKey is { Length: not 0x800 })
+            throw new ArgumentException(
+                "Publisher IMAGE_KEY must contain exactly 0x800 bytes.", nameof(props));
         if (props.OuterPfsSeed is not null &&
             props.NapsPfsImageSeed is not null &&
             !props.OuterPfsSeed.AsSpan().SequenceEqual(props.NapsPfsImageSeed))
@@ -1105,7 +1111,8 @@ public static class ProsperoPkgBuilder
         byte[]? imageKeyBody = null;
         if (!noData && props.UsePublisherPprNaps)
         {
-            imageKeyBody = BuildPublisherImageKeyEntry(ekpfs, props.DeterministicBuild);
+            imageKeyBody = props.PublisherImageKey?.AsSpan().ToArray()
+                ?? BuildPublisherImageKeyEntry(ekpfs, props.DeterministicBuild);
         }
         else if (!noData)
         {
@@ -1203,9 +1210,11 @@ public static class ProsperoPkgBuilder
     }
 
     /// <summary>
-    /// Builds the publisher IMAGE_KEY payload. The 0x800-byte field consists of
-    /// repeated RSA-3072 PKCS#1-v1_5 wraps of EKPFS under mount_image.bin; the
-    /// final ciphertext is truncated at the fixed field boundary.
+    /// Builds the structural research fallback for the 0x800-byte publisher IMAGE_KEY payload.
+    /// The exact sc2 producer is not recovered: reference entries contain eight independent
+    /// 0x100-byte regions, while this legacy fallback concatenates RSA-3072 PKCS#1-v1_5 wraps
+    /// and necessarily truncates the final ciphertext. It is suitable only for internal
+    /// round-trip tests; publisher compatibility requires <see cref="ProsperoPkgBuildProperties.PublisherImageKey"/>.
     /// </summary>
     private static byte[] BuildPublisherImageKeyEntry(byte[] ekpfs, bool deterministic)
     {

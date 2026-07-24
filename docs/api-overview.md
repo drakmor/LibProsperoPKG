@@ -35,6 +35,8 @@ The primary entry point.
   options are omitted, raw `pfs_image_key.bin` and `pfs_image_seed.bin` sidecars next to the
   host executable are loaded together. `NapsPfsImageSeed` also becomes the outer-PFS
   superblock `+0x370` seed; an explicit `OuterPfsSeed` must contain the same bytes.
+  `PublisherImageKey` accepts an exact protected 0x800-byte CNT `IMAGE_KEY`, with
+  `pkg_image_key.bin` as its sidecar fallback.
 - **`ProsperoBuildResult`** — `OutputPath` and a list of non-fatal `Warnings`.
 - **`ProsperoPackageMode`** — `Application`, `Homebrew`, `AdditionalContentData`,
   `AdditionalContentNoData`.
@@ -82,6 +84,7 @@ The primary entry point.
   It is not required for the verified Publishing Tools 2.79 debug/AC profile, whose tags are zero.
   `NapsPfsImageKey`/`NapsPfsImageSeed` drive the built-in streaming `obcc` generator; the pair is
   distinct from the passcode-derived EKPFS.
+  `PublisherImageKey` preserves a publisher/sc2-authored 0x800-byte CNT key blob verbatim.
   Set
   `DeterministicBuild` to derive repeatable seeds and RSA padding for byte-identical debug/test
   packages; the default mode retains cryptographic randomness.

@@ -188,6 +188,14 @@ public sealed class ProsperoBuildOptions
     public byte[]? NapsPfsImageSeed { get; set; }
 
     /// <summary>
+    /// Optional publisher-authored raw <c>IMAGE_KEY</c> CNT entry (exactly <c>0x800</c> bytes).
+    /// Current publisher profiles produce this protected blob outside the ordinary passcode KDF.
+    /// When omitted, the library retains its structural research fallback, which is not claimed
+    /// to reproduce the native sc2 wrapper.
+    /// </summary>
+    public byte[]? PublisherImageKey { get; set; }
+
+    /// <summary>
     /// Optional fixed 16-byte outer-PFS seed. When omitted, the seed is derived in
     /// <see cref="DeterministicBuild"/> mode and generated with a cryptographic RNG otherwise.
     /// </summary>
@@ -419,6 +427,9 @@ public static class ProsperoPackageBuilder
             throw new ArgumentException("NAPS pfs-image-key must contain exactly 32 bytes.", nameof(options));
         if (options.NapsPfsImageSeed is { Length: not 16 })
             throw new ArgumentException("NAPS pfs-image-seed must contain exactly 16 bytes.", nameof(options));
+        if (options.PublisherImageKey is { Length: not 0x800 })
+            throw new ArgumentException(
+                "Publisher IMAGE_KEY must contain exactly 0x800 bytes.", nameof(options));
         if (options.OuterPfsSeed is not null &&
             options.NapsPfsImageSeed is not null &&
             !options.OuterPfsSeed.AsSpan().SequenceEqual(options.NapsPfsImageSeed))
@@ -462,6 +473,8 @@ public static class ProsperoPackageBuilder
             ?? ProsperoPublishingSidecar.TryLoadNapsCmacKey();
         byte[]? napsPfsImageKey = options.NapsPfsImageKey;
         byte[]? napsPfsImageSeed = options.NapsPfsImageSeed;
+        byte[]? publisherImageKey = options.PublisherImageKey
+            ?? ProsperoPublishingSidecar.TryLoadPublisherImageKey();
         if (napsPfsImageKey is null && napsPfsImageSeed is null)
         {
             napsPfsImageKey = ProsperoPublishingSidecar.TryLoadNapsPfsImageKey();
@@ -487,6 +500,10 @@ public static class ProsperoPackageBuilder
             log(
                 $"Loaded {ProsperoPublishingSidecar.NapsPfsImageKeyFileName} and " +
                 $"{ProsperoPublishingSidecar.NapsPfsImageSeedFileName} from " +
+                $"{ProsperoPublishingSidecar.DefaultDirectory}.");
+        if (options.PublisherImageKey is null && publisherImageKey is not null)
+            log(
+                $"Loaded {ProsperoPublishingSidecar.PublisherImageKeyFileName} from " +
                 $"{ProsperoPublishingSidecar.DefaultDirectory}.");
 
         string finalPath = Path.Combine(options.OutputFolder, ComposePkgFileName(options.ContentId, options.Version));
@@ -517,6 +534,7 @@ public static class ProsperoPackageBuilder
             NapsIntegrityProvider = options.NapsIntegrityProvider,
             NapsPfsImageKey = napsPfsImageKey,
             NapsPfsImageSeed = napsPfsImageSeed,
+            PublisherImageKey = publisherImageKey,
             OuterPfsSeed = options.OuterPfsSeed,
             DeterministicBuild = options.DeterministicBuild,
             MetadataSigner = metadataSigner,
@@ -529,6 +547,8 @@ public static class ProsperoPackageBuilder
             var missing = new List<string>();
             if (metadataSigner is null)
                 missing.Add("a caller-supplied trusted RSA-3072 metadata signer");
+            if (usesNaps && publisherImageKey is null)
+                missing.Add("a publisher-authored 0x800-byte IMAGE_KEY blob");
             if (usesNaps &&
                 options.NapsMeta18 is null &&
                 options.NapsIntegrityProvider is null &&
@@ -549,6 +569,9 @@ public static class ProsperoPackageBuilder
         if (metadataSigner is null)
             warnings.Add(
                 "Publisher metadata signer was not supplied; the embedded research RSA-3072 profile is not trusted by current prospero-pub-cmd builds.");
+        if (usesNaps && publisherImageKey is null)
+            warnings.Add(
+                "Publisher IMAGE_KEY blob was not supplied; the generated research fallback is not known to match the protected sc2 output.");
         if (usesNaps &&
             options.NapsMeta18 is null &&
             options.NapsIntegrityProvider is null &&

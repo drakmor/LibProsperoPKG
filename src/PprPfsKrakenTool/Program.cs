@@ -1077,6 +1077,10 @@ internal static class Program
                     "000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F");
             byte[] deterministicPfsImageSeed =
                 Convert.FromHexString("000102030405060708090A0B0C0D0E0F");
+            byte[] deterministicPublisherImageKey =
+                Enumerable.Range(0, 0x800)
+                    .Select(i => (byte)((i * 29 + 7) & 0xFF))
+                    .ToArray();
             ProsperoBuildResult build1 = ProsperoPackageBuilder.Build(
                 new ProsperoBuildOptions
                 {
@@ -1089,6 +1093,7 @@ internal static class Program
                     DeterministicBuild = true,
                     NapsPfsImageKey = deterministicPfsImageKey,
                     NapsPfsImageSeed = deterministicPfsImageSeed,
+                    PublisherImageKey = deterministicPublisherImageKey,
                 },
                 _ => { });
             ProsperoBuildResult build2 = ProsperoPackageBuilder.Build(
@@ -1103,6 +1108,7 @@ internal static class Program
                     DeterministicBuild = true,
                     NapsPfsImageKey = deterministicPfsImageKey,
                     NapsPfsImageSeed = deterministicPfsImageSeed,
+                    PublisherImageKey = deterministicPublisherImageKey,
                 },
                 _ => { });
 
@@ -1119,6 +1125,7 @@ internal static class Program
                         Passcode = deterministicPasscode,
                         NapsPfsImageKey = deterministicPfsImageKey,
                         NapsPfsImageSeed = deterministicPfsImageSeed,
+                        PublisherImageKey = deterministicPublisherImageKey,
                         RequirePublisherCompatibility = true,
                     },
                     _ => { });
@@ -1189,8 +1196,20 @@ internal static class Program
                     $"{Convert.ToHexString(ProsperoSha3.HashData(package1))} != " +
                     $"{Convert.ToHexString(ProsperoSha3.HashData(package2))}.");
             }
-            if (ProsperoPkgReader.Read(build1.OutputPath).Type != ProsperoPkgType.FullDebug)
+            ProsperoPkg parsedDeterministic = ProsperoPkgReader.Read(build1.OutputPath);
+            if (parsedDeterministic.Type != ProsperoPkgType.FullDebug)
                 throw new InvalidDataException("Deterministic APP regression package is not a finalized debug image.");
+            ProsperoPkgEntry deterministicImageKey = parsedDeterministic.Entries.Single(
+                entry => entry.RawId == 0x0020);
+            ulong deterministicCntBase = parsedDeterministic.Fih?.EmbeddedCntOffset ?? 0;
+            if (!package1.AsSpan(
+                    checked((int)(deterministicCntBase + deterministicImageKey.DataOffset)),
+                    checked((int)deterministicImageKey.DataSize))
+                    .SequenceEqual(deterministicPublisherImageKey))
+            {
+                throw new InvalidDataException(
+                    "Caller-supplied publisher IMAGE_KEY was not preserved verbatim.");
+            }
 
             string streamedOuterPath = Path.Combine(regressionRoot, "outer.pfs");
             ProsperoPackageArchive.DecryptOuterPfs(

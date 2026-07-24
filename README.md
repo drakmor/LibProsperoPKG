@@ -130,6 +130,8 @@ var options = new ProsperoBuildOptions
     // Optional sc2 estimate outputs for exact naps_meta_18 obcc generation:
     // NapsPfsImageKey  = File.ReadAllBytes("pfs_image_key.bin"),  // exactly 32 bytes
     // NapsPfsImageSeed = File.ReadAllBytes("pfs_image_seed.bin"), // exactly 16 bytes
+    // Optional protected CNT entry produced by the publisher/sc2 profile:
+    // PublisherImageKey = File.ReadAllBytes("pkg_image_key.bin"), // exactly 0x800 bytes
 };
 
 ProsperoBuildResult result = ProsperoPackageBuilder.Build(options, Console.WriteLine);
@@ -190,6 +192,9 @@ AES-128-XTS-encrypt + CRC32C pipeline; callers may pass the pair through
 `NapsPfsImageKey`/`NapsPfsImageSeed` or place raw `pfs_image_key.bin`/
 `pfs_image_seed.bin` sidecars next to the host executable. The image seed is also written to
 the outer-PFS superblock at `+0x370`; a separately supplied `OuterPfsSeed` must match it.
+The protected CNT `IMAGE_KEY` can be supplied as `PublisherImageKey` or the raw
+`pkg_image_key.bin` sidecar; the built-in fallback preserves package geometry but is not
+claimed to reproduce the publisher/sc2 key wrapper.
 The verified Publishing Tools 2.79 debug/AC profile disables keyed NAPS outer-block CMAC and
 stores zero tags; `NapsOuterBlockCmacKey` remains available for other explicitly keyed profiles.
 Retail finalization and retail encrypted install metadata are not generated. A console running

@@ -25,6 +25,9 @@ public static class ProsperoPublishingSidecar
     /// <summary>Default raw 16-byte publisher PFS image seed sidecar.</summary>
     public const string NapsPfsImageSeedFileName = "pfs_image_seed.bin";
 
+    /// <summary>Default raw 0x800-byte publisher CNT IMAGE_KEY sidecar.</summary>
+    public const string PublisherImageKeyFileName = "pkg_image_key.bin";
+
     /// <summary>Returns the absolute sidecar directory used by default.</summary>
     public static string DefaultDirectory => Path.GetFullPath(AppContext.BaseDirectory);
 
@@ -71,6 +74,10 @@ public static class ProsperoPublishingSidecar
     /// <summary>Loads the raw 16-byte <c>pfs_image_seed.bin</c> sidecar when present.</summary>
     public static byte[]? TryLoadNapsPfsImageSeed(string? directory = null) =>
         TryLoadRawSidecar(NapsPfsImageSeedFileName, 16, directory);
+
+    /// <summary>Loads the raw 0x800-byte <c>pkg_image_key.bin</c> sidecar when present.</summary>
+    public static byte[]? TryLoadPublisherImageKey(string? directory = null) =>
+        TryLoadRawSidecar(PublisherImageKeyFileName, 0x800, directory);
 
     private static byte[]? TryLoadRawSidecar(string fileName, int expectedLength, string? directory)
     {
