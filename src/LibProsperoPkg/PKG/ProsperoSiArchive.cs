@@ -107,6 +107,11 @@ public sealed class ProsperoPfsImageXmlOptions
     /// <summary>Content id, e.g. <c>IV9999-NPXS41139_00-XXXXXXXXXXXXXXXX</c>.</summary>
     public string ContentId { get; set; } = "";
 
+    /// <summary>
+    /// Primary package id. Defaults to <see cref="ContentId"/>.
+    /// </summary>
+    public string? PrimaryId { get; set; }
+
     /// <summary>Human-readable title (<c>&lt;titleName&gt;</c> / <c>&lt;chunkinfo&gt;</c>).</summary>
     public string TitleName { get; set; } = "";
 
@@ -571,7 +576,7 @@ public static class ProsperoSiArchive
         sb.Append("<package-configuration version=\"1.0\" type=\"package-info\">\n");
         sb.Append($"  <config version=\"{options.ContentVersion}\" metadata=\"0\" primary=\"yes\">\n");
         sb.Append($"    <content-id>{options.ContentId}</content-id>\n");
-        sb.Append($"    <primary-id>{options.ContentId}</primary-id>\n");
+        sb.Append($"    <primary-id>{options.PrimaryId ?? options.ContentId}</primary-id>\n");
         sb.Append($"    <longname>{longName}</longname>\n");
         sb.Append($"    <required-system-version>{options.RequiredSystemVersion}</required-system-version>\n");
         sb.Append($"    <drm-type>{options.DrmType}</drm-type>\n");

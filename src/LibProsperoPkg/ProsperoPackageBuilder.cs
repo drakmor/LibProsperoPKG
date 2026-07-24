@@ -103,6 +103,13 @@ public sealed class ProsperoBuildOptions
     /// <summary>36-character content id (e.g. <c>UP9000-PPSA00000_00-PROSPERO00000000</c>).</summary>
     public string ContentId { get; set; } = "";
 
+    /// <summary>
+    /// Optional 36-character primary package id. It is the identity used by publisher
+    /// <c>ENTRY_KEYS</c> index 1 and the PFS-image-key KDF, and defaults to
+    /// <see cref="ContentId"/>.
+    /// </summary>
+    public string? PrimaryId { get; set; }
+
     /// <summary>32-character passcode. Defaults to all zeroes.</summary>
     public string Passcode { get; set; } = new string('0', 32);
 
@@ -172,16 +179,15 @@ public sealed class ProsperoBuildOptions
     public IProsperoNapsIntegrityProvider? NapsIntegrityProvider { get; set; }
 
     /// <summary>
-    /// Optional raw 32-byte publisher <c>pfs-image-key</c> returned by the native
-    /// <c>sc2 estimate</c> step. Together with <see cref="NapsPfsImageSeed"/> it lets the
-    /// library generate the exact AES-XTS/CRC32C <c>obcc</c> table without a custom provider.
-    /// This key is distinct from the passcode-derived EKPFS.
+    /// Optional expected 32-byte publisher <c>pfs-image-key</c>. The library derives this
+    /// value locally from primary id, passcode and seed; when supplied, it is treated as a
+    /// known-answer vector and must match.
     /// </summary>
     public byte[]? NapsPfsImageKey { get; set; }
 
     /// <summary>
-    /// Optional raw 16-byte publisher <c>pfs-image-seed</c> paired with
-    /// <see cref="NapsPfsImageKey"/>. In the publisher profile this is also the outer-PFS seed
+    /// Optional raw 16-byte publisher <c>pfs-image-seed</c>. In the publisher profile this is
+    /// also the outer-PFS seed
     /// stored at superblock offset <c>+0x370</c>. If <see cref="OuterPfsSeed"/> is supplied too,
     /// both values must be identical.
     /// </summary>
@@ -424,11 +430,10 @@ public static class ProsperoPackageBuilder
             throw new ArgumentException("Passcode must be exactly 32 characters.", nameof(options));
         if (!IsValidContentId(options.ContentId))
             throw new ArgumentException("Content ID is not in the format XXYYYY-XXXXYYYYY_00-ZZZZZZZZZZZZZZZZ.", nameof(options));
+        if (options.PrimaryId is not null && !IsValidContentId(options.PrimaryId))
+            throw new ArgumentException("Primary ID is not in the format XXYYYY-XXXXYYYYY_00-ZZZZZZZZZZZZZZZZ.", nameof(options));
         if (options.OuterPfsSeed is { Length: not 16 })
             throw new ArgumentException("Outer PFS seed must contain exactly 16 bytes.", nameof(options));
-        if ((options.NapsPfsImageKey is null) != (options.NapsPfsImageSeed is null))
-            throw new ArgumentException(
-                "NAPS pfs-image-key and pfs-image-seed must be supplied together.", nameof(options));
         if (options.NapsPfsImageKey is { Length: not 32 })
             throw new ArgumentException("NAPS pfs-image-key must contain exactly 32 bytes.", nameof(options));
         if (options.NapsPfsImageSeed is { Length: not 16 })
@@ -445,6 +450,14 @@ public static class ProsperoPackageBuilder
         {
             throw new ArgumentException(
                 "OuterPfsSeed and NapsPfsImageSeed identify the same publisher superblock seed and must match.",
+                nameof(options));
+        }
+        if (options.NapsPfsImageKey is not null &&
+            options.NapsPfsImageSeed is null &&
+            options.OuterPfsSeed is null)
+        {
+            throw new ArgumentException(
+                "An expected NAPS pfs-image-key requires NapsPfsImageSeed or OuterPfsSeed.",
                 nameof(options));
         }
 
@@ -488,15 +501,13 @@ public static class ProsperoPackageBuilder
             ?? ProsperoPublishingSidecar.TryLoadPublisherEntryKeys();
         byte[]? napsMeta18 = options.NapsMeta18
             ?? ProsperoPublishingSidecar.TryLoadNapsMeta18();
-        if (napsPfsImageKey is null && napsPfsImageSeed is null)
+        if (napsPfsImageSeed is null)
+            napsPfsImageSeed = ProsperoPublishingSidecar.TryLoadNapsPfsImageSeed();
+        if (napsPfsImageKey is null &&
+            (napsPfsImageSeed is not null || options.OuterPfsSeed is not null))
         {
             napsPfsImageKey = ProsperoPublishingSidecar.TryLoadNapsPfsImageKey();
-            napsPfsImageSeed = ProsperoPublishingSidecar.TryLoadNapsPfsImageSeed();
         }
-        if ((napsPfsImageKey is null) != (napsPfsImageSeed is null))
-            throw new InvalidDataException(
-                $"Both {ProsperoPublishingSidecar.NapsPfsImageKeyFileName} and " +
-                $"{ProsperoPublishingSidecar.NapsPfsImageSeedFileName} must be present.");
         if (options.OuterPfsSeed is not null &&
             napsPfsImageSeed is not null &&
             !options.OuterPfsSeed.AsSpan().SequenceEqual(napsPfsImageSeed))
@@ -509,10 +520,13 @@ public static class ProsperoPackageBuilder
             log($"Loaded publisher metadata signer {sidecarSigner.ProfileName} from {ProsperoPublishingSidecar.DefaultDirectory}.");
         if (options.NapsOuterBlockCmacKey is null && napsCmacKey is not null)
             log($"Loaded {ProsperoPublishingSidecar.NapsCmacKeyFileName} from {ProsperoPublishingSidecar.DefaultDirectory}.");
+        if (options.NapsPfsImageSeed is null && napsPfsImageSeed is not null)
+            log(
+                $"Loaded {ProsperoPublishingSidecar.NapsPfsImageSeedFileName} from " +
+                $"{ProsperoPublishingSidecar.DefaultDirectory}.");
         if (options.NapsPfsImageKey is null && napsPfsImageKey is not null)
             log(
-                $"Loaded {ProsperoPublishingSidecar.NapsPfsImageKeyFileName} and " +
-                $"{ProsperoPublishingSidecar.NapsPfsImageSeedFileName} from " +
+                $"Loaded expected {ProsperoPublishingSidecar.NapsPfsImageKeyFileName} from " +
                 $"{ProsperoPublishingSidecar.DefaultDirectory}.");
         if (options.PublisherImageKey is null && publisherImageKey is not null)
             log(
@@ -544,6 +558,7 @@ public static class ProsperoPackageBuilder
         {
             SourceFolder = sourceFolder,
             ContentId = options.ContentId,
+            PrimaryId = options.PrimaryId,
             Passcode = options.Passcode,
             VolumeType = ProsperoVolumeTypeForMode(options.Mode),
             TimeStamp = options.TimeStamp,
@@ -571,15 +586,6 @@ public static class ProsperoPackageBuilder
                 missing.Add("a caller-supplied trusted RSA-3072 metadata signer");
             if (usesNaps && publisherImageKey is null)
                 missing.Add("a publisher-authored 0x800-byte IMAGE_KEY blob");
-            if (usesNaps &&
-                napsMeta18 is null &&
-                options.NapsIntegrityProvider is null &&
-                napsPfsImageKey is null)
-            {
-                missing.Add(
-                    "a publisher naps_meta_18 blob, NAPS obcc integrity provider, or " +
-                    "pfs-image-key/pfs-image-seed pair");
-            }
             if (missing.Count != 0)
                 throw new InvalidOperationException(
                     "Strict publisher compatibility requires " + string.Join(", ", missing) + ".");
@@ -594,14 +600,6 @@ public static class ProsperoPackageBuilder
         if (usesNaps && publisherImageKey is null)
             warnings.Add(
                 "Publisher IMAGE_KEY blob was not supplied; the generated research fallback is not known to match the protected sc2 output.");
-        if (usesNaps &&
-            napsMeta18 is null &&
-            options.NapsIntegrityProvider is null &&
-            napsPfsImageKey is null)
-        {
-            warnings.Add(
-                "NAPS pfs-image-key/pfs-image-seed pair was not supplied; ihsh/rhsh are generated exactly, while the AES-XTS-derived obcc table remains zero.");
-        }
         log("Building the PS5 package...");
         LibProsperoPkg.PKG.ProsperoPkgBuilder.Build(buildProps, cntPath, out byte[]? nestedImageDigest, out var siInputs, log);
 

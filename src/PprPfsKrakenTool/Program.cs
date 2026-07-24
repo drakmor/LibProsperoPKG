@@ -709,7 +709,7 @@ internal static class Program
             Console.WriteLine(path);
         Console.WriteLine(
             "Exported protected inputs for exact preservation; the separate sc2 estimate " +
-            "pfs-image-key cannot be recovered from the package.");
+            "pfs-image-key cannot be recovered from the package alone (the passcode is not stored).");
         return 0;
     }
 
@@ -943,6 +943,33 @@ internal static class Program
         deterministicKeys2.Write(keys2);
         if (!keys1.ToArray().AsSpan().SequenceEqual(keys2.ToArray()))
             throw new InvalidDataException("Deterministic RSA-wrapped ENTRY_KEYS differ.");
+        var distinctPrimaryKeys = new KeysEntry(
+            "IV9999-UMTX11110_00-XXXXXXXXXXXXXXXX",
+            "00000000000000000000000000000000",
+            publisherProfile: true,
+            deterministic: true,
+            primaryId: "IV9999-UMTX11111_00-XXXXXXXXXXXXXXXX");
+        using var primaryKeys = new MemoryStream();
+        distinctPrimaryKeys.Write(primaryKeys);
+        byte[] commonContext = keys1.ToArray();
+        byte[] primaryContext = primaryKeys.ToArray();
+        bool changedIndexOneDigest = false;
+        bool changedIndexOneCiphertext = false;
+        for (int i = 0; i < commonContext.Length; i++)
+        {
+            if (commonContext[i] == primaryContext[i])
+                continue;
+            if (i is >= 0x40 and < 0x60)
+                changedIndexOneDigest = true;
+            else if (i is >= 0x280 and < 0x400)
+                changedIndexOneCiphertext = true;
+            else
+                throw new InvalidDataException(
+                    $"Primary id unexpectedly changed ENTRY_KEYS at +0x{i:X}.");
+        }
+        if (!changedIndexOneDigest || !changedIndexOneCiphertext)
+            throw new InvalidDataException(
+                "Primary id did not select ENTRY_KEYS key index 1 exclusively.");
         keys1.Position = 0;
         KeysEntry parsedKeys = KeysEntry.Read(
             new MetaEntry { DataOffset = 0, DataSize = deterministicKeys1.Length }, keys1);
@@ -1092,11 +1119,36 @@ internal static class Program
                     "File-backed and in-memory outer-PFS writers produced different artifacts.");
             }
 
-            byte[] deterministicPfsImageKey =
-                Convert.FromHexString(
-                    "000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F");
             byte[] deterministicPfsImageSeed =
                 Convert.FromHexString("000102030405060708090A0B0C0D0E0F");
+            byte[] deterministicPfsImageKey =
+                ProsperoPfsKeys.DerivePublisherPfsImageKey(
+                    deterministicContentId, deterministicPasscode, deterministicPfsImageSeed);
+            byte[] publisherEstimateKat = ProsperoPfsKeys.DerivePublisherPfsImageKey(
+                "UP0006-PPSA08560_00-FULLGAMEUNLOCK00",
+                deterministicPasscode,
+                Convert.FromHexString("DBE696E18CCE59AC67FC923DD08FEB16"));
+            if (!publisherEstimateKat.AsSpan().SequenceEqual(
+                    Convert.FromHexString(
+                        "D874F0A9D8D1AFA9388EEA0F4898EF9BDBFDC27824A0C1BA6864FC18E3ED7785")))
+            {
+                throw new InvalidDataException(
+                    "Publisher pfs-image-key KDF does not match the captured sc2 2.79 estimate.");
+            }
+            string distinctPrimaryId = "IV9999-PPSA00001_00-DETERMINISTIC001";
+            string primaryIdXml = ProsperoSiArchive.BuildPfsImageXml(
+                new ProsperoPfsImageXmlOptions
+                {
+                    ContentId = deterministicContentId,
+                    PrimaryId = distinctPrimaryId,
+                });
+            if (!primaryIdXml.Contains(
+                    $"<primary-id>{distinctPrimaryId}</primary-id>",
+                    StringComparison.Ordinal))
+            {
+                throw new InvalidDataException(
+                    "pfsimage.xml did not preserve a primary id distinct from content id.");
+            }
             byte[] deterministicPublisherImageKey =
                 Enumerable.Range(0, 0x800)
                     .Select(i => (byte)((i * 29 + 7) & 0xFF))
@@ -1121,7 +1173,6 @@ internal static class Program
                     Mode = ProsperoPackageMode.Application,
                     Passcode = deterministicPasscode,
                     DeterministicBuild = true,
-                    NapsPfsImageKey = deterministicPfsImageKey,
                     NapsPfsImageSeed = deterministicPfsImageSeed,
                     PublisherImageKey = deterministicPublisherImageKey,
                     PublisherEntryKeys = deterministicPublisherEntryKeys,
@@ -1155,7 +1206,6 @@ internal static class Program
                         TitleId = "PPSA00000",
                         Mode = ProsperoPackageMode.Application,
                         Passcode = deterministicPasscode,
-                        NapsPfsImageKey = deterministicPfsImageKey,
                         NapsPfsImageSeed = deterministicPfsImageSeed,
                         PublisherImageKey = deterministicPublisherImageKey,
                         PublisherEntryKeys = deterministicPublisherEntryKeys,
@@ -1163,7 +1213,7 @@ internal static class Program
                     },
                     _ => { });
                 throw new InvalidDataException(
-                    "Strict publisher mode accepted a build without external signer/integrity inputs.");
+                    "Strict publisher mode accepted a build without an external signer.");
             }
             catch (InvalidOperationException ex) when (
                 ex.Message.StartsWith("Strict publisher compatibility requires", StringComparison.Ordinal))
@@ -1177,7 +1227,7 @@ internal static class Program
                     ex.Message.Contains("pfs-image-key", StringComparison.OrdinalIgnoreCase))
                 {
                     throw new InvalidDataException(
-                        "Strict publisher mode did not accept the complete PFS image key/seed pair.",
+                        "Strict publisher mode incorrectly requires an external PFS image key.",
                         ex);
                 }
             }

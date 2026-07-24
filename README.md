@@ -127,9 +127,11 @@ var options = new ProsperoBuildOptions
     // Optional only for a profile that explicitly enables keyed NAPS outer-block CMAC.
     // Publishing Tools 2.79 debug/AC leaves these tags zero by default:
     // NapsOuterBlockCmacKey = Convert.FromHexString("00112233445566778899AABBCCDDEEFF"),
-    // Optional sc2 estimate outputs for exact naps_meta_18 obcc generation:
-    // NapsPfsImageKey  = File.ReadAllBytes("pfs_image_key.bin"),  // exactly 32 bytes
+    // Optional fixed publisher seed. pfs-image-key is derived locally from
+    // PrimaryId (or ContentId), Passcode and this seed:
     // NapsPfsImageSeed = File.ReadAllBytes("pfs_image_seed.bin"), // exactly 16 bytes
+    // Optional sc2 known-answer vector; a mismatch aborts the build:
+    // NapsPfsImageKey  = File.ReadAllBytes("pfs_image_key.bin"),  // exactly 32 bytes
     // Optional protected CNT entries produced by the publisher/sc2 profile:
     // PublisherEntryKeys = File.ReadAllBytes("pkg_entry_keys.bin"), // exactly 0xB80 bytes
     // PublisherImageKey = File.ReadAllBytes("pkg_image_key.bin"), // exactly 0x800 bytes
@@ -187,11 +189,15 @@ See **[docs/](docs/)** for the full feature status and the PS5 package technical
 LibProsperoPkg produces a complete, self-consistent package whose CNT/FIH digests, outer PFS,
 NAPS mapping, inner PPR-PFS, and debug install metadata round-trip through the reader. Exact
 publisher acceptance still depends on external protected inputs: a trusted RSA-3072 metadata
-signer, the `sc2 estimate` PFS image key/seed pair, and (for AC/AL) a backend-authored license.
+signer, the protected `IMAGE_KEY`/`ENTRY_KEYS` context, and (for AC/AL) a backend-authored license.
 The `obcc` transform itself is implemented exactly as the recovered HMAC-SHA256 +
-AES-128-XTS-encrypt + CRC32C pipeline; callers may pass the pair through
-`NapsPfsImageKey`/`NapsPfsImageSeed` or place raw `pfs_image_key.bin`/
-`pfs_image_seed.bin` sidecars next to the host executable. The image seed is also written to
+AES-128-XTS-encrypt + CRC32C pipeline. The builder derives the `sc2 estimate`
+`pfs-image-key` locally as
+`HMAC-SHA256(EKPFS(PrimaryId, Passcode), NapsPfsImageSeed)`. `PrimaryId` defaults to
+`ContentId`; callers should set it explicitly for base/update profiles where they differ.
+`NapsPfsImageSeed` may be supplied directly or through `pfs_image_seed.bin`; otherwise it
+uses the effective outer seed. `NapsPfsImageKey`/`pfs_image_key.bin` is now an optional
+known-answer vector rather than a required secret input. The image seed is also written to
 the outer-PFS superblock at `+0x370`; a separately supplied `OuterPfsSeed` must match it.
 The protected CNT `IMAGE_KEY` can be supplied as `PublisherImageKey` or the raw
 `pkg_image_key.bin` sidecar; the built-in fallback preserves package geometry but is not
@@ -201,7 +207,9 @@ For an exact rebuild of the same protected publisher context, run
 `export-publisher-inputs <reference.pkg> <sidecar-dir>` to preserve `ENTRY_KEYS`,
 `IMAGE_KEY`, and `naps_meta_18` without
 manually locating the embedded CNT or SI ZIP. This does not recover the separate
-`sc2 estimate` PFS-image key and does not make an `IMAGE_KEY` portable to another entitlement.
+`sc2 estimate` PFS-image key from the package alone because its passcode is not stored, but
+the builder computes it when primary id, passcode and seed are known. It does not make an
+`IMAGE_KEY` portable to another entitlement.
 The verified Publishing Tools 2.79 debug/AC profile disables keyed NAPS outer-block CMAC and
 stores zero tags; `NapsOuterBlockCmacKey` remains available for other explicitly keyed profiles.
 Retail finalization and retail encrypted install metadata are not generated. A console running

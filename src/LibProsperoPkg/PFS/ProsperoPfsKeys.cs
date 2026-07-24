@@ -9,6 +9,7 @@
 #nullable enable
 using LibProsperoPkg.Util;
 using System;
+using System.Security.Cryptography;
 
 namespace LibProsperoPkg.PFS;
 
@@ -29,6 +30,21 @@ public static class ProsperoPfsKeys
         ArgumentNullException.ThrowIfNull(contentId);
         ArgumentNullException.ThrowIfNull(passcode);
         return Crypto.ComputeKeys(contentId, passcode, EkpfsIndex, useSha3: true);
+    }
+
+    /// <summary>
+    /// Reproduces the 32-byte <c>pfs-image-key</c> returned by
+    /// <c>sc2 --estimate</c>:
+    /// <c>HMAC-SHA256(EKPFS(primaryId, passcode), pfsImageSeed)</c>.
+    /// </summary>
+    public static byte[] DerivePublisherPfsImageKey(
+        string primaryId,
+        string passcode,
+        byte[] pfsImageSeed)
+    {
+        ValidateSeed(pfsImageSeed);
+        byte[] ekpfs = DeriveEkpfs(primaryId, passcode);
+        return HMACSHA256.HashData(ekpfs, pfsImageSeed);
     }
 
     /// <summary>

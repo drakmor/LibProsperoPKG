@@ -26,14 +26,15 @@ The primary entry point.
 ### Supporting types
 
 - **`ProsperoBuildOptions`** — the build description: `Mode`, `OutputFormat`, `SourceFolder`,
-  `OutputFolder`, `ContentId`, `Passcode`, `Title`, `TitleId`, `Version`,
+  `OutputFolder`, `ContentId`, optional `PrimaryId`, `Passcode`, `Title`, `TitleId`, `Version`,
   `GenerateParamJsonIfMissing`, `CompressInnerImage`, `InnerCompression`, `UsePublisherPprNaps`
   (default true), and optional 16-byte `NapsOuterBlockCmacKey` for profiles that explicitly
   enable keyed outer-block CMAC. Publishing Tools 2.79 debug/AC leaves it disabled by default.
-  `NapsPfsImageKey` (32 bytes) and `NapsPfsImageSeed` (16 bytes) accept the paired
-  `sc2 estimate` outputs used to generate exact `naps_meta_18` `obcc` entries. When the
-  options are omitted, raw `pfs_image_key.bin` and `pfs_image_seed.bin` sidecars next to the
-  host executable are loaded together. `NapsPfsImageSeed` also becomes the outer-PFS
+  The builder derives the `sc2 estimate` `pfs-image-key` from `PrimaryId` (falling back to
+  `ContentId`), `Passcode`, and the effective 16-byte PFS image seed. `NapsPfsImageSeed`
+  fixes that seed; `NapsPfsImageKey` is an optional expected 32-byte known-answer vector.
+  Raw `pfs_image_seed.bin` and `pfs_image_key.bin` sidecars provide the same optional values.
+  `NapsPfsImageSeed` also becomes the outer-PFS
   superblock `+0x370` seed; an explicit `OuterPfsSeed` must contain the same bytes.
   `PublisherImageKey` accepts an exact protected 0x800-byte CNT `IMAGE_KEY`, with
   `pkg_image_key.bin` as its sidecar fallback. `PublisherEntryKeys` similarly preserves the
@@ -59,7 +60,7 @@ The primary entry point.
 | `ProsperoPkgBuilder` | Build the outer PFS + `\x7FCNT` metadata container. |
 | `ProsperoPkgReader` | `DetectType(path/stream)` and `Read(path/stream)` for existing packages. |
 | `ProsperoPackageArchive` | High-level finalized-package reader. `DecryptOuterPfs` verifies/decrypts the outer image; `ExtractOuterFiles` extracts its files; `DecodeInnerPfs` resolves and decompresses NAPS into the logical PPR-PFS image; `ExtractInnerFiles` performs the full package-to-files operation. The `DecryptOuterPfs(package, output, passcode)` and `DecodeInnerPfs(package, output, passcode)` overloads are file-backed and support images larger than a managed array; high-level extraction uses that bounded-memory path automatically. |
-| `ProsperoPublishingSidecar` | Loads conventional protected publisher inputs next to the host executable. `ReadPublisherEntryKeys`, `ReadPublisherImageKey`, `TryReadNapsMeta18`, and `ExportReusableInputs` preserve raw `pkg_entry_keys.bin`, `pkg_image_key.bin`, and SI `naps_meta_18.dat` from an existing package for an exact rebuild of the same publisher context. They do not derive a new `IMAGE_KEY` or recover the separate `sc2 estimate` PFS-image key. |
+| `ProsperoPublishingSidecar` | Loads conventional protected publisher inputs next to the host executable. `ReadPublisherEntryKeys`, `ReadPublisherImageKey`, `TryReadNapsMeta18`, and `ExportReusableInputs` preserve raw `pkg_entry_keys.bin`, `pkg_image_key.bin`, and SI `naps_meta_18.dat` from an existing package for an exact rebuild of the same publisher context. They do not derive a new `IMAGE_KEY`. A PFS-image key cannot be recovered from a package alone because the passcode is absent, but is derived locally during a build. |
 | `ProsperoPkgWriter` | Low-level container writer (`ProsperoPkgWriterEntry`, `ProsperoPkgWriterOptions`). |
 | `ProsperoFihBuilder` | Wrap a `\x7FCNT` into a finalized `\x7FFIH` debug image. |
 | `ProsperoPkgSigner` | RSA-3072 metadata signing and EKPFS/PFS key derivation. |
@@ -84,8 +85,9 @@ The primary entry point.
   publisher path is selected by `UsePublisherPprNaps`; `NapsOuterBlockCmacKey` supplies the separate
   publishing CMAC input only for a profile that explicitly enables keyed NAPS outer-block tags.
   It is not required for the verified Publishing Tools 2.79 debug/AC profile, whose tags are zero.
-  `NapsPfsImageKey`/`NapsPfsImageSeed` drive the built-in streaming `obcc` generator; the pair is
-  distinct from the passcode-derived EKPFS.
+  `PrimaryId` selects the identity used by publisher `ENTRY_KEYS` index 1 and the PFS-image-key
+  KDF; it defaults to `ContentId`. `NapsPfsImageSeed` fixes the seed used by the built-in streaming `obcc`
+  generator. `NapsPfsImageKey` is an optional expected value; the actual key is derived locally.
   `PublisherImageKey` preserves a publisher/sc2-authored 0x800-byte CNT key blob verbatim.
   Set
   `DeterministicBuild` to derive repeatable seeds and RSA padding for byte-identical debug/test

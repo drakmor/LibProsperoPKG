@@ -21,6 +21,7 @@ using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Encodings.Web;
 using System.Text.Json;
@@ -134,6 +135,13 @@ public sealed class ProsperoPkgBuildProperties
     /// <summary>The 36-character content id.</summary>
     public required string ContentId { get; init; }
 
+    /// <summary>
+    /// Primary package id used by publisher <c>ENTRY_KEYS</c> index 1 and the
+    /// PFS-image-key KDF. Defaults to <see cref="ContentId"/>; update/base profiles
+    /// may supply a distinct id.
+    /// </summary>
+    public string? PrimaryId { get; init; }
+
     /// <summary>The 32-character passcode (the EKPFS is derived from it; all-zero is the default).</summary>
     public string Passcode { get; init; } = new string('0', 32);
 
@@ -186,7 +194,10 @@ public sealed class ProsperoPkgBuildProperties
     /// </summary>
     public IProsperoNapsIntegrityProvider? NapsIntegrityProvider { get; init; }
 
-    /// <summary>Optional raw 32-byte publisher <c>pfs-image-key</c> for exact NAPS obcc.</summary>
+    /// <summary>
+    /// Optional expected raw 32-byte publisher <c>pfs-image-key</c>. The builder derives this
+    /// value locally from primary id, passcode and seed; a supplied value must match.
+    /// </summary>
     public byte[]? NapsPfsImageKey { get; init; }
 
     /// <summary>
@@ -299,13 +310,12 @@ public static class ProsperoPkgBuilder
             throw new ArgumentException("Source folder does not exist.", nameof(props));
         if (props.ContentId is not { Length: 36 })
             throw new ArgumentException("Content id must be exactly 36 characters.", nameof(props));
+        if (props.PrimaryId is not null and not { Length: 36 })
+            throw new ArgumentException("Primary id must be exactly 36 characters.", nameof(props));
         if (props.Passcode is not { Length: 32 })
             throw new ArgumentException("Passcode must be exactly 32 characters.", nameof(props));
         if (props.NapsOuterBlockCmacKey is { Length: not 16 })
             throw new ArgumentException("NAPS outer-block CMAC key must be exactly 16 bytes.", nameof(props));
-        if ((props.NapsPfsImageKey is null) != (props.NapsPfsImageSeed is null))
-            throw new ArgumentException(
-                "NAPS pfs-image-key and pfs-image-seed must be supplied together.", nameof(props));
         if (props.NapsPfsImageKey is { Length: not 32 })
             throw new ArgumentException("NAPS pfs-image-key must contain exactly 32 bytes.", nameof(props));
         if (props.NapsPfsImageSeed is { Length: not 16 })
@@ -586,6 +596,15 @@ public static class ProsperoPkgBuilder
             ?? (props.DeterministicBuild
                 ? DeriveDeterministicOuterSeed(props.ContentId, props.Passcode)
                 : System.Security.Cryptography.RandomNumberGenerator.GetBytes(16));
+        byte[] pfsImageKey = ProsperoPfsKeys.DerivePublisherPfsImageKey(
+            props.PrimaryId ?? props.ContentId, props.Passcode, outerSeed);
+        if (props.NapsPfsImageKey is not null &&
+            !CryptographicOperations.FixedTimeEquals(props.NapsPfsImageKey, pfsImageKey))
+        {
+            throw new InvalidDataException(
+                "The supplied NAPS pfs-image-key does not match primary id, passcode and " +
+                "the effective outer-PFS seed.");
+        }
         byte[] ekpfs = ProsperoPfsKeys.DeriveEkpfs(props.ContentId, props.Passcode);
         ProsperoOuterPackageFileResult outer;
         File.WriteAllBytes(napsLayoutPath, napsLayout);
@@ -694,8 +713,8 @@ public static class ProsperoPkgBuilder
                 FihNapsFileCount = napsFileCount,
                 NapsMeta18 = props.NapsMeta18,
                 NapsIntegrityProvider = props.NapsIntegrityProvider,
-                NapsPfsImageKey = props.NapsPfsImageKey,
-                NapsPfsImageSeed = props.NapsPfsImageSeed,
+                NapsPfsImageKey = pfsImageKey,
+                NapsPfsImageSeed = outerSeed,
                 // Verified prospero-pub-cmd 2.79 APP and AC nwonly SI profiles both contain the
                 // seven NAPS/PlayGo records and no common/etc/pfsimage.xml.
                 IncludePfsImageXml = false,
@@ -1115,12 +1134,16 @@ public static class ProsperoPkgBuilder
         pkg.EntryKeys = props.PublisherEntryKeys is not null
             ? KeysEntry.FromPublisherBytes(props.PublisherEntryKeys)
             : new KeysEntry(
-                props.ContentId, props.Passcode, props.UsePublisherPprNaps, props.DeterministicBuild);
+                props.ContentId, props.Passcode, props.UsePublisherPprNaps,
+                props.DeterministicBuild, props.PrimaryId);
         byte[]? imageKeyBody = null;
         if (!noData && props.UsePublisherPprNaps)
         {
+            byte[] imageEkpfs = props.PrimaryId is null
+                ? ekpfs
+                : ProsperoPfsKeys.DeriveEkpfs(props.PrimaryId, props.Passcode);
             imageKeyBody = props.PublisherImageKey?.AsSpan().ToArray()
-                ?? BuildPublisherImageKeyEntry(ekpfs, props.DeterministicBuild);
+                ?? BuildPublisherImageKeyEntry(imageEkpfs, props.DeterministicBuild);
         }
         else if (!noData)
         {
@@ -1460,7 +1483,9 @@ public static class ProsperoPkgBuilder
         // Every digest, the geometry and the entry table are now finalized on this CNT, so the reproducible
         // SI pfsimage.xml options can be assembled from the builder's own output. The inner-PFS seed is read
         // from the plaintext outer superblock at sbOffset+0x370.
-        return BuildSiXmlOptions(pkg, image, sbOffset, Path.GetFullPath(props.SourceFolder!));
+        return BuildSiXmlOptions(
+            pkg, image, sbOffset, Path.GetFullPath(props.SourceFolder!),
+            props.PrimaryId ?? props.ContentId);
     }
 
     private static byte[] ComputeDescriptorDigest(Stream stream, in Header header)
@@ -1488,7 +1513,8 @@ public static class ProsperoPkgBuilder
     /// fixed-info digests, the container geometry and the CNT entry table — so the emitted pfsimage.xml is
     /// self-consistent with the produced package.
     /// </summary>
-    private static ProsperoPfsImageXmlOptions BuildSiXmlOptions(Pkg pkg, byte[] image, int sbOffsetInImage, string sourceFolder)
+    private static ProsperoPfsImageXmlOptions BuildSiXmlOptions(
+        Pkg pkg, byte[] image, int sbOffsetInImage, string sourceFolder, string primaryId)
     {
         // Inner-PFS superblock seed: 16 bytes at superblock+0x370 (zeros in our build — self-consistent).
         byte[] seed = new byte[16];
@@ -1517,6 +1543,7 @@ public static class ProsperoPkgBuilder
         return new ProsperoPfsImageXmlOptions
         {
             ContentId = pkg.Header.content_id,
+            PrimaryId = primaryId,
             TitleName = pj.TitleName,
             ContentVersion = pj.ContentVersion,
             DrmType = "none",

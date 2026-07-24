@@ -219,7 +219,12 @@ public class KeysEntry : Entry
     {
     }
 
-    public KeysEntry(string contentId, string passcode, bool publisherProfile, bool deterministic = false)
+    public KeysEntry(
+        string contentId,
+        string passcode,
+        bool publisherProfile,
+        bool deterministic = false,
+        string primaryId = null)
     {
         this.publisherProfile = publisherProfile;
         const int keyCount = 7;
@@ -229,7 +234,13 @@ public class KeysEntry : Entry
             : Crypto.Sha256(Encoding.ASCII.GetBytes(contentId.PadRight(48, '\0')));
         for (uint i = 0; i < keyCount; i++)
         {
-            var passcodeKey = Crypto.ComputeKeys(contentId, passcode, i, useSha3: publisherProfile);
+            // sc2 uses the primary package identity only for EKPFS/index 1. The seed
+            // digest and key indices 0/2..6 remain tied to the package content id.
+            string keyContextId = publisherProfile && i == 1
+                ? primaryId ?? contentId
+                : contentId;
+            var passcodeKey = Crypto.ComputeKeys(
+                keyContextId, passcode, i, useSha3: publisherProfile);
             if (publisherProfile)
             {
                 ReadOnlySpan<byte> moduli = LibProsperoPkg.Keys.ProsperoKeys.PasscodeKey;

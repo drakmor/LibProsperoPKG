@@ -183,7 +183,8 @@ public static class ProsperoPublishingSidecar
     /// <summary>
     /// Exports reusable protected publisher inputs from an existing package under their conventional
     /// sidecar names. Existing files are rejected unless <paramref name="overwrite"/> is true.
-    /// This does not recover the separate <c>sc2 estimate</c> PFS-image key.
+    /// This does not recover the separate <c>sc2 estimate</c> PFS-image key from the
+    /// package alone; the builder derives it when primary id, passcode, and seed are known.
     /// </summary>
     public static IReadOnlyList<string> ExportReusableInputs(
         string packagePath,

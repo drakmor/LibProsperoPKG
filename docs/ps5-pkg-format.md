@@ -138,7 +138,8 @@ data unit:
    images derive it from content id and passcode using SHA3-256. A fresh Publisher Tools 2.79
    outer image decrypted with that derived EKPFS and reproduced its extracted files byte-for-byte.
    The separate 32-byte `pfs-image-key` returned by `sc2 estimate` is not this stored outer-PFS
-   root key; it drives the temporary publisher-XTS transform used by `obcc`.
+   root key; it drives the temporary publisher-XTS transform used by `obcc`. It is nevertheless
+   reproducible: `HMAC-SHA256(EKPFS(primary-id, passcode), pfs-image-seed)`.
 2. From the EKPFS and the 16-byte superblock **seed**, the per-image key material (tweak key,
    data key, sign key) is derived using the SHA3-256-based `new_crypt` key schedule.
 
@@ -215,7 +216,7 @@ member order against reference debug packages (every member uncompressed / `STOR
 
 | Path | Notes |
 |---|---|
-| `common/etc/naps_meta_18.dat` | per-package encrypted TLV metric blob; size varies (e.g. 3440 / 7936 B). Generated automatically. Geometry, file records, `ihsh` SHA3/checksum rows, `rhsh` rolling hashes and `obcc` are local; exact `obcc` requires the package's 32-byte `pfs-image-key` and 16-byte seed or a provider override. |
+| `common/etc/naps_meta_18.dat` | per-package encrypted TLV metric blob; size varies (e.g. 3440 / 7936 B). Generated automatically. Geometry, file records, `ihsh` SHA3/checksum rows, `rhsh` rolling hashes and `obcc` are local; the 32-byte PFS-image key is derived from primary id, passcode and the 16-byte seed. |
 | `common/etc/naps_meta_300.dat` | 48 B; reproduced byte-exact (`R = alignUp(pfs_image.dat) - 0x10000` at 0x10/0x20, kind id `0x3E9` at 0x18, block size `0x10000` at 0x28) |
 | `common/etc/naps_meta_301.dat` | 48 B, byte-identical to `_300` |
 | `common/etc/naps_meta_302.dat` | 48 B, byte-identical to `_300` |
@@ -257,11 +258,23 @@ temporary = AES-128-XTS-encrypt(
 obcc[i] = LE32(CRC32C(temporary))
 ```
 
-The transform is streamed in 64-KiB blocks. `NapsPfsImageKey`/`NapsPfsImageSeed` or the raw
-`pfs_image_key.bin`/`pfs_image_seed.bin` sidecars supply the pair. Without a pair or an
-`IProsperoNapsIntegrityProvider`, the table is explicitly zero-filled; a publisher-authored
-`naps_meta_18.dat` can still be preserved verbatim. The PFS image key is the separate result of
-`sc2 estimate`, not the passcode-derived EKPFS. The image seed is the same 16-byte value stored
+Before this transform the builder reproduces `sc2 estimate`:
+
+```text
+EKPFS_primary = SHA3-256(
+    SHA3-256(BE32(1)) ||
+    SHA3-256(ASCII(primary-id) padded with NUL to 48 bytes) ||
+    ASCII(passcode[32]))
+pfs-image-key = HMAC-SHA256(EKPFS_primary, pfs-image-seed)
+```
+
+The transform is streamed in 64-KiB blocks. `NapsPfsImageSeed` or the raw
+`pfs_image_seed.bin` sidecar fixes the seed; otherwise the effective generated outer seed is
+used. `NapsPfsImageKey`/`pfs_image_key.bin` is an optional known-answer vector and a mismatch
+is rejected. A custom `IProsperoNapsIntegrityProvider` can still override the table, and a
+publisher-authored `naps_meta_18.dat` can be preserved verbatim. The PFS image key is the
+separate result of `sc2 estimate`, derived from the primary-id EKPFS rather than the content-id
+EKPFS used by the outer image. The image seed is the same 16-byte value stored
 at outer-superblock `+0x370` and used by the outer-PFS key schedule; the builder therefore rejects
 conflicting `NapsPfsImageSeed` and `OuterPfsSeed` values. See
 [implementation-status.md](implementation-status.md).
@@ -325,7 +338,7 @@ stream. CNT-entry placement for each file is described below.
 | `playgo-hash-table.dat` | CNT entry `0x2010` | PlayGo file hash table; `0x38 + n × 8` bytes (n = `ficmCount / 2`). A content-independent constant structure (version=1, `\x7FFLT` magic at `0x18`, fixed 16-byte prefix + `n × 8` constant table entries). `PlayGo.ProsperoPlayGo.BuildHashTable`. |
 | `playgo-ficm.dat` | CNT entry `0x2011` | PlayGo file-in-chunk map; 16-byte header + `fileCount` bytes. `PlayGo.ProsperoPlayGo.BuildFicm`. |
 | `playgo-chunk.crc` | `config/<content-id>/` (SI) | CRC-32C over each 64 KiB block of the finalized mount image. `ProsperoPlayGo.BuildChunkCrc`. |
-| `naps_meta_18.dat` | `sce_suppl/common/etc` (SI) | Per-package AES-XTS TLV metric blob; built by `ProsperoNapsMeta.BuildMeta18`. Exact `obcc` is generated from the `sc2 estimate` PFS image key/seed pair, with an optional provider override. |
+| `naps_meta_18.dat` | `sce_suppl/common/etc` (SI) | Per-package AES-XTS TLV metric blob; built by `ProsperoNapsMeta.BuildMeta18`. Exact `obcc` uses the locally derived `sc2 estimate` PFS image key and effective seed, with an optional provider override. |
 | `naps_meta_300/301/302/308.dat` | `sce_suppl/common/etc` (SI) | 48-byte NAPS records; `301/302/308` are byte-identical to `300`. Reproduced byte-exact (`ProsperoNapsMeta`). |
 | `pfsimage.xml` | `sce_suppl/common/etc` (SI) | Machine-readable image descriptor; reproduced through `<entries>` plus the `<chunkinfo>`/`<pfs-image>`/`<nested-image>` introspection trees (self-consistent; see §5.4). |
 
