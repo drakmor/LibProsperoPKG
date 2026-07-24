@@ -39,6 +39,8 @@ The primary entry point.
   `PublisherImageKey` accepts an exact protected 0x800-byte CNT `IMAGE_KEY`, with
   `pkg_image_key.bin` as its sidecar fallback. `PublisherEntryKeys` similarly preserves the
   complete 0xB80-byte publisher `ENTRY_KEYS` record through `pkg_entry_keys.bin`.
+  `LicenseProvider` accepts already-issued decrypted AC/AL RIF/license records from an
+  application-defined backend or console bridge; returned bytes are validated before CNT encryption.
 - **`ProsperoBuildResult`** — `OutputPath` and a list of non-fatal `Warnings`.
 - **`ProsperoPackageMode`** — `Application`, `Homebrew`, `AdditionalContentData`,
   `AdditionalContentNoData`.
@@ -61,6 +63,8 @@ The primary entry point.
 | `ProsperoPkgReader` | `DetectType(path/stream)` and `Read(path/stream)` for existing packages. |
 | `ProsperoPackageArchive` | High-level finalized-package reader. `DecryptOuterPfs` verifies/decrypts the outer image; `ExtractOuterFiles` extracts its files; `DecodeInnerPfs` resolves and decompresses NAPS into the logical PPR-PFS image; `ExtractInnerFiles` performs the full package-to-files operation. The `DecryptOuterPfs(package, output, passcode)` and `DecodeInnerPfs(package, output, passcode)` overloads are file-backed and support images larger than a managed array; high-level extraction uses that bounded-memory path automatically. |
 | `ProsperoPublishingSidecar` | Loads conventional protected publisher inputs next to the host executable. `ReadPublisherEntryKeys`, `ReadPublisherImageKey`, `TryReadNapsMeta18`, and `ExportReusableInputs` preserve raw `pkg_entry_keys.bin`, `pkg_image_key.bin`, and SI `naps_meta_18.dat` from an existing package for an exact rebuild of the same publisher context. They do not derive a new `IMAGE_KEY`. A PFS-image key cannot be recovered from a package alone because the passcode is absent, but is derived locally during a build. |
+| `IProsperoLicenseProvider` / `ProsperoLicenseArtifacts` | Provider boundary for backend/SDK/console-issued decrypted `license.dat` and `license.info`. `ProsperoDirectoryLicenseProvider` loads the conventional two-file representation. The builder validates size, `RIF\0`, content id and entitlement key, then applies the normal volume-specific CNT entry encryption. |
+| `ProsperoCntEntryPolicy` | Central publisher policy for CNT flags, key index and fixed-entry naming. It distinguishes GD `license.info` key index 2 from AC/AL index 4 and applies key index 3 to protected NP/self/image/delta/reserved records. |
 | `ProsperoPkgWriter` | Low-level container writer (`ProsperoPkgWriterEntry`, `ProsperoPkgWriterOptions`). |
 | `ProsperoFihBuilder` | Wrap a `\x7FCNT` into a finalized `\x7FFIH` debug image. |
 | `ProsperoPkgSigner` | RSA-3072 metadata signing and EKPFS/PFS key derivation. |
@@ -89,6 +93,8 @@ The primary entry point.
   KDF; it defaults to `ContentId`. `NapsPfsImageSeed` fixes the seed used by the built-in streaming `obcc`
   generator. `NapsPfsImageKey` is an optional expected value; the actual key is derived locally.
   `PublisherImageKey` preserves a publisher/sc2-authored 0x800-byte CNT key blob verbatim.
+  `LicenseProvider` supplies already-issued RIF/license records when they are not stored beside
+  the source GP5.
   Set
   `DeterministicBuild` to derive repeatable seeds and RSA padding for byte-identical debug/test
   packages; the default mode retains cryptographic randomness.

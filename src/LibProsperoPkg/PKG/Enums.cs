@@ -715,6 +715,12 @@ public static class EntryNames
     { EntryId.PIC0_DDS, "pic0.dds" },
     { EntryId.PIC1_DDS, "pic1.dds" },
   };
+        // PS5 UDS/trophy2 records observed in publisher APP packages. Their protected npbind
+        // records use the same entry crypto as the fixed 0x0403 npbind.dat entry.
+        IdToName.Add((EntryId)0x1480, "trophy2/trophy00.ucp");
+        IdToName.Add((EntryId)0x14A0, "uds/uds00.ucp");
+        IdToName.Add((EntryId)0x2020, "uds/npbind.dat");
+        IdToName.Add((EntryId)0x2021, "trophy2/npbind.dat");
         for (var i = 0; i < 31; i++)
         {
             IdToName.Add((EntryId)((int)EntryId.ICON0_00_PNG + i), $"icon0_{i:d2}.png");

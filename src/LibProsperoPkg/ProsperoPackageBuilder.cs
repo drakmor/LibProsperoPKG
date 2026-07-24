@@ -227,6 +227,13 @@ public sealed class ProsperoBuildOptions
     public IProsperoMetadataSigner? MetadataSigner { get; set; }
 
     /// <summary>
+    /// Optional provider for already-issued decrypted AC/AL <c>license.dat</c> and
+    /// <c>license.info</c>. It takes precedence over loose sidecars in the source folder.
+    /// The returned records are validated and CNT-encrypted by the builder.
+    /// </summary>
+    public IProsperoLicenseProvider? LicenseProvider { get; set; }
+
+    /// <summary>
     /// Refuses to build unless every caller-supplied input required by the external Publishing
     /// Tools acceptance path is present. This checks availability, not whether a supplied signer
     /// or keyed provider belongs to a particular SDK trust domain; final acceptance is still
@@ -575,6 +582,7 @@ public static class ProsperoPackageBuilder
             OuterPfsSeed = options.OuterPfsSeed,
             DeterministicBuild = options.DeterministicBuild,
             MetadataSigner = metadataSigner,
+            LicenseProvider = options.LicenseProvider,
         };
 
         bool usesNaps = options.UsePublisherPprNaps &&

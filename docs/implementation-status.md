@@ -139,7 +139,17 @@ This document describes the current LibProsperoPkg package-building and reading 
 - Inner extraction removes the PFS implementation-only `uroot/` component so paths round-trip to the source tree. `PfsReader.File.Save` creates/truncates destinations instead of leaving stale tails from an older longer file.
 - The July 2026 `origin/main` validation/robustness audit was selectively ported without merging its incompatible API refactor. AES-XTS objects now reuse their AES transforms and are deterministically disposed; PFS inode-table offsets account for records that cross a block boundary; zero-length PFSC reads stop before block lookup; NAPS U2C padding points at the terminal CblockInfo; duplicate media entry ids are ignored; malformed `ENTRY_KEYS` sizes and unrepresentable FSELF layouts are rejected.
 - `PprPfsKrakenTool selftest-large-outer` exercises the first double-indirect data block: it builds a 1,833-block (120,127,488-byte) sparse file, decrypts the result, checks `ib[0]` and `ib[1]`, and traverses the complete file through `PfsReader`. The same test checks the concrete planner at the first `ib[2]` block (3,314,233 data blocks) without materializing a 202-GiB payload.
-- AC/AL builds require existing backend-issued `sce_sys/license.dat` and `license.info`. When a GP5 is present these two out-of-band sidecars are merged from the adjacent loose `sce_sys` directory, then checked for their exact 0x400/0x200 sizes, `RIF\0` framing, package content id, and GP5 entitlement key before entry encryption. Missing sidecars fail the build instead of silently producing an incomplete package.
+- AC/AL builds require existing backend-issued `license.dat` and `license.info`. They may be
+  supplied as loose `sce_sys` sidecars or through `IProsperoLicenseProvider`, which is the
+  integration point for an authorized backend/SDK/console bridge. Both paths check the exact
+  0x400/0x200 sizes, `RIF\0` framing, package content id and GP5 entitlement key before entry
+  encryption. Missing artifacts fail the build instead of silently producing an incomplete package.
+- CNT system-entry policy is centralized in `ProsperoCntEntryPolicy`. Fixed protected records
+  0x0400..0x0409 are unnamed; license, NP title/binding, self/image info, delta info and
+  `psreserved.dat` use the encrypted profile. Reference GD packages use key index 2 for
+  `license.info`, while AC/AL use key index 4; the other covered protected records use key index 3.
+  Nested `uds/npbind.dat` (0x2020) and `trophy2/npbind.dat` (0x2021) retain their names and use
+  key index 3. The corresponding UCP ids 0x14A0/0x1480 are mapped as ordinary data records.
 - `ProsperoBuildOptions.RequirePublisherCompatibility` (CLI trailing mode `strict`) turns the remaining external-input warnings into pre-build errors. It requires a caller/sidecar metadata signer and a publisher-authored 0x800-byte `PublisherImageKey`. It no longer requires an external PFS-image key or `naps_meta_18.dat`: the PFS-image key, `ihsh`, `rhsh`, and `obcc` are generated locally. `pfs_image_seed.bin` can fix the publisher seed and `pfs_image_key.bin` can be retained as a known-answer check. A NAPS CMAC key is not required for the verified Publishing Tools 2.79 debug/AC profile: its config constructor leaves CMAC mode disabled and real packages contain zero eight-byte outer-block tags. `NapsOuterBlockCmacKey` remains an optional input for another profile that explicitly enables keyed CMAC. Only `img_info`/`img_verify` can establish that the supplied signer and protected package inputs belong to the correct trust profile.
 
 ## Known gaps / not implemented
@@ -183,7 +193,7 @@ This document describes the current LibProsperoPkg package-building and reading 
 | CNT GeneralDigests block | Implemented, byte-exact for tested debug packages and self-consistent builder output |
 | FIH `0xA8`/`0xB0` NAPS layout size/digest | Implemented and byte-exact against `dlc_baseline.pkg` |
 | `imagedigs.dat` CNT entry | Implemented |
-| Supplied `sce_sys` system files (license, np, self, delta-info, keymap_rp, changeinfo, pronunciation, trophy) | Implemented; AC/AL license sidecars are mandatory, GP5-aware, structurally/content-id/entitlement-key validated, then encrypted as entries 0x400/0x401 |
+| Supplied `sce_sys` system files (license, np, self, delta-info, keymap_rp, changeinfo, pronunciation, trophy) | Implemented; AC/AL licenses come from sidecars or `IProsperoLicenseProvider`, are GP5-aware, structurally/content-id/entitlement-key validated, then encrypted with volume-specific entry policy |
 | `playgo-chunk.dat`, `playgo-hash-table.dat`, `playgo-ficm.dat` | Implemented |
 | UCP archives (`trophy2/*.ucp`, `uds/*.ucp`) | Implemented, byte-exact round-trip and digest for tested reference samples |
 | `npbind.dat` / `nptitle.dat` structural validation | Implemented; validated and identifiers extracted, packed verbatim |

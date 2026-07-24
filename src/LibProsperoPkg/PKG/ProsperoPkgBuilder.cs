@@ -229,6 +229,12 @@ public sealed class ProsperoPkgBuildProperties
     /// current publisher tools require their matching trusted RSA-3072 profile.
     /// </summary>
     public IProsperoMetadataSigner? MetadataSigner { get; init; }
+
+    /// <summary>
+    /// Optional source of already-issued decrypted AC/AL RIF/license records.
+    /// Returned records are validated before ordinary CNT entry encryption.
+    /// </summary>
+    public IProsperoLicenseProvider? LicenseProvider { get; init; }
 }
 
 /// <summary>
@@ -1179,7 +1185,8 @@ public static class ProsperoPkgBuilder
 
         // sce_sys media entries (icon0.png, pic0.png, pic1.png, snd0.at9, ...) present in the folder.
         foreach (var media in CollectMediaEntries(
-                     sourceFolder, props.VolumeType, props.ContentId, generateDds: !noData))
+                     sourceFolder, props.VolumeType, props.ContentId,
+                     props.LicenseProvider, generateDds: !noData))
             if (!pkg.Entries.Any(existing => (uint)existing.Id == (uint)media.Id))
                 pkg.Entries.Add(media);
 
@@ -1223,7 +1230,7 @@ public static class ProsperoPkgBuilder
 
         pkg.Digests.FileData = new byte[pkg.Entries.Count * Pkg.HASH_SIZE];
 
-        LayOutEntries(pkg, paramJson);
+        LayOutEntries(pkg, paramJson, props.VolumeType);
         return pkg;
     }
 
@@ -1262,53 +1269,37 @@ public static class ProsperoPkgBuilder
         return result;
     }
 
-    // The PS5 Flags1 word for each entry id.
-    private static uint Flags1For(uint id) => id switch
-    {
-        (uint)EntryId.DIGESTS => 0x40000000,
-        (uint)EntryId.ENTRY_KEYS => 0x60000000,
-        (uint)EntryId.IMAGE_KEY => 0x60000000,        // image key is not entry-encrypted.
-        (uint)EntryId.GENERAL_DIGESTS => 0x60000000,
-        (uint)EntryId.METAS => 0x60000000,
-        (uint)EntryId.ENTRY_NAMES => 0x40000000,
-        (uint)EntryId.LICENSE_DAT => 0x80000000,
-        (uint)EntryId.LICENSE_INFO => 0x80000000,
-        (uint)EntryId.NPTITLE_DAT => 0x80000000,
-        (uint)EntryId.NPBIND_DAT => 0x80000000,
-        0x2000 => 0x00000000,                          // param.json
-        _ => 0x08000000,                               // media / data entries
-    };
-
-    private static uint Flags2For(uint id) => id switch
-    {
-        (uint)EntryId.LICENSE_DAT => 0x00003000,       // derived key index 3
-        (uint)EntryId.LICENSE_INFO => 0x00004000,      // derived key index 4
-        (uint)EntryId.NPTITLE_DAT => 0x00003000,       // derived key index 3
-        (uint)EntryId.NPBIND_DAT => 0x00003000,        // derived key index 3
-        _ => 0u,
-    };
-
-    private static void LayOutEntries(Pkg pkg, byte[] paramJson)
+    private static void LayOutEntries(
+        Pkg pkg, byte[] paramJson, ProsperoVolumeType volumeType)
     {
         // Publisher ENTRY_NAMES follows the sorted MetaEntry table, not lexical filename order.
         // The table therefore starts with playgo-chunk.dat (id 0x1001), followed by presentation
         // media and the 0x2000/0x2010/0x2011 records in id order. NameTableOffset values are assigned
         // against this canonical sequence before the independent semantic body layout is calculated.
         foreach (var entry in pkg.Entries.OrderBy(e => (uint)e.Id))
-            pkg.EntryNames.GetOffset(entry.Name);
+        {
+            ProsperoCntEntryProfile profile = ProsperoCntEntryPolicy.Resolve(
+                (uint)entry.Id, volumeType, entry.Name);
+            if (profile.IncludeName)
+                pkg.EntryNames.GetOffset(entry.Name);
+        }
 
         // 2nd pass: assign 16-byte-aligned data offsets and build the meta table.
         ulong dataOffset = pkg.Header.body_offset;
         foreach (var entry in pkg.Entries)
         {
+            ProsperoCntEntryProfile profile = ProsperoCntEntryPolicy.Resolve(
+                (uint)entry.Id, volumeType, entry.Name);
             var meta = new MetaEntry
             {
                 id = entry.Id,
-                NameTableOffset = pkg.EntryNames.GetOffset(entry.Name),
+                NameTableOffset = profile.IncludeName
+                    ? pkg.EntryNames.GetOffset(entry.Name)
+                    : 0,
                 DataOffset = (uint)dataOffset,
                 DataSize = entry.Length,
-                Flags1 = Flags1For((uint)entry.Id),
-                Flags2 = Flags2For((uint)entry.Id),
+                Flags1 = profile.Flags1,
+                Flags2 = profile.Flags2,
             };
             pkg.Metas.Metas.Add(meta);
             if (entry == pkg.Metas)
@@ -2059,13 +2050,26 @@ public static class ProsperoPkgBuilder
 
     private static IEnumerable<Entry> CollectMediaEntries(
         string sourceFolder, ProsperoVolumeType volumeType, string contentId,
-        bool generateDds = true)
+        IProsperoLicenseProvider? licenseProvider, bool generateDds = true)
     {
         IReadOnlyDictionary<string, string> sceSysFiles = ResolveSceSysFiles(sourceFolder);
         byte[]? entitlementKey = IsAdditionalContent(volumeType)
             ? ResolveGp5EntitlementKey(sourceFolder)
             : null;
-        if (IsAdditionalContent(volumeType))
+        ProsperoLicenseArtifacts? providedLicense = null;
+        if (licenseProvider is not null)
+        {
+            var request = new ProsperoLicenseRequest
+            {
+                VolumeType = volumeType,
+                ContentId = contentId,
+                EntitlementKey = entitlementKey,
+            };
+            providedLicense = licenseProvider.GetLicense(request)
+                ?? throw new InvalidDataException("The license provider returned no artifacts.");
+            providedLicense.Validate(request);
+        }
+        if (IsAdditionalContent(volumeType) && providedLicense is null)
         {
             foreach (string required in new[] { "license.dat", "license.info" })
             {
@@ -2077,6 +2081,20 @@ public static class ProsperoPkgBuilder
             }
         }
         var emitted = new HashSet<uint>();
+
+        if (providedLicense is not null)
+        {
+            emitted.Add((uint)EntryId.LICENSE_DAT);
+            yield return new GenericEntry(EntryId.LICENSE_DAT)
+            {
+                FileData = providedLicense.LicenseDat.ToArray(),
+            };
+            emitted.Add((uint)EntryId.LICENSE_INFO);
+            yield return new GenericEntry(EntryId.LICENSE_INFO)
+            {
+                FileData = providedLicense.LicenseInfo.ToArray(),
+            };
+        }
 
         foreach (var (name, id) in MediaFiles)
         {
@@ -2140,7 +2158,9 @@ public static class ProsperoPkgBuilder
             // Publisher AC license records are identified exclusively by id. Reference packages
             // keep NameTableOffset at zero for 0x0400/0x0401; adding their friendly names grows
             // ENTRY_NAMES by 0x19 bytes and shifts the semantic CNT body layout.
-            string? entryName = id is EntryId.LICENSE_DAT or EntryId.LICENSE_INFO ? null : rel;
+            ProsperoCntEntryProfile profile = ProsperoCntEntryPolicy.Resolve(
+                idv, volumeType, rel);
+            string? entryName = profile.IncludeName ? rel : null;
             yield return new GenericEntry(id, entryName) { FileData = data };
         }
     }

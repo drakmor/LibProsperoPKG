@@ -203,6 +203,11 @@ The protected CNT `IMAGE_KEY` can be supplied as `PublisherImageKey` or the raw
 `pkg_image_key.bin` sidecar; the built-in fallback preserves package geometry but is not
 claimed to reproduce the publisher/sc2 key wrapper.
 `naps_meta_18.dat` is likewise loaded automatically when placed next to the executable.
+Backend-issued AC/AL `license.dat` and `license.info` can either remain beside the GP5 or be
+returned by `ProsperoBuildOptions.LicenseProvider`. The built-in
+`ProsperoDirectoryLicenseProvider` loads an arbitrary sidecar directory; custom providers can
+bridge an authorized publishing service or console. The records are validated and encrypted into
+CNT entries by the library; the provider does not ask the writer to fabricate a retail RIF.
 For an exact rebuild of the same protected publisher context, run
 `export-publisher-inputs <reference.pkg> <sidecar-dir>` to preserve `ENTRY_KEYS`,
 `IMAGE_KEY`, and `naps_meta_18` without

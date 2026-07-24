@@ -792,6 +792,43 @@ internal static class Program
         }
         Console.WriteLine("selftest: imagedigs.dat digest byte order passed");
 
+        ProsperoCntEntryProfile gdLicenseInfo = ProsperoCntEntryPolicy.Resolve(
+            (uint)EntryId.LICENSE_INFO, ProsperoVolumeType.Application);
+        ProsperoCntEntryProfile acLicenseInfo = ProsperoCntEntryPolicy.Resolve(
+            (uint)EntryId.LICENSE_INFO, ProsperoVolumeType.AdditionalContentData);
+        uint[] rareProtectedEntries =
+        [
+            (uint)EntryId.SELFINFO_DAT,
+            (uint)EntryId.IMAGEINFO_DAT,
+            (uint)EntryId.TARGET_DELTAINFO_DAT,
+            (uint)EntryId.ORIGIN_DELTAINFO_DAT,
+            (uint)EntryId.PSRESERVED_DAT,
+        ];
+        if (gdLicenseInfo.Flags1 != 0x80000000 ||
+            gdLicenseInfo.Flags2 != 0x00002000 ||
+            gdLicenseInfo.IncludeName ||
+            acLicenseInfo.Flags1 != 0x80000000 ||
+            acLicenseInfo.Flags2 != 0x00004000 ||
+            acLicenseInfo.IncludeName ||
+            rareProtectedEntries.Any(id =>
+            {
+                ProsperoCntEntryProfile profile = ProsperoCntEntryPolicy.Resolve(
+                    id, ProsperoVolumeType.Application);
+                return profile.Flags1 != 0x80000000 ||
+                    profile.Flags2 != 0x00003000 ||
+                    profile.IncludeName;
+            }) ||
+            ProsperoCntEntryPolicy.Resolve(
+                0x2020, ProsperoVolumeType.Application, "uds/npbind.dat") is not
+                { Flags1: 0x80000000, Flags2: 0x00003000, IncludeName: true } ||
+            !EntryNames.NameToId.TryGetValue("uds/npbind.dat", out EntryId udsNpbind) ||
+            (uint)udsNpbind != 0x2020)
+        {
+            throw new InvalidDataException(
+                "Publisher CNT system-entry encryption/name policy is invalid.");
+        }
+        Console.WriteLine("selftest: publisher CNT system-entry policy passed");
+
         List<ProsperoPs5MetaNode> inodeBoundaryNodes = Enumerable.Range(0, 391)
             .Select(i => new ProsperoPs5MetaNode
             {
@@ -1606,7 +1643,11 @@ internal static class Program
                 licenseDatEntry.Flags1 != 0x80000000 || licenseDatEntry.Flags2 != 0x00003000 ||
                 licenseInfoEntry.Flags1 != 0x80000000 || licenseInfoEntry.Flags2 != 0x00004000 ||
                 nptitleEntry.Flags1 != 0x80000000 || nptitleEntry.Flags2 != 0x00003000 ||
-                npbindEntry.Flags1 != 0x80000000 || npbindEntry.Flags2 != 0x00003000)
+                npbindEntry.Flags1 != 0x80000000 || npbindEntry.Flags2 != 0x00003000 ||
+                licenseDatEntry.NameTableOffset != 0 ||
+                licenseInfoEntry.NameTableOffset != 0 ||
+                nptitleEntry.NameTableOffset != 0 ||
+                npbindEntry.NameTableOffset != 0)
             {
                 throw new InvalidDataException(
                     "GP5 AC system sidecars were not emitted with publisher CNT ids/flags.");
@@ -1622,8 +1663,47 @@ internal static class Program
                 throw new InvalidDataException(
                     "Encrypted nptitle.dat/npbind.dat CNT round trip changed their logical bytes.");
             }
+
+            // The same RIF/license input can come from an authorized backend/console bridge instead
+            // of source-tree sidecars. Keep it in a separate directory, remove the loose copies and
+            // verify that the provider result follows the identical validation/encryption path.
+            string licenseProviderDirectory = Path.Combine(regressionRoot, "license-provider");
+            string providerOutput = Path.Combine(regressionRoot, "ac-provider-output");
+            Directory.CreateDirectory(licenseProviderDirectory);
+            File.WriteAllBytes(
+                Path.Combine(licenseProviderDirectory, "license.dat"), licenseDat);
+            File.WriteAllBytes(
+                Path.Combine(licenseProviderDirectory, "license.info"), licenseInfo);
+            File.Delete(Path.Combine(acSource, "sce_sys", "license.dat"));
+            File.Delete(Path.Combine(acSource, "sce_sys", "license.info"));
+            ProsperoBuildResult providerBuild = ProsperoPackageBuilder.Build(
+                new ProsperoBuildOptions
+                {
+                    SourceFolder = acSource,
+                    OutputFolder = providerOutput,
+                    ContentId = acContentId,
+                    TitleId = "PPSA00001",
+                    Mode = ProsperoPackageMode.AdditionalContentData,
+                    Passcode = deterministicPasscode,
+                    UsePublisherPprNaps = true,
+                    DeterministicBuild = true,
+                    LicenseProvider =
+                        new ProsperoDirectoryLicenseProvider(licenseProviderDirectory),
+                });
+            string providerExtracted = Path.Combine(
+                regressionRoot, "ac-provider-extracted");
+            ProsperoPackageArchive.ExtractCntEntries(
+                providerBuild.OutputPath, providerExtracted, deterministicPasscode);
+            if (!File.ReadAllBytes(Path.Combine(providerExtracted, "license.dat"))
+                    .AsSpan().SequenceEqual(licenseDat) ||
+                !File.ReadAllBytes(Path.Combine(providerExtracted, "license.info"))
+                    .AsSpan().SequenceEqual(licenseInfo))
+            {
+                throw new InvalidDataException(
+                    "License-provider CNT round trip changed the issued RIF/license records.");
+            }
             Console.WriteLine(
-                "selftest: GP5 AC system-sidecar validation and CNT encryption passed");
+                "selftest: GP5 AC sidecar/provider validation and CNT encryption passed");
 
             Console.WriteLine(
                 "selftest: deterministic APP/PPR-NAPS build + file-backed extraction passed " +
