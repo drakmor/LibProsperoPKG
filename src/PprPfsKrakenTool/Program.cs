@@ -80,6 +80,7 @@ internal static class Program
                 "extract-pkg-cnt" => ExtractPackageCnt(args),
                 "extract-pkg-si" => ExtractPackageSi(args),
                 "export-publisher-inputs" => ExportPublisherInputs(args),
+                "probe-publisher-key-wrap" => ProbePublisherKeyWrap(args),
                 "probe-entry-crypto" => ProbeEntryCrypto(args),
                 "selftest" => SelfTest(args),
                 "selftest-large-outer" => SelfTestLargeOuter(args),
@@ -731,6 +732,44 @@ internal static class Program
             "Exported protected inputs for exact preservation; the separate sc2 estimate " +
             "pfs-image-key cannot be recovered from the package alone (the passcode is not stored).");
         return 0;
+    }
+
+    private static int ProbePublisherKeyWrap(string[] args)
+    {
+        if (args.Length is < 3 or > 4)
+            throw new ArgumentException(
+                "probe-publisher-key-wrap requires <package.pkg> <passcode> [primary-id].");
+        if (args[2].Length != 32)
+            throw new ArgumentException("Passcode must contain exactly 32 characters.");
+
+        ProsperoPkg package = ProsperoPkgReader.Read(args[1]);
+        string contentId = package.Header?.ContentId
+            ?? throw new InvalidDataException("Package has no CNT header.");
+        string primaryId = args.Length == 4 ? args[3] : contentId;
+        byte[] publisher = ProsperoPublishingSidecar.ReadPublisherEntryKeys(args[1]);
+        var generatedEntry = new KeysEntry(
+            contentId,
+            args[2],
+            publisherProfile: true,
+            deterministic: true,
+            primaryId: primaryId);
+        using var generatedStream = new MemoryStream(0xB80);
+        generatedEntry.Write(generatedStream);
+        byte[] generated = generatedStream.ToArray();
+
+        bool fixedFields = publisher.AsSpan(0, 0x100).SequenceEqual(generated.AsSpan(0, 0x100));
+        Console.WriteLine(
+            $"content-id={contentId} primary-id={primaryId} fixed-fields={fixedFields}");
+        bool allWrappedKeys = true;
+        for (int index = 0; index < 7; index++)
+        {
+            int offset = 0x100 + index * 0x180;
+            bool equal = publisher.AsSpan(offset, 0x180)
+                .SequenceEqual(generated.AsSpan(offset, 0x180));
+            allWrappedKeys &= equal;
+            Console.WriteLine($"wrapped-key[{index}]={equal}");
+        }
+        return fixedFields && allWrappedKeys ? 0 : 2;
     }
 
     private static int ProbeEntryCrypto(string[] args)
@@ -1527,6 +1566,16 @@ internal static class Program
                 throw new InvalidDataException(
                     "Publisher pfs-image-key KDF does not match the captured sc2 2.79 estimate.");
             }
+            byte[] publisherImageKeyKat =
+                ProsperoPfsKeys.BuildPublisherImageKey(publisherEstimateKat);
+            if (!System.Security.Cryptography.SHA256.HashData(publisherImageKeyKat)
+                    .AsSpan().SequenceEqual(
+                    Convert.FromHexString(
+                        "E805449610068EB58EC281A09A35D5FCA8D04CE4D23DEF4A6EFA8ADF2A901FAC")))
+            {
+                throw new InvalidDataException(
+                    "Publisher IMAGE_KEY producer does not match the captured sc2 2.79 build.");
+            }
             string distinctPrimaryId = "IV9999-PPSA00001_00-DETERMINISTIC001";
             string primaryIdXml = ProsperoSiArchive.BuildPfsImageXml(
                 new ProsperoPfsImageXmlOptions
@@ -1542,9 +1591,7 @@ internal static class Program
                     "pfsimage.xml did not preserve a primary id distinct from content id.");
             }
             byte[] deterministicPublisherImageKey =
-                Enumerable.Range(0, 0x800)
-                    .Select(i => (byte)((i * 29 + 7) & 0xFF))
-                    .ToArray();
+                ProsperoPfsKeys.BuildPublisherImageKey(deterministicPfsImageKey);
             byte[] deterministicContentIdBytes =
                 Encoding.ASCII.GetBytes(deterministicContentId);
             var gdLicenseDat = new byte[ProsperoSystemFiles.LicenseDatSize];
@@ -1599,7 +1646,6 @@ internal static class Program
                     DeterministicBuild = true,
                     NapsPfsImageKey = deterministicPfsImageKey,
                     NapsPfsImageSeed = deterministicPfsImageSeed,
-                    PublisherImageKey = deterministicPublisherImageKey,
                     PublisherEntryKeys = deterministicPublisherEntryKeys,
                     LicenseProvider = gdLicenseProvider,
                 },
@@ -3464,6 +3510,7 @@ internal static class Program
         Console.WriteLine("  extract-pkg-cnt <package.pkg> <output-dir> [passcode]");
         Console.WriteLine("  extract-pkg-si <package.pkg> <output-dir>");
         Console.WriteLine("  export-publisher-inputs <package.pkg> <output-dir> [--overwrite]");
+        Console.WriteLine("  probe-publisher-key-wrap <package.pkg> <passcode> [primary-id]");
         Console.WriteLine("  probe-entry-crypto <package.pkg> <entry-id-hex> <passcode>");
         Console.WriteLine("  selftest");
         Console.WriteLine("  selftest-large-outer");

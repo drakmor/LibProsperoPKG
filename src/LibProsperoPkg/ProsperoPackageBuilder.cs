@@ -201,10 +201,9 @@ public sealed class ProsperoBuildOptions
     public byte[]? NapsPfsImageSeed { get; set; }
 
     /// <summary>
-    /// Optional publisher-authored raw <c>IMAGE_KEY</c> CNT entry (exactly <c>0x800</c> bytes).
-    /// Current publisher profiles produce this protected blob outside the ordinary passcode KDF.
-    /// When omitted, the library retains its structural research fallback, which is not claimed
-    /// to reproduce the native sc2 wrapper.
+    /// Optional publisher-authored raw <c>IMAGE_KEY</c> CNT entry (exactly <c>0x800</c> bytes)
+    /// to preserve verbatim. When omitted, the library reproduces the native <c>sc2</c>
+    /// RSA-3072 plus SHAKE128 construction from the locally derived PFS-image key.
     /// </summary>
     public byte[]? PublisherImageKey { get; set; }
 
@@ -600,8 +599,6 @@ public static class ProsperoPackageBuilder
             var missing = new List<string>();
             if (metadataSigner is null)
                 missing.Add("a caller-supplied trusted RSA-3072 metadata signer");
-            if (usesNaps && publisherImageKey is null)
-                missing.Add("a publisher-authored 0x800-byte IMAGE_KEY blob");
             if (missing.Count != 0)
                 throw new InvalidOperationException(
                     "Strict publisher compatibility requires " + string.Join(", ", missing) + ".");
@@ -613,9 +610,6 @@ public static class ProsperoPackageBuilder
         if (metadataSigner is null)
             warnings.Add(
                 "Publisher metadata signer was not supplied; the embedded research RSA-3072 profile is not trusted by current prospero-pub-cmd builds.");
-        if (usesNaps && publisherImageKey is null)
-            warnings.Add(
-                "Publisher IMAGE_KEY blob was not supplied; the generated research fallback is not known to match the protected sc2 output.");
         log("Building the PS5 package...");
         LibProsperoPkg.PKG.ProsperoPkgBuilder.Build(buildProps, cntPath, out byte[]? nestedImageDigest, out var siInputs, log);
 

@@ -30,28 +30,39 @@ public static class Crypto
 
         if (deterministic)
         {
-            // Explicit reproducible-build profile. The encoded message is still valid
-            // EME-PKCS1-v1_5, but its non-zero PS bytes come from a stable SHA-256 stream.
+            // Reproduce the deterministic RSAES-PKCS1-v1_5 padding used by the
+            // publishing-tool family: seed MT19937 with
+            // SHA256(SHA256(modulus || message)), then hash groups of twelve
+            // big-endian MT words to obtain non-zero PS octets.
             byte[] encoded = new byte[modulus.Length];
             encoded[1] = 2;
             int paddingLength = encoded.Length - data.Length - 3;
-            byte[] seed = SHA256.HashData(
-                Encoding.ASCII.GetBytes("LibProsperoPkg deterministic RSA wrap\0")
-                    .Concat(modulus)
-                    .Concat(data)
-                    .ToArray());
+            byte[] seed = SHA256.HashData(SHA256.HashData(modulus.Concat(data).ToArray()));
+            var seedWords = new uint[seed.Length / 4];
+            for (int i = 0; i < seedWords.Length; i++)
+            {
+                int offset = i * 4;
+                seedWords[i] =
+                    ((uint)seed[offset] << 24) |
+                    ((uint)seed[offset + 1] << 16) |
+                    ((uint)seed[offset + 2] << 8) |
+                    seed[offset + 3];
+            }
+            var mt = new MersenneTwister(seedWords);
             int cursor = 2;
-            uint counter = 0;
             while (cursor < 2 + paddingLength)
             {
-                byte[] input = new byte[seed.Length + 4];
-                seed.CopyTo(input, 0);
-                input[^4] = (byte)(counter >> 24);
-                input[^3] = (byte)(counter >> 16);
-                input[^2] = (byte)(counter >> 8);
-                input[^1] = (byte)counter;
-                counter++;
-                foreach (byte value in SHA256.HashData(input))
+                byte[] source = new byte[12 * sizeof(uint)];
+                for (int i = 0; i < 12; i++)
+                {
+                    uint value = mt.Int32();
+                    int offset = i * 4;
+                    source[offset] = (byte)(value >> 24);
+                    source[offset + 1] = (byte)(value >> 16);
+                    source[offset + 2] = (byte)(value >> 8);
+                    source[offset + 3] = (byte)value;
+                }
+                foreach (byte value in SHA256.HashData(source))
                 {
                     if (value == 0) continue;
                     encoded[cursor++] = value;

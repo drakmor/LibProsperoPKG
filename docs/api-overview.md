@@ -36,9 +36,9 @@ The primary entry point.
   Raw `pfs_image_seed.bin` and `pfs_image_key.bin` sidecars provide the same optional values.
   `NapsPfsImageSeed` also becomes the outer-PFS
   superblock `+0x370` seed; an explicit `OuterPfsSeed` must contain the same bytes.
-  `PublisherImageKey` accepts an exact protected 0x800-byte CNT `IMAGE_KEY`, with
-  `pkg_image_key.bin` as its sidecar fallback. `PublisherEntryKeys` similarly preserves the
-  complete 0xB80-byte publisher `ENTRY_KEYS` record through `pkg_entry_keys.bin`.
+  The builder generates the protected 0x800-byte CNT `IMAGE_KEY` and complete 0xB80-byte
+  `ENTRY_KEYS` locally. `PublisherImageKey` and `PublisherEntryKeys` remain optional verbatim
+  overrides, with `pkg_image_key.bin` and `pkg_entry_keys.bin` as their sidecar fallbacks.
   `LicenseProvider` accepts already-issued decrypted AC/AL RIF/license records from an
   application-defined backend or console bridge; returned bytes are validated before CNT encryption.
 - **`ProsperoBuildResult`** — `OutputPath` and a list of non-fatal `Warnings`.
@@ -62,7 +62,7 @@ The primary entry point.
 | `ProsperoPkgBuilder` | Build the outer PFS + `\x7FCNT` metadata container. |
 | `ProsperoPkgReader` | `DetectType(path/stream)` and `Read(path/stream)` for existing packages. |
 | `ProsperoPackageArchive` | High-level finalized-package reader. `DecryptOuterPfs` verifies/decrypts the outer image; `ExtractOuterFiles` extracts its files; `DecodeInnerPfs` resolves and decompresses NAPS into the logical PPR-PFS image; `ExtractInnerFiles` performs the full package-to-files operation. The `DecryptOuterPfs(package, output, passcode)` and `DecodeInnerPfs(package, output, passcode)` overloads are file-backed and support images larger than a managed array; high-level extraction uses that bounded-memory path automatically. |
-| `ProsperoPublishingSidecar` | Loads conventional protected publisher inputs next to the host executable. `ReadPublisherEntryKeys`, `ReadPublisherImageKey`, `TryReadNapsMeta18`, and `ExportReusableInputs` preserve raw `pkg_entry_keys.bin`, `pkg_image_key.bin`, and SI `naps_meta_18.dat` from an existing package for an exact rebuild of the same publisher context. They do not derive a new `IMAGE_KEY`. A PFS-image key cannot be recovered from a package alone because the passcode is absent, but is derived locally during a build. |
+| `ProsperoPublishingSidecar` | Loads conventional protected publisher inputs next to the host executable. `ReadPublisherEntryKeys`, `ReadPublisherImageKey`, `TryReadNapsMeta18`, and `ExportReusableInputs` preserve raw `pkg_entry_keys.bin`, `pkg_image_key.bin`, and SI `naps_meta_18.dat` from an existing package for an exact rebuild. These are optional overrides: fresh `ENTRY_KEYS` and `IMAGE_KEY` values are generated locally. A PFS-image key cannot be recovered from a package alone because the passcode is absent, but is derived locally during a build. |
 | `IProsperoLicenseProvider` / `ProsperoLicenseArtifacts` | Provider boundary for backend/SDK/console-issued decrypted `license.dat` and `license.info`. `ProsperoDirectoryLicenseProvider` loads the conventional two-file representation. The builder validates size, `RIF\0`, content id and entitlement key, then applies the normal volume-specific CNT entry encryption. |
 | `ProsperoCntEntryPolicy` | Central publisher policy for CNT flags, key index and fixed-entry naming. It distinguishes GD `license.info` key index 2 from AC/AL index 4 and applies key index 3 to protected NP/self/image/delta/reserved records. |
 | `ProsperoPkgWriter` | Low-level container writer (`ProsperoPkgWriterEntry`, `ProsperoPkgWriterOptions`). |
@@ -92,7 +92,9 @@ The primary entry point.
   `PrimaryId` selects the identity used by publisher `ENTRY_KEYS` index 1 and the PFS-image-key
   KDF; it defaults to `ContentId`. `NapsPfsImageSeed` fixes the seed used by the built-in streaming `obcc`
   generator. `NapsPfsImageKey` is an optional expected value; the actual key is derived locally.
-  `PublisherImageKey` preserves a publisher/sc2-authored 0x800-byte CNT key blob verbatim.
+  The native 0x800-byte `IMAGE_KEY` is generated as
+  `RSA3072(pfs-image-key)[0x180] || SHAKE128(SHA3-256(pfs-image-key), 0x680)`;
+  `PublisherImageKey` can still preserve an existing blob verbatim.
   `LicenseProvider` supplies already-issued RIF/license records when they are not stored beside
   the source GP5.
   Set
@@ -114,7 +116,7 @@ The primary entry point.
 | `ProsperoOuterPfsSignature` | PS5 nwonly outer-PFS signing primitives. `ComputeBlockHash` (plain SHA3-256 per-block/dinode hash), `ComputeSuperblockIcv`/`WriteSuperblockIcv` (`SHA3-256(superblock[0:0x5a0])` with the `icv` field zeroed), `BlockSector(index, signed)` (the bit-47 signed-block sector flag). |
 | `ProsperoOuterPfsBuilder` | PS5 nwonly outer-PFS **structure generator**: assembles the data-first plaintext outer image from its files (`pfs_image.dat`, `naps_pkg_layout.dat`) — inode table with per-block SHA3 hashes, super-root/uroot dirents, the `\x7fFLT` inode_flat_path_table (custom reduced-Keccak path hash), and the signed superblock (+`icv`). `BuildPlaintext`, `Encrypt`, `BuildEncrypted`, `BuildForPackage`, and bounded-memory `BuildForPackageToFile`. Signed files use 12 direct blocks, `ib[0]` single indirect, and `ib[1]` double indirect (about 202.3 GiB per inode). Types: `ProsperoOuterFile`, `ProsperoOuterFileSource`, `ProsperoOuterPfsBuildParameters`, `ProsperoOuterPfsBuildResult`, `ProsperoOuterPackageFileResult`. |
 | `ProsperoPublisherPprBuilder` | Publisher artifact pipeline from a source folder through relocated direct-offset PPR-PFS (`mode 0x18`, superblock at logical 0x400000), NAPS, data-first outer PFS and AES-XTS. `Build` is the compatibility in-memory API; `BuildFileBacked` streams the logical/NAPS/outer layers to files and returns `ProsperoPublisherPprFileBuildResult`. Both return publisher `imagedigs.dat` metadata and the logical digest and validate the reverse path. |
-| `ProsperoPfsKeys` | PFS-image key derivation using SHA3-256. `DeriveEkpfs(contentId, passcode)`, `DeriveImageEncryptionKeys(ekpfs, seed)` → `(tweakKey, dataKey)`, overload `DeriveImageEncryptionKeys(contentId, passcode, seed)` → `(tweakKey, dataKey)`, `DeriveImageSignKey(ekpfs, seed)`. |
+| `ProsperoPfsKeys` | PFS-image key derivation using SHA3-256. `DeriveEkpfs(contentId, passcode)`, `DerivePublisherPfsImageKey(primaryId, passcode, seed)`, `BuildPublisherImageKey(pfsImageKey)`, `DeriveImageEncryptionKeys(ekpfs, seed)` → `(tweakKey, dataKey)`, overload `DeriveImageEncryptionKeys(contentId, passcode, seed)` → `(tweakKey, dataKey)`, `DeriveImageSignKey(ekpfs, seed)`. |
 | `ProsperoPfsc` | PFSC block compression. `PackFile`, `Unpack`, `IsPfsc`. |
 
 Each carries an options/result record pair (`ProsperoPfsLayoutOptions`/`Result`,

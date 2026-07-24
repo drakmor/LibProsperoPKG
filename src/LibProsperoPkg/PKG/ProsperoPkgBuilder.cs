@@ -209,7 +209,10 @@ public sealed class ProsperoPkgBuildProperties
     /// </summary>
     public byte[]? NapsPfsImageSeed { get; init; }
 
-    /// <summary>Optional publisher-authored raw 0x800-byte CNT IMAGE_KEY entry.</summary>
+    /// <summary>
+    /// Optional publisher-authored raw 0x800-byte CNT IMAGE_KEY entry to preserve verbatim.
+    /// When omitted, the native RSA-3072 plus SHAKE128 payload is generated locally.
+    /// </summary>
     public byte[]? PublisherImageKey { get; init; }
 
     /// <summary>Optional publisher-authored raw 0xB80-byte CNT ENTRY_KEYS entry.</summary>
@@ -665,7 +668,8 @@ public static class ProsperoPkgBuilder
         ulong mchunk1Size = mchunkTotal - mchunk0Size;
         var pkg = BuildContainer(
             props, ekpfs, sourceFolder, (ulong)outer.PfsSize, outer.ImageDigests.Length,
-            playgoFileCount, mchunk0Size, mchunk1Size, playgoPaths, publisherNwonly: true);
+            playgoFileCount, mchunk0Size, mchunk1Size, playgoPaths,
+            publisherNwonly: true, publisherPfsImageKey: pfsImageKey);
         var imagedigsEntry = (GenericEntry)pkg.Entries.First(e => (uint)e.Id == ImagedigsEntryId);
 
         // imagedigs stores each SHA3 digest with its byte order reversed.
@@ -1079,7 +1083,8 @@ public static class ProsperoPkgBuilder
         ProsperoPkgBuildProperties props, byte[] ekpfs, string sourceFolder,
         ulong pfsSize, int imagedigsSize, uint playgoFileCount,
         ulong mchunk0Size, ulong mchunk1Size,
-        IReadOnlyList<string>? playgoPaths = null, bool publisherNwonly = false)
+        IReadOnlyList<string>? playgoPaths = null, bool publisherNwonly = false,
+        byte[]? publisherPfsImageKey = null)
     {
         bool noData = props.VolumeType == ProsperoVolumeType.AdditionalContentNoData;
         uint contentType = ContentTypeFor(props.VolumeType);
@@ -1142,15 +1147,15 @@ public static class ProsperoPkgBuilder
             ? KeysEntry.FromPublisherBytes(props.PublisherEntryKeys)
             : new KeysEntry(
                 props.ContentId, props.Passcode, props.UsePublisherPprNaps,
-                props.DeterministicBuild, props.PrimaryId);
+                props.UsePublisherPprNaps || props.DeterministicBuild, props.PrimaryId);
         byte[]? imageKeyBody = null;
         if (!noData && props.UsePublisherPprNaps)
         {
-            byte[] imageEkpfs = props.PrimaryId is null
-                ? ekpfs
-                : ProsperoPfsKeys.DeriveEkpfs(props.PrimaryId, props.Passcode);
+            if (publisherPfsImageKey is not { Length: 32 })
+                throw new InvalidDataException(
+                    "The publisher IMAGE_KEY producer requires the derived 32-byte pfs-image-key.");
             imageKeyBody = props.PublisherImageKey?.AsSpan().ToArray()
-                ?? BuildPublisherImageKeyEntry(imageEkpfs, props.DeterministicBuild);
+                ?? ProsperoPfsKeys.BuildPublisherImageKey(publisherPfsImageKey);
         }
         else if (!noData)
         {
@@ -1246,31 +1251,6 @@ public static class ProsperoPkgBuilder
         if (id is 0x2010 or 0x2011) return 4;          // PlayGo tails
         if (id is >= 0x1200 and < 0x2000 || id is 0x1006 or 0x100D) return 3; // media
         return 1;                                      // backend-authored sce_sys blobs
-    }
-
-    /// <summary>
-    /// Builds the structural research fallback for the 0x800-byte publisher IMAGE_KEY payload.
-    /// The exact sc2 producer is not recovered: reference entries contain eight independent
-    /// 0x100-byte regions, while this legacy fallback concatenates RSA-3072 PKCS#1-v1_5 wraps
-    /// and necessarily truncates the final ciphertext. It is suitable only for internal
-    /// round-trip tests; publisher compatibility requires <see cref="ProsperoPkgBuildProperties.PublisherImageKey"/>.
-    /// </summary>
-    private static byte[] BuildPublisherImageKeyEntry(byte[] ekpfs, bool deterministic)
-    {
-        const int imageKeySize = 0x800;
-        const int rsa3072Size = 384;
-        byte[] modulus = LibProsperoPkg.Keys.ProsperoKeys.MountImageKey.ToArray();
-        if (modulus.Length != rsa3072Size)
-            throw new InvalidDataException("The publisher mount-image modulus must be 384 bytes.");
-
-        byte[] result = new byte[imageKeySize];
-        for (int offset = 0; offset < result.Length; offset += rsa3072Size)
-        {
-            byte[] wrapped = Crypto.RsaPkcs1EncryptKey(modulus, ekpfs, deterministic);
-            wrapped.AsSpan(0, Math.Min(wrapped.Length, result.Length - offset))
-                .CopyTo(result.AsSpan(offset));
-        }
-        return result;
     }
 
     private static void LayOutEntries(

@@ -9,6 +9,7 @@
 #nullable enable
 using LibProsperoPkg.Util;
 using System;
+using System.IO;
 using System.Security.Cryptography;
 
 namespace LibProsperoPkg.PFS;
@@ -45,6 +46,34 @@ public static class ProsperoPfsKeys
         ValidateSeed(pfsImageSeed);
         byte[] ekpfs = DeriveEkpfs(primaryId, passcode);
         return HMACSHA256.HashData(ekpfs, pfsImageSeed);
+    }
+
+    /// <summary>
+    /// Builds the exact 0x800-byte publisher CNT <c>IMAGE_KEY</c> payload used by
+    /// <c>sc2 --build</c>. The first 0x180 bytes are the deterministically padded
+    /// RSA-3072 wrap of <paramref name="pfsImageKey"/> under the mount-image modulus.
+    /// The remaining 0x680 bytes are
+    /// <c>SHAKE128(SHA3-256(pfsImageKey), 0x680)</c>.
+    /// </summary>
+    public static byte[] BuildPublisherImageKey(byte[] pfsImageKey)
+    {
+        ValidateEkpfs(pfsImageKey);
+
+        const int rsaSize = 0x180;
+        const int imageKeySize = 0x800;
+        byte[] modulus = LibProsperoPkg.Keys.ProsperoKeys.MountImageKey.ToArray();
+        if (modulus.Length != rsaSize)
+            throw new InvalidDataException(
+                "The publisher mount-image modulus must be exactly 0x180 bytes.");
+
+        byte[] result = new byte[imageKeySize];
+        byte[] wrapped = Crypto.RsaPkcs1EncryptKey(
+            modulus, pfsImageKey, deterministic: true);
+        wrapped.CopyTo(result, 0);
+
+        byte[] digest = ProsperoSha3.HashData(pfsImageKey);
+        ProsperoSha3.Shake128Data(digest, result.AsSpan(rsaSize));
+        return result;
     }
 
     /// <summary>

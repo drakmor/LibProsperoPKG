@@ -29,6 +29,54 @@ public static class ProsperoSha3
         return DigestSize;
     }
 
+    /// <summary>
+    /// Portable SHAKE128 extendable-output function. This is kept managed because the platform
+    /// <see cref="Shake128"/> API may be present at compile time while remaining unsupported by
+    /// the active Windows cryptographic provider.
+    /// </summary>
+    public static void Shake128Data(ReadOnlySpan<byte> data, Span<byte> destination)
+    {
+        const int rate = 168;
+        var lanes = new ulong[25];
+
+        while (data.Length >= rate)
+        {
+            for (int i = 0; i < rate / sizeof(ulong); i++)
+                lanes[i] ^= BinaryPrimitives.ReadUInt64LittleEndian(data[(i * 8)..]);
+            ManagedSha3.Permute(lanes);
+            data = data[rate..];
+        }
+
+        Span<byte> finalBlock = stackalloc byte[rate];
+        finalBlock.Clear();
+        data.CopyTo(finalBlock);
+        finalBlock[data.Length] ^= 0x1F;
+        finalBlock[rate - 1] ^= 0x80;
+        for (int i = 0; i < rate / sizeof(ulong); i++)
+            lanes[i] ^= BinaryPrimitives.ReadUInt64LittleEndian(finalBlock[(i * 8)..]);
+        ManagedSha3.Permute(lanes);
+
+        Span<byte> partialWord = stackalloc byte[sizeof(ulong)];
+        while (!destination.IsEmpty)
+        {
+            int take = Math.Min(rate, destination.Length);
+            int fullWords = take / sizeof(ulong);
+            for (int i = 0; i < fullWords; i++)
+                BinaryPrimitives.WriteUInt64LittleEndian(
+                    destination[(i * 8)..], lanes[i]);
+            int remainder = take - fullWords * sizeof(ulong);
+            if (remainder != 0)
+            {
+                BinaryPrimitives.WriteUInt64LittleEndian(
+                    partialWord, lanes[fullWords]);
+                partialWord[..remainder].CopyTo(destination[(fullWords * 8)..]);
+            }
+            destination = destination[take..];
+            if (!destination.IsEmpty)
+                ManagedSha3.Permute(lanes);
+        }
+    }
+
     public static byte[] HashData(Stream stream)
     {
         ArgumentNullException.ThrowIfNull(stream);
@@ -117,7 +165,7 @@ public static class ProsperoSha3
             Permute(lanes);
         }
 
-        private static void Permute(ulong[] a)
+        public static void Permute(ulong[] a)
         {
             Span<ulong> c = stackalloc ulong[5];
             Span<ulong> d = stackalloc ulong[5];
