@@ -130,7 +130,8 @@ var options = new ProsperoBuildOptions
     // Optional sc2 estimate outputs for exact naps_meta_18 obcc generation:
     // NapsPfsImageKey  = File.ReadAllBytes("pfs_image_key.bin"),  // exactly 32 bytes
     // NapsPfsImageSeed = File.ReadAllBytes("pfs_image_seed.bin"), // exactly 16 bytes
-    // Optional protected CNT entry produced by the publisher/sc2 profile:
+    // Optional protected CNT entries produced by the publisher/sc2 profile:
+    // PublisherEntryKeys = File.ReadAllBytes("pkg_entry_keys.bin"), // exactly 0xB80 bytes
     // PublisherImageKey = File.ReadAllBytes("pkg_image_key.bin"), // exactly 0x800 bytes
 };
 
@@ -197,7 +198,8 @@ The protected CNT `IMAGE_KEY` can be supplied as `PublisherImageKey` or the raw
 claimed to reproduce the publisher/sc2 key wrapper.
 `naps_meta_18.dat` is likewise loaded automatically when placed next to the executable.
 For an exact rebuild of the same protected publisher context, run
-`export-publisher-inputs <reference.pkg> <sidecar-dir>` to preserve both blobs without
+`export-publisher-inputs <reference.pkg> <sidecar-dir>` to preserve `ENTRY_KEYS`,
+`IMAGE_KEY`, and `naps_meta_18` without
 manually locating the embedded CNT or SI ZIP. This does not recover the separate
 `sc2 estimate` PFS-image key and does not make an `IMAGE_KEY` portable to another entitlement.
 The verified Publishing Tools 2.79 debug/AC profile disables keyed NAPS outer-block CMAC and

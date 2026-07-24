@@ -302,6 +302,26 @@ public class KeysEntry : Entry
         }
         return new KeysEntry(seedDigest, keys, keySize == 384) { meta = e };
     }
+
+    /// <summary>
+    /// Parses a complete raw publisher <c>ENTRY_KEYS</c> payload (0xB80 bytes) without
+    /// decrypting or rewrapping any of its seven RSA-3072 records.
+    /// </summary>
+    public static KeysEntry FromPublisherBytes(byte[] bytes)
+    {
+        ArgumentNullException.ThrowIfNull(bytes);
+        if (bytes.Length != 0xB80)
+            throw new InvalidDataException(
+                $"Publisher ENTRY_KEYS must contain exactly 0xB80 bytes, not 0x{bytes.Length:X}.");
+        var meta = new MetaEntry
+        {
+            id = EntryId.ENTRY_KEYS,
+            DataOffset = 0,
+            DataSize = checked((uint)bytes.Length),
+        };
+        using var stream = new MemoryStream(bytes, writable: false);
+        return Read(meta, stream);
+    }
 }
 
 /// <summary>

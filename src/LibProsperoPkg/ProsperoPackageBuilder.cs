@@ -196,6 +196,12 @@ public sealed class ProsperoBuildOptions
     public byte[]? PublisherImageKey { get; set; }
 
     /// <summary>
+    /// Optional publisher-authored raw <c>ENTRY_KEYS</c> CNT entry (exactly <c>0xB80</c> bytes).
+    /// Supplying it preserves all seven RSA-3072 wrapped records verbatim for an exact rebuild.
+    /// </summary>
+    public byte[]? PublisherEntryKeys { get; set; }
+
+    /// <summary>
     /// Optional fixed 16-byte outer-PFS seed. When omitted, the seed is derived in
     /// <see cref="DeterministicBuild"/> mode and generated with a cryptographic RNG otherwise.
     /// </summary>
@@ -430,6 +436,9 @@ public static class ProsperoPackageBuilder
         if (options.PublisherImageKey is { Length: not 0x800 })
             throw new ArgumentException(
                 "Publisher IMAGE_KEY must contain exactly 0x800 bytes.", nameof(options));
+        if (options.PublisherEntryKeys is { Length: not 0xB80 })
+            throw new ArgumentException(
+                "Publisher ENTRY_KEYS must contain exactly 0xB80 bytes.", nameof(options));
         if (options.OuterPfsSeed is not null &&
             options.NapsPfsImageSeed is not null &&
             !options.OuterPfsSeed.AsSpan().SequenceEqual(options.NapsPfsImageSeed))
@@ -475,6 +484,8 @@ public static class ProsperoPackageBuilder
         byte[]? napsPfsImageSeed = options.NapsPfsImageSeed;
         byte[]? publisherImageKey = options.PublisherImageKey
             ?? ProsperoPublishingSidecar.TryLoadPublisherImageKey();
+        byte[]? publisherEntryKeys = options.PublisherEntryKeys
+            ?? ProsperoPublishingSidecar.TryLoadPublisherEntryKeys();
         byte[]? napsMeta18 = options.NapsMeta18
             ?? ProsperoPublishingSidecar.TryLoadNapsMeta18();
         if (napsPfsImageKey is null && napsPfsImageSeed is null)
@@ -506,6 +517,10 @@ public static class ProsperoPackageBuilder
         if (options.PublisherImageKey is null && publisherImageKey is not null)
             log(
                 $"Loaded {ProsperoPublishingSidecar.PublisherImageKeyFileName} from " +
+                $"{ProsperoPublishingSidecar.DefaultDirectory}.");
+        if (options.PublisherEntryKeys is null && publisherEntryKeys is not null)
+            log(
+                $"Loaded {ProsperoPublishingSidecar.PublisherEntryKeysFileName} from " +
                 $"{ProsperoPublishingSidecar.DefaultDirectory}.");
         if (options.NapsMeta18 is null && napsMeta18 is not null)
             log(
@@ -541,6 +556,7 @@ public static class ProsperoPackageBuilder
             NapsPfsImageKey = napsPfsImageKey,
             NapsPfsImageSeed = napsPfsImageSeed,
             PublisherImageKey = publisherImageKey,
+            PublisherEntryKeys = publisherEntryKeys,
             OuterPfsSeed = options.OuterPfsSeed,
             DeterministicBuild = options.DeterministicBuild,
             MetadataSigner = metadataSigner,

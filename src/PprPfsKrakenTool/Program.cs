@@ -1101,6 +1101,16 @@ internal static class Program
                 Enumerable.Range(0, 0x800)
                     .Select(i => (byte)((i * 29 + 7) & 0xFF))
                     .ToArray();
+            byte[] deterministicPublisherEntryKeys;
+            using (var entryKeysStream = new MemoryStream())
+            {
+                new KeysEntry(
+                    deterministicContentId,
+                    deterministicPasscode,
+                    publisherProfile: true,
+                    deterministic: true).Write(entryKeysStream);
+                deterministicPublisherEntryKeys = entryKeysStream.ToArray();
+            }
             ProsperoBuildResult build1 = ProsperoPackageBuilder.Build(
                 new ProsperoBuildOptions
                 {
@@ -1114,6 +1124,7 @@ internal static class Program
                     NapsPfsImageKey = deterministicPfsImageKey,
                     NapsPfsImageSeed = deterministicPfsImageSeed,
                     PublisherImageKey = deterministicPublisherImageKey,
+                    PublisherEntryKeys = deterministicPublisherEntryKeys,
                 },
                 _ => { });
             ProsperoBuildResult build2 = ProsperoPackageBuilder.Build(
@@ -1129,6 +1140,7 @@ internal static class Program
                     NapsPfsImageKey = deterministicPfsImageKey,
                     NapsPfsImageSeed = deterministicPfsImageSeed,
                     PublisherImageKey = deterministicPublisherImageKey,
+                    PublisherEntryKeys = deterministicPublisherEntryKeys,
                 },
                 _ => { });
 
@@ -1146,6 +1158,7 @@ internal static class Program
                         NapsPfsImageKey = deterministicPfsImageKey,
                         NapsPfsImageSeed = deterministicPfsImageSeed,
                         PublisherImageKey = deterministicPublisherImageKey,
+                        PublisherEntryKeys = deterministicPublisherEntryKeys,
                         RequirePublisherCompatibility = true,
                     },
                     _ => { });
@@ -1221,6 +1234,8 @@ internal static class Program
                 throw new InvalidDataException("Deterministic APP regression package is not a finalized debug image.");
             ProsperoPkgEntry deterministicImageKey = parsedDeterministic.Entries.Single(
                 entry => entry.RawId == 0x0020);
+            ProsperoPkgEntry deterministicEntryKeys = parsedDeterministic.Entries.Single(
+                entry => entry.RawId == 0x0010);
             ulong deterministicCntBase = parsedDeterministic.Fih?.EmbeddedCntOffset ?? 0;
             if (!package1.AsSpan(
                     checked((int)(deterministicCntBase + deterministicImageKey.DataOffset)),
@@ -1230,17 +1245,29 @@ internal static class Program
                 throw new InvalidDataException(
                     "Caller-supplied publisher IMAGE_KEY was not preserved verbatim.");
             }
+            if (!package1.AsSpan(
+                    checked((int)(deterministicCntBase + deterministicEntryKeys.DataOffset)),
+                    checked((int)deterministicEntryKeys.DataSize))
+                    .SequenceEqual(deterministicPublisherEntryKeys))
+            {
+                throw new InvalidDataException(
+                    "Caller-supplied publisher ENTRY_KEYS was not preserved verbatim.");
+            }
             string exportedInputsDirectory = Path.Combine(regressionRoot, "exported-publisher-inputs");
             IReadOnlyList<string> exportedInputs =
                 ProsperoPublishingSidecar.ExportReusableInputs(
                     build1.OutputPath, exportedInputsDirectory);
             string exportedImageKeyPath = Path.Combine(
                 exportedInputsDirectory, ProsperoPublishingSidecar.PublisherImageKeyFileName);
+            string exportedEntryKeysPath = Path.Combine(
+                exportedInputsDirectory, ProsperoPublishingSidecar.PublisherEntryKeysFileName);
             string exportedMeta18Path = Path.Combine(
                 exportedInputsDirectory, ProsperoPublishingSidecar.NapsMeta18FileName);
-            if (exportedInputs.Count != 2 ||
+            if (exportedInputs.Count != 3 ||
                 !File.ReadAllBytes(exportedImageKeyPath).AsSpan()
                     .SequenceEqual(deterministicPublisherImageKey) ||
+                !File.ReadAllBytes(exportedEntryKeysPath).AsSpan()
+                    .SequenceEqual(deterministicPublisherEntryKeys) ||
                 !File.Exists(exportedMeta18Path) ||
                 File.ReadAllBytes(exportedMeta18Path).Length == 0)
             {

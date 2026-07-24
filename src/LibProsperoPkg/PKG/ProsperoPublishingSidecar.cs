@@ -31,6 +31,9 @@ public static class ProsperoPublishingSidecar
     /// <summary>Default raw 0x800-byte publisher CNT IMAGE_KEY sidecar.</summary>
     public const string PublisherImageKeyFileName = "pkg_image_key.bin";
 
+    /// <summary>Default raw 0xB80-byte publisher CNT ENTRY_KEYS sidecar.</summary>
+    public const string PublisherEntryKeysFileName = "pkg_entry_keys.bin";
+
     /// <summary>Default publisher-authored encrypted NAPS metadata sidecar.</summary>
     public const string NapsMeta18FileName = "naps_meta_18.dat";
 
@@ -85,6 +88,10 @@ public static class ProsperoPublishingSidecar
     public static byte[]? TryLoadPublisherImageKey(string? directory = null) =>
         TryLoadRawSidecar(PublisherImageKeyFileName, 0x800, directory);
 
+    /// <summary>Loads the raw 0xB80-byte <c>pkg_entry_keys.bin</c> sidecar when present.</summary>
+    public static byte[]? TryLoadPublisherEntryKeys(string? directory = null) =>
+        TryLoadRawSidecar(PublisherEntryKeysFileName, 0xB80, directory);
+
     /// <summary>
     /// Loads a publisher-authored <c>naps_meta_18.dat</c> sidecar when present.
     /// The payload is intentionally kept encrypted and is validated by the SI/NAPS parser later.
@@ -101,21 +108,36 @@ public static class ProsperoPublishingSidecar
     /// when rebuilding the same publisher context.
     /// </summary>
     public static byte[] ReadPublisherImageKey(string packagePath)
+        => ReadRawCntEntry(packagePath, EntryId.IMAGE_KEY, 0x800, "IMAGE_KEY");
+
+    /// <summary>
+    /// Reads the complete raw 0xB80-byte publisher CNT <c>ENTRY_KEYS</c> entry.
+    /// The RSA ciphertexts are preserved verbatim.
+    /// </summary>
+    public static byte[] ReadPublisherEntryKeys(string packagePath)
+        => ReadRawCntEntry(packagePath, EntryId.ENTRY_KEYS, 0xB80, "ENTRY_KEYS");
+
+    private static byte[] ReadRawCntEntry(
+        string packagePath,
+        EntryId entryId,
+        int expectedLength,
+        string displayName)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(packagePath);
         using var input = File.OpenRead(packagePath);
         ProsperoPkg package = ProsperoPkgReader.Read(input);
         ProsperoPkgEntry entry = package.Entries.SingleOrDefault(
-            candidate => candidate.RawId == (uint)EntryId.IMAGE_KEY)
-            ?? throw new InvalidDataException("The package does not contain a CNT IMAGE_KEY entry.");
-        if (entry.DataSize != 0x800)
+            candidate => candidate.RawId == (uint)entryId)
+            ?? throw new InvalidDataException($"The package does not contain a CNT {displayName} entry.");
+        if (entry.DataSize != expectedLength)
             throw new InvalidDataException(
-                $"Publisher CNT IMAGE_KEY must contain exactly 0x800 bytes, not 0x{entry.DataSize:X}.");
+                $"Publisher CNT {displayName} must contain exactly 0x{expectedLength:X} bytes, " +
+                $"not 0x{entry.DataSize:X}.");
 
         long cntBase = package.Fih is null ? 0 : checked((long)package.Fih.EmbeddedCntOffset);
         long offset = checked(cntBase + entry.DataOffset);
         if (offset < 0 || offset > input.Length - entry.DataSize)
-            throw new InvalidDataException("The CNT IMAGE_KEY range is outside the package.");
+            throw new InvalidDataException($"The CNT {displayName} range is outside the package.");
 
         byte[] value = new byte[entry.DataSize];
         input.Position = offset;
@@ -170,10 +192,12 @@ public static class ProsperoPublishingSidecar
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(outputDirectory);
         byte[] imageKey = ReadPublisherImageKey(packagePath);
+        byte[] entryKeys = ReadPublisherEntryKeys(packagePath);
         byte[]? napsMeta18 = TryReadNapsMeta18(packagePath);
         string directory = Path.GetFullPath(outputDirectory);
         var outputs = new List<(string Path, byte[] Data)>
         {
+            (Path.Combine(directory, PublisherEntryKeysFileName), entryKeys),
             (Path.Combine(directory, PublisherImageKeyFileName), imageKey),
         };
         if (napsMeta18 is not null)

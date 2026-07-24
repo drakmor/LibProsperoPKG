@@ -198,6 +198,9 @@ public sealed class ProsperoPkgBuildProperties
     /// <summary>Optional publisher-authored raw 0x800-byte CNT IMAGE_KEY entry.</summary>
     public byte[]? PublisherImageKey { get; init; }
 
+    /// <summary>Optional publisher-authored raw 0xB80-byte CNT ENTRY_KEYS entry.</summary>
+    public byte[]? PublisherEntryKeys { get; init; }
+
     /// <summary>
     /// Optional fixed 16-byte outer-PFS seed. When omitted, the seed is derived in
     /// <see cref="DeterministicBuild"/> mode and generated with a cryptographic RNG otherwise.
@@ -310,6 +313,9 @@ public static class ProsperoPkgBuilder
         if (props.PublisherImageKey is { Length: not 0x800 })
             throw new ArgumentException(
                 "Publisher IMAGE_KEY must contain exactly 0x800 bytes.", nameof(props));
+        if (props.PublisherEntryKeys is { Length: not 0xB80 })
+            throw new ArgumentException(
+                "Publisher ENTRY_KEYS must contain exactly 0xB80 bytes.", nameof(props));
         if (props.OuterPfsSeed is not null &&
             props.NapsPfsImageSeed is not null &&
             !props.OuterPfsSeed.AsSpan().SequenceEqual(props.NapsPfsImageSeed))
@@ -1106,8 +1112,10 @@ public static class ProsperoPkgBuilder
         };
 
         // System-container entries (the 6 SC entries), ids 0x1/0x10/0x20/0x80/0x100/0x200.
-        pkg.EntryKeys = new KeysEntry(
-            props.ContentId, props.Passcode, props.UsePublisherPprNaps, props.DeterministicBuild);
+        pkg.EntryKeys = props.PublisherEntryKeys is not null
+            ? KeysEntry.FromPublisherBytes(props.PublisherEntryKeys)
+            : new KeysEntry(
+                props.ContentId, props.Passcode, props.UsePublisherPprNaps, props.DeterministicBuild);
         byte[]? imageKeyBody = null;
         if (!noData && props.UsePublisherPprNaps)
         {
