@@ -1276,6 +1276,8 @@ public static class ProsperoPkgBuilder
         (uint)EntryId.ENTRY_NAMES => 0x40000000,
         (uint)EntryId.LICENSE_DAT => 0x80000000,
         (uint)EntryId.LICENSE_INFO => 0x80000000,
+        (uint)EntryId.NPTITLE_DAT => 0x80000000,
+        (uint)EntryId.NPBIND_DAT => 0x80000000,
         0x2000 => 0x00000000,                          // param.json
         _ => 0x08000000,                               // media / data entries
     };
@@ -1284,6 +1286,8 @@ public static class ProsperoPkgBuilder
     {
         (uint)EntryId.LICENSE_DAT => 0x00003000,       // derived key index 3
         (uint)EntryId.LICENSE_INFO => 0x00004000,      // derived key index 4
+        (uint)EntryId.NPTITLE_DAT => 0x00003000,       // derived key index 3
+        (uint)EntryId.NPBIND_DAT => 0x00003000,        // derived key index 3
         _ => 0u,
     };
 

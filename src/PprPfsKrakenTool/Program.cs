@@ -773,6 +773,34 @@ internal static class Program
             throw new InvalidDataException($"Managed SHA3-256 KAT failed: {actual}");
         Console.WriteLine("selftest: SHA3-256 known-answer test passed");
 
+        byte[] cbcCfbPlaintext = Convert.FromHexString(
+            "6BC1BEE22E409F96E93D7E117393172A" +
+            "AE2D8A571E03AC9C9EB76FAC45AF8E51" +
+            "30C81C46A35CE411E5FB");
+        byte[] cbcCfbCiphertext = new byte[cbcCfbPlaintext.Length];
+        Crypto.AesCbcCfb128Encrypt(
+            cbcCfbCiphertext,
+            cbcCfbPlaintext,
+            cbcCfbPlaintext.Length,
+            Convert.FromHexString("2B7E151628AED2A6ABF7158809CF4F3C"),
+            Convert.FromHexString("000102030405060708090A0B0C0D0E0F"));
+        byte[] expectedCbcCfb = Convert.FromHexString(
+            "7649ABAC8119B246CEE98E9B12E9197D" +
+            "5086CB9B507219EE95DB113A917678B2" +
+            "71016FE31A6390CAF77E");
+        if (!cbcCfbCiphertext.AsSpan().SequenceEqual(expectedCbcCfb))
+            throw new InvalidDataException(
+                $"AES-CBC-CFB128 KAT failed: {Convert.ToHexString(cbcCfbCiphertext)}");
+        Crypto.AesCbcCfb128Decrypt(
+            cbcCfbCiphertext,
+            cbcCfbCiphertext,
+            cbcCfbCiphertext.Length,
+            Convert.FromHexString("2B7E151628AED2A6ABF7158809CF4F3C"),
+            Convert.FromHexString("000102030405060708090A0B0C0D0E0F"));
+        if (!cbcCfbCiphertext.AsSpan().SequenceEqual(cbcCfbPlaintext))
+            throw new InvalidDataException("AES-CBC-CFB128 in-place decryption failed.");
+        Console.WriteLine("selftest: AES-CBC-CFB128 residual-block KAT passed");
+
         byte[] checksumKat = [1, 2, 3];
         ulong weak = ProsperoNapsMeta.ComputeInputChecksum(checksumKat);
         ulong rolling = ProsperoNapsMeta.ComputeRollingHash(checksumKat);
@@ -1431,6 +1459,8 @@ internal static class Program
                   </volume>
                   <files>
                     <file dst_path="sce_sys/param.json" src_path="sce_sys\param.json"/>
+                    <file dst_path="sce_sys/nptitle.dat" src_path="sce_sys\nptitle.dat"/>
+                    <file dst_path="sce_sys/npbind.dat" src_path="sce_sys\npbind.dat"/>
                     <file dst_path="data/payload.bin" src_path="data\payload.bin"/>
                   </files>
                 </psproject>
@@ -1455,6 +1485,23 @@ internal static class Program
                 .CopyTo(licenseInfo, 0x30);
             File.WriteAllBytes(Path.Combine(acSource, "sce_sys", "license.dat"), licenseDat);
             File.WriteAllBytes(Path.Combine(acSource, "sce_sys", "license.info"), licenseInfo);
+            byte[] nptitle = new byte[ProsperoSystemFiles.NptitleSize];
+            "NPTD"u8.CopyTo(nptitle);
+            BinaryPrimitives.WriteUInt32BigEndian(nptitle.AsSpan(4), 0x80);
+            Encoding.ASCII.GetBytes("PPSA00001_00").CopyTo(nptitle, 0x10);
+            File.WriteAllBytes(Path.Combine(acSource, "sce_sys", "nptitle.dat"), nptitle);
+            byte[] npbind = new byte[ProsperoSystemFiles.NpbindSize];
+            BinaryPrimitives.WriteUInt32BigEndian(
+                npbind, ProsperoSystemFiles.NpbindMagic);
+            BinaryPrimitives.WriteUInt32BigEndian(npbind.AsSpan(4), 1);
+            BinaryPrimitives.WriteUInt32BigEndian(
+                npbind.AsSpan(0x0C), ProsperoSystemFiles.NpbindSize);
+            const string testCommId = "NPWR23725_00";
+            BinaryPrimitives.WriteUInt16BigEndian(npbind.AsSpan(0x80), 0x0010);
+            BinaryPrimitives.WriteUInt16BigEndian(
+                npbind.AsSpan(0x82), checked((ushort)testCommId.Length));
+            Encoding.ASCII.GetBytes(testCommId).CopyTo(npbind, 0x84);
+            File.WriteAllBytes(Path.Combine(acSource, "sce_sys", "npbind.dat"), npbind);
 
             ProsperoBuildResult acBuild = ProsperoPackageBuilder.Build(
                 new ProsperoBuildOptions
@@ -1473,16 +1520,35 @@ internal static class Program
                 parsedAc.Entries.SingleOrDefault(entry => entry.RawId == 0x0400);
             ProsperoPkgEntry? licenseInfoEntry =
                 parsedAc.Entries.SingleOrDefault(entry => entry.RawId == 0x0401);
+            ProsperoPkgEntry? nptitleEntry =
+                parsedAc.Entries.SingleOrDefault(entry => entry.RawId == 0x0402);
+            ProsperoPkgEntry? npbindEntry =
+                parsedAc.Entries.SingleOrDefault(entry => entry.RawId == 0x0403);
             if (licenseDatEntry is null || licenseInfoEntry is null ||
+                nptitleEntry is null || npbindEntry is null ||
                 licenseDatEntry.DataSize != ProsperoSystemFiles.LicenseDatSize ||
                 licenseInfoEntry.DataSize != ProsperoSystemFiles.LicenseInfoSize ||
                 licenseDatEntry.Flags1 != 0x80000000 || licenseDatEntry.Flags2 != 0x00003000 ||
-                licenseInfoEntry.Flags1 != 0x80000000 || licenseInfoEntry.Flags2 != 0x00004000)
+                licenseInfoEntry.Flags1 != 0x80000000 || licenseInfoEntry.Flags2 != 0x00004000 ||
+                nptitleEntry.Flags1 != 0x80000000 || nptitleEntry.Flags2 != 0x00003000 ||
+                npbindEntry.Flags1 != 0x80000000 || npbindEntry.Flags2 != 0x00003000)
             {
                 throw new InvalidDataException(
-                    "GP5 AC license sidecars were not emitted with publisher CNT ids/flags.");
+                    "GP5 AC system sidecars were not emitted with publisher CNT ids/flags.");
             }
-            Console.WriteLine("selftest: GP5 AC license sidecar validation and CNT encryption passed");
+            string acExtractedCnt = Path.Combine(regressionRoot, "ac-sidecar-extracted");
+            ProsperoPackageArchive.ExtractCntEntries(
+                acBuild.OutputPath, acExtractedCnt, deterministicPasscode);
+            if (!File.ReadAllBytes(Path.Combine(acExtractedCnt, "nptitle.dat"))
+                    .AsSpan().SequenceEqual(nptitle) ||
+                !File.ReadAllBytes(Path.Combine(acExtractedCnt, "npbind.dat"))
+                    .AsSpan().SequenceEqual(npbind))
+            {
+                throw new InvalidDataException(
+                    "Encrypted nptitle.dat/npbind.dat CNT round trip changed their logical bytes.");
+            }
+            Console.WriteLine(
+                "selftest: GP5 AC system-sidecar validation and CNT encryption passed");
 
             Console.WriteLine(
                 "selftest: deterministic APP/PPR-NAPS build + file-backed extraction passed " +

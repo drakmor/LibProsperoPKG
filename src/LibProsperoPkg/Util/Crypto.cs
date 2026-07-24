@@ -170,22 +170,6 @@ public static class Crypto
     }
 
     /// <summary>
-    /// Creates an AES-128-CBC engine (no padding) using the modern <see cref="Aes.Create()"/>
-    /// factory in place of the obsolete <c>AesManaged</c> type.
-    /// </summary>
-    private static Aes CreateCbcAes(byte[] key, byte[] iv)
-    {
-        var aes = Aes.Create();
-        aes.Mode = CipherMode.CBC;
-        aes.KeySize = 128;
-        aes.Key = key;
-        aes.IV = iv;
-        aes.Padding = PaddingMode.None;
-        aes.BlockSize = 128;
-        return aes;
-    }
-
-    /// <summary>
     /// Encrypts the given hash with the given public key (modulus)
     /// </summary>
     /// <param name="modulus"></param>
@@ -319,31 +303,76 @@ public static class Crypto
 
     public static int AesCbcCfb128Encrypt(byte[] @out, byte[] @in, int size, byte[] key, byte[] iv)
     {
-        using var cipher = CreateCbcAes(key, iv);
-        var tmp = new byte[size];
-        using (var pt_stream = new MemoryStream(@in))
-        using (var ct_stream = new MemoryStream(tmp))
-        using (var dec = cipher.CreateEncryptor(key, iv))
-        using (var s = new CryptoStream(ct_stream, dec, CryptoStreamMode.Write))
-        {
-            pt_stream.CopyTo(s);
-        }
-        Buffer.BlockCopy(tmp, 0, @out, 0, tmp.Length);
+        AesCbcCfb128Crypt(@out, @in, size, key, iv, decrypt: false);
         return 0;
     }
+
     public static int AesCbcCfb128Decrypt(byte[] @out, byte[] @in, int size, byte[] key, byte[] iv)
     {
-        using var cipher = CreateCbcAes(key, iv);
-        var tmp = new byte[size];
-        using (var ct_stream = new MemoryStream(@in))
-        using (var pt_stream = new MemoryStream(tmp))
-        using (var dec = cipher.CreateDecryptor(key, iv))
-        using (var s = new CryptoStream(ct_stream, dec, CryptoStreamMode.Read))
-        {
-            s.CopyTo(pt_stream);
-        }
-        Buffer.BlockCopy(tmp, 0, @out, 0, tmp.Length);
+        AesCbcCfb128Crypt(@out, @in, size, key, iv, decrypt: true);
         return 0;
+    }
+
+    // Sony's bnet_crypto_aes_cbc_cfb128 primitive is length preserving: complete
+    // 16-byte blocks use CBC, then a residual fragment uses CFB128 with the last
+    // CBC ciphertext (or the original IV when there is no complete block) as IV.
+    // Plain CBC/NoPadding rejected npbind.dat because its 0x214-byte logical size
+    // contains a four-byte residual fragment.
+    private static void AesCbcCfb128Crypt(
+        byte[] output, byte[] input, int size, byte[] key, byte[] iv, bool decrypt)
+    {
+        ArgumentNullException.ThrowIfNull(output);
+        ArgumentNullException.ThrowIfNull(input);
+        ArgumentNullException.ThrowIfNull(key);
+        ArgumentNullException.ThrowIfNull(iv);
+        if (size < 0 || size > input.Length || size > output.Length)
+            throw new ArgumentOutOfRangeException(nameof(size));
+        if (key.Length != 16)
+            throw new ArgumentException("AES-CBC-CFB128 requires a 16-byte key.", nameof(key));
+        if (iv.Length != 16)
+            throw new ArgumentException("AES-CBC-CFB128 requires a 16-byte IV.", nameof(iv));
+        if (size == 0)
+            return;
+
+        using var aes = Aes.Create();
+        aes.Mode = CipherMode.ECB;
+        aes.KeySize = 128;
+        aes.Key = key;
+        aes.Padding = PaddingMode.None;
+        using ICryptoTransform encryptor = aes.CreateEncryptor();
+        using ICryptoTransform decryptor = decrypt ? aes.CreateDecryptor() : null;
+
+        byte[] feedback = iv.ToArray();
+        byte[] sourceBlock = new byte[16];
+        byte[] workBlock = new byte[16];
+        int fullLength = size & ~15;
+        int offset = 0;
+        while (offset < fullLength)
+        {
+            Buffer.BlockCopy(input, offset, sourceBlock, 0, 16);
+            if (decrypt)
+            {
+                decryptor.TransformBlock(sourceBlock, 0, 16, workBlock, 0);
+                for (int i = 0; i < 16; i++)
+                    output[offset + i] = (byte)(workBlock[i] ^ feedback[i]);
+                Buffer.BlockCopy(sourceBlock, 0, feedback, 0, 16);
+            }
+            else
+            {
+                for (int i = 0; i < 16; i++)
+                    workBlock[i] = (byte)(sourceBlock[i] ^ feedback[i]);
+                encryptor.TransformBlock(workBlock, 0, 16, feedback, 0);
+                Buffer.BlockCopy(feedback, 0, output, offset, 16);
+            }
+            offset += 16;
+        }
+
+        int residual = size - fullLength;
+        if (residual == 0)
+            return;
+        encryptor.TransformBlock(feedback, 0, 16, workBlock, 0);
+        for (int i = 0; i < residual; i++)
+            output[offset + i] = (byte)(input[offset + i] ^ workBlock[i]);
     }
 
     /// <summary>
