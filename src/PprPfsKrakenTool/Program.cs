@@ -773,6 +773,25 @@ internal static class Program
             throw new InvalidDataException($"Managed SHA3-256 KAT failed: {actual}");
         Console.WriteLine("selftest: SHA3-256 known-answer test passed");
 
+        byte[] imageDigestTable = Enumerable.Range(0, 64).Select(i => (byte)i).ToArray();
+        byte[] storedImageDigestTable =
+            ProsperoImageDigests.ToStoredImageDigestTable(imageDigestTable);
+        byte[] expectedStoredImageDigestTable = (byte[])imageDigestTable.Clone();
+        Array.Reverse(expectedStoredImageDigestTable, 0, 32);
+        Array.Reverse(expectedStoredImageDigestTable, 32, 32);
+        if (!storedImageDigestTable.AsSpan().SequenceEqual(expectedStoredImageDigestTable))
+            throw new InvalidDataException("imagedigs.dat per-digest byte-order conversion failed.");
+        try
+        {
+            ProsperoImageDigests.ToStoredImageDigestTable(new byte[33]);
+            throw new InvalidDataException("Invalid imagedigs.dat table length was accepted.");
+        }
+        catch (ArgumentException)
+        {
+            // Expected: the stored table consists exclusively of independent SHA3-256 values.
+        }
+        Console.WriteLine("selftest: imagedigs.dat digest byte order passed");
+
         byte[] cbcCfbPlaintext = Convert.FromHexString(
             "6BC1BEE22E409F96E93D7E117393172A" +
             "AE2D8A571E03AC9C9EB76FAC45AF8E51" +

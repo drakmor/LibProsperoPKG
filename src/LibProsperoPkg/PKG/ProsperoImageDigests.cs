@@ -201,6 +201,23 @@ public static class ProsperoImageDigests
     public static byte[] ComputeEntryDigest(ReadOnlySpan<byte> entryPayload) => Sha3_256(entryPayload);
 
     /// <summary>
+    /// Converts the concatenated outer-PFS SHA3 digest table to the byte order used by CNT entry
+    /// <c>imagedigs.dat</c> (id 0x040A): every independent 32-byte digest is reversed.
+    /// </summary>
+    public static byte[] ToStoredImageDigestTable(ReadOnlySpan<byte> imageDigests)
+    {
+        if (imageDigests.Length % DigestSize != 0)
+            throw new ArgumentException(
+                $"Image-digest table length must be a multiple of {DigestSize} bytes.",
+                nameof(imageDigests));
+
+        byte[] stored = imageDigests.ToArray();
+        for (int off = 0; off < stored.Length; off += DigestSize)
+            Array.Reverse(stored, off, DigestSize);
+        return stored;
+    }
+
+    /// <summary>
     /// Computes the content-digest = SHA3-256( CNT[0x40:0x78] ‖ game-digest(32) ‖ major-param-digest(32) ),
     /// stored in the CNT GeneralDigests block at +0x20 and recorded as pfsimage.xml &lt;content-digest&gt;.
     /// </summary>

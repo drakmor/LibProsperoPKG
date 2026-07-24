@@ -488,7 +488,7 @@ public static class ProsperoPkgBuilder
                     // and digest tables are written.
                     byte[]? captured = outerPfs.ImageDigests;
                     if (captured is { Length: > 0 } && captured.Length == imagedigsEntry.FileData.Length)
-                        imagedigsEntry.FileData = captured;
+                        imagedigsEntry.FileData = ProsperoImageDigests.ToStoredImageDigestTable(captured);
                     ProsperoPfsImageXmlOptions siXml = FinishContainer(pkg, fs, props, innerImageDigest, log);
 
                     // Capture the reproducible SI inputs so the finalizer can build the sce_suppl segment:
@@ -659,10 +659,7 @@ public static class ProsperoPkgBuilder
         var imagedigsEntry = (GenericEntry)pkg.Entries.First(e => (uint)e.Id == ImagedigsEntryId);
 
         // imagedigs stores each SHA3 digest with its byte order reversed.
-        byte[] reversedDigests = (byte[])outer.ImageDigests.Clone();
-        for (int off = 0; off < reversedDigests.Length; off += ProsperoImageDigests.DigestSize)
-            Array.Reverse(reversedDigests, off, ProsperoImageDigests.DigestSize);
-        imagedigsEntry.FileData = reversedDigests;
+        imagedigsEntry.FileData = ProsperoImageDigests.ToStoredImageDigestTable(outer.ImageDigests);
 
         bool transferredInnerFile = false;
         try
