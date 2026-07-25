@@ -231,8 +231,9 @@ public sealed class ProsperoPkgBuildProperties
     public bool DeterministicBuild { get; init; }
 
     /// <summary>
-    /// Metadata signing provider for CNT+0x1000. When null, the embedded research signer is used;
-    /// current publisher tools require their matching trusted RSA-3072 profile.
+    /// Legacy private-signing hook retained for source compatibility. Publisher CNT+0x1000 is not
+    /// a private-key signature: the builder always reproduces sc2's deterministic public wrap with
+    /// passcode-bank modulus 3.
     /// </summary>
     public IProsperoMetadataSigner? MetadataSigner { get; init; }
 
@@ -1139,7 +1140,7 @@ public static class ProsperoPkgBuilder
                 desc_digest = new byte[64],
             },
             HeaderDigest = new byte[32],
-            HeaderSignature = new byte[ProsperoPkgSigner.SignatureSize],
+            HeaderSignature = new byte[ProsperoPublisherRsa.ModulusSize],
         };
 
         // System-container entries (the 6 SC entries), ids 0x1/0x10/0x20/0x80/0x100/0x200.
@@ -1363,16 +1364,9 @@ public static class ProsperoPkgBuilder
         stream.Write(pkg.HeaderDigest);
 
         stream.Position = 0;
-        byte[] signaturePreimage = new byte[0x1000];
-        stream.ReadExactly(signaturePreimage);
-        byte[] headerSha = Crypto.Sha256(signaturePreimage);
-        IProsperoMetadataSigner metadataSigner =
-            props.MetadataSigner ?? ProsperoPkgSigner.EmbeddedMetadataSigner;
-        pkg.HeaderSignature = metadataSigner.SignSha256(headerSha);
-        if (pkg.HeaderSignature.Length != ProsperoPkgSigner.SignatureSize)
-            throw new InvalidDataException(
-                $"Metadata signer '{metadataSigner.ProfileName}' returned " +
-                $"{pkg.HeaderSignature.Length} bytes; expected {ProsperoPkgSigner.SignatureSize}.");
+        byte[] wrapPreimage = new byte[0x1000];
+        stream.ReadExactly(wrapPreimage);
+        pkg.HeaderSignature = ProsperoPublisherRsa.BuildCntHeaderWrap(wrapPreimage);
         stream.Position = 0x1000;
         stream.Write(pkg.HeaderSignature);
     }
@@ -1422,7 +1416,7 @@ public static class ProsperoPkgBuilder
         if (pkg.Header.desc_image_key_size != 0 && pkg.Header.desc_mandatory_size != 0)
             pkg.Header.desc_digest = ComputeDescriptorDigest(s, pkg.Header);
 
-        // Header, header digest and the PS5 RSA-3072 metadata signature.
+        // Header, package digest and the PS5 RSA-3072 public wrap.
         s.Position = 0;
         writer.WriteHeader(pkg.Header);
         // Package-digest (the CNT self-seal at +0xFE0): PS5 uses SHA3-256(CNT[0:0xFE0]), NOT SHA-256.
@@ -1438,22 +1432,17 @@ public static class ProsperoPkgBuilder
         pkg.HeaderDigest = ProsperoImageDigests.ComputePackageDigest(cntHead);
         s.Position = ProsperoImageDigests.PackageDigestStoredOffset;
         s.Write(pkg.HeaderDigest, 0, pkg.HeaderDigest.Length);
-        // Sign the bytes exactly as they will appear in the finalized FIH. BuildFromCnt changes
+        // Wrap the bytes exactly as they will appear in the finalized FIH. BuildFromCnt changes
         // CNT+0x410 from the standalone physical image offset to the shared FIH offset 0x10000;
-        // signing the pre-finalized value makes the embedded signature invalid after that rewrite.
+        // wrapping the pre-finalized value makes CNT+0x1000 invalid after that rewrite.
         s.Position = 0;
-        byte[] signaturePreimage = new byte[0x1000];
-        s.ReadExactly(signaturePreimage);
+        byte[] wrapPreimage = new byte[0x1000];
+        s.ReadExactly(wrapPreimage);
         BinaryPrimitives.WriteUInt64BigEndian(
-            signaturePreimage.AsSpan(ProsperoImageDigests.CntPfsImageOffsetField, 8),
+            wrapPreimage.AsSpan(ProsperoImageDigests.CntPfsImageOffsetField, 8),
             ProsperoImageDigests.FihRelativeImageOffset);
-        byte[] headerSha = Crypto.Sha256(signaturePreimage);
         s.Position = 0x1000;
-        IProsperoMetadataSigner metadataSigner = props.MetadataSigner ?? ProsperoPkgSigner.EmbeddedMetadataSigner;
-        pkg.HeaderSignature = metadataSigner.SignSha256(headerSha);
-        if (pkg.HeaderSignature.Length != ProsperoPkgSigner.SignatureSize)
-            throw new InvalidDataException(
-                $"Metadata signer '{metadataSigner.ProfileName}' returned {pkg.HeaderSignature.Length} bytes; expected {ProsperoPkgSigner.SignatureSize}.");
+        pkg.HeaderSignature = ProsperoPublisherRsa.BuildCntHeaderWrap(wrapPreimage);
         s.Write(pkg.HeaderSignature, 0, pkg.HeaderSignature.Length);
 
         // Every digest, the geometry and the entry table are now finalized on this CNT, so the reproducible

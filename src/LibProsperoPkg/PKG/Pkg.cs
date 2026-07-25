@@ -16,15 +16,16 @@ public class Pkg
     public Header Header;
     // 0xFE0 - 0xFFF
     public byte[] HeaderDigest;
-    // 0x1000 - 0x10FF
+    // Publisher profile: deterministic RSA-3072 public wrap at 0x1000 - 0x117F.
+    // The historical member name is retained for API compatibility.
     public byte[] HeaderSignature;
-    // 0x2000 - 0x27FF
+    // Publisher profile: 0x2000 - 0x2B7F (0xB80 bytes).
     public KeysEntry EntryKeys;
-    // 0x2800 - 0x28FF
+    // Publisher profile commonly starts at 0x2B80 and is 0x800 bytes.
     public GenericEntry ImageKey;
-    // 0x2900 - 0x2A7F
+    // Layout-dependent.
     public GeneralDigestsEntry GeneralDigests;
-    // 0x2A80 - 0x2xxx
+    // Layout-dependent.
     public MetasEntry Metas;
     // variable...
     public GenericEntry Digests;

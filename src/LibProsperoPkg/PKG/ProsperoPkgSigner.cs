@@ -1,12 +1,11 @@
 // LibProsperoPkg - A library for building and inspecting PS5 packages.
 // Copyright (C) 2026 SvenGDK
 //
-// PS5 PKG signing primitives and pluggable metadata-signing profiles.
+// Legacy/research PKG signing primitives and pluggable private-signing profiles.
 //
 // Checks and derivations:
-// * The PKG-metadata signature primitive the system software checks: RSA-3072 PKCS#1 v1.5
-// over a SHA-256 digest. The embedded key is a research/self-test profile; an external
-// provider or PEM sidecar supplies the trust profile required by a particular publisher tool.
+// * These private-signing helpers are not the producer for publisher CNT+0x1000. sc2 stores a
+// deterministic public wrap there; see ProsperoPublisherRsa.
 // * EKPFS / PFS key derivation from content id + passcode
 // (LibProsperoPkg.Util.Crypto.ComputeKeys / PfsGenEncKey) for the PS5 inner image.
 // * Self-consistency checks for the embedded profile: expected modulus fingerprint and a
@@ -21,8 +20,8 @@ using System.Text;
 namespace LibProsperoPkg.PKG;
 
 /// <summary>
-/// Provider for the final publisher metadata signature stored at CNT+0x1000. Implementations receive
-/// SHA-256(CNT[0:0x1000]) and must return a 384-byte RSA-3072 PKCS#1 v1.5 signature.
+/// Legacy provider for research/private RSA signatures. Publisher CNT generation does not consume
+/// this interface; CNT+0x1000 is produced by <see cref="ProsperoPublisherRsa"/>.
 /// </summary>
 public interface IProsperoMetadataSigner
 {
@@ -117,9 +116,8 @@ public static class ProsperoPkgSigner
     }
 
     /// <summary>
-    /// Embedded research signing profile. Its signatures are self-consistent, but current
-    /// prospero-pub-cmd publisher builds use a different trust key; use a caller-supplied provider
-    /// when publisher acceptance is required.
+    /// Embedded legacy research signing profile. It is retained for callers of the old standalone
+    /// signing API and is not used by the publisher CNT writer.
     /// </summary>
     public static IProsperoMetadataSigner EmbeddedMetadataSigner { get; } = new EmbeddedSigner();
     /// <summary>Size in bytes of an RSA-3072 signature (the PKG-metadata key width).</summary>

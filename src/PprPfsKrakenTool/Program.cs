@@ -1,6 +1,7 @@
 using LibProsperoPkg;
 using LibProsperoPkg.Content;
 using LibProsperoPkg.GP5;
+using LibProsperoPkg.Keys;
 using LibProsperoPkg.PFS;
 using LibProsperoPkg.PFS.Compression;
 using LibProsperoPkg.PKG;
@@ -306,7 +307,7 @@ internal static class Program
     {
         if (args.Length is < 5 or > 13)
             throw new ArgumentException(
-                "build-pkg requires <source-dir> <output-dir> <content-id> <app|ac|al> [passcode] [naps-cmac-key-hex|-] [naps-meta-18-file|-] [metadata-private-key.pem|-] [outer-pfs-seed-hex|-] [deterministic] [strict] [afid=<map.tsv>].");
+                "build-pkg requires <source-dir> <output-dir> <content-id> <app|ac|al> [passcode] [naps-cmac-key-hex|-] [naps-meta-18-file|-] [legacy-metadata-key-ignored|-] [outer-pfs-seed-hex|-] [deterministic] [strict] [afid=<map.tsv>].");
         ProsperoPackageMode mode = args[4].ToLowerInvariant() switch
         {
             "app" => ProsperoPackageMode.Application,
@@ -316,9 +317,12 @@ internal static class Program
         };
         byte[]? cmac = args.Length >= 7 && args[6] != "-" ? Convert.FromHexString(args[6]) : null;
         byte[]? napsMeta18 = args.Length >= 8 && args[7] != "-" ? File.ReadAllBytes(args[7]) : null;
-        using ProsperoRsaMetadataSigner? metadataSigner = args.Length >= 9 && args[8] != "-"
-            ? ProsperoRsaMetadataSigner.LoadPem(args[8])
-            : null;
+        if (args.Length >= 9 && args[8] != "-")
+        {
+            Console.WriteLine(
+                "warning: the legacy metadata-private-key argument is ignored; " +
+                "CNT+0x1000 is generated with the sc2 public RSA profile.");
+        }
         byte[]? outerPfsSeed = args.Length >= 10 && args[9] != "-"
             ? Convert.FromHexString(args[9])
             : null;
@@ -362,7 +366,6 @@ internal static class Program
                 UsePublisherPprNaps = true,
                 NapsOuterBlockCmacKey = cmac,
                 NapsMeta18 = napsMeta18,
-                MetadataSigner = metadataSigner,
                 OuterPfsSeed = outerPfsSeed,
                 PublisherAfidAssignments = afidAssignments,
                 DeterministicBuild = deterministic,
@@ -659,7 +662,7 @@ internal static class Program
         if (args.Length != 2)
             throw new ArgumentException("check-pkg-signature requires <package.pkg>.");
         bool valid = ProsperoPackageArchive.VerifyCntMetadataSignature(args[1]);
-        Console.WriteLine($"cnt-metadata-signature={(valid ? "valid" : "invalid")}");
+        Console.WriteLine($"cnt-header-wrap={(valid ? "valid" : "invalid")}");
         return valid ? 0 : 2;
     }
 
@@ -686,10 +689,10 @@ internal static class Program
         package.Position = (long)cntOffset;
         byte[] signedHeader = new byte[0x1000];
         package.ReadExactly(signedHeader);
-        byte[] signature = ProsperoPkgSigner.SignDigest(Crypto.Sha256(signedHeader));
+        byte[] signature = ProsperoPublisherRsa.BuildCntHeaderWrap(signedHeader);
         package.Position = checked((long)cntOffset + 0x1000);
         package.Write(signature);
-        Console.WriteLine($"resigned CNT+0x1000 with RSA-3072: {output}");
+        Console.WriteLine($"rebuilt CNT+0x1000 deterministic RSA-3072 public wrap: {output}");
         return 0;
     }
 
@@ -1204,6 +1207,35 @@ internal static class Program
             new MetaEntry { DataOffset = 0, DataSize = deterministicKeys1.Length }, keys1);
         if (parsedKeys.Keys.Length != 7 || parsedKeys.Keys.Any(key => key.key.Length != 384))
             throw new InvalidDataException("RSA-3072 ENTRY_KEYS width was not recovered from its record size.");
+        if (!ProsperoKeys.IsPublisherRsaProfileAvailable ||
+            ProsperoKeys.PasscodeKey.Length !=
+                ProsperoPublisherRsa.PasscodeBankCount * ProsperoPublisherRsa.ModulusSize ||
+            ProsperoKeys.MountImageKey.Length != ProsperoPublisherRsa.ModulusSize ||
+            ProsperoKeys.TokenKey.Length != ProsperoPublisherRsa.ModulusSize)
+        {
+            throw new InvalidDataException("The complete sc2 RSA-3072 public profile was not loaded.");
+        }
+        if (!Convert.ToHexString(Crypto.Sha256(ProsperoKeys.PasscodeKey.ToArray())).Equals(
+                "81E8283D582F522D8DA34565ECD6AB39A38B3D3C0CACEF078DF97D2B285EC24E",
+                StringComparison.Ordinal) ||
+            !Convert.ToHexString(Crypto.Sha256(ProsperoKeys.MountImageKey.ToArray())).Equals(
+                "4510462812321CEA26B4C0155E363955B16E31B89252B92510ACCAD02ECA5CD0",
+                StringComparison.Ordinal) ||
+            !Convert.ToHexString(Crypto.Sha256(ProsperoKeys.TokenKey.ToArray())).Equals(
+                "88350359CAA32A4177184C8C6C5D6FB88A87A13487AA96B6C495E3745C03F48E",
+                StringComparison.Ordinal))
+        {
+            throw new InvalidDataException("An embedded sc2 RSA bank failed its known-answer hash.");
+        }
+        byte[] cntHeaderProbe = Enumerable.Range(0, ProsperoPublisherRsa.CntHeaderSize)
+            .Select(i => (byte)(i * 37 + 11))
+            .ToArray();
+        byte[] cntWrapProbe = ProsperoPublisherRsa.BuildCntHeaderWrap(cntHeaderProbe);
+        if (!ProsperoPublisherRsa.VerifyCntHeaderWrap(cntHeaderProbe, cntWrapProbe))
+            throw new InvalidDataException("CNT deterministic public-wrap self-test failed.");
+        cntHeaderProbe[0x123] ^= 1;
+        if (ProsperoPublisherRsa.VerifyCntHeaderWrap(cntHeaderProbe, cntWrapProbe))
+            throw new InvalidDataException("CNT public-wrap verifier accepted a modified header.");
         try
         {
             KeysEntry.Read(
@@ -1230,7 +1262,8 @@ internal static class Program
         {
             // Expected: the FSELF header embeds ELF+PHDR as one contiguous region.
         }
-        Console.WriteLine("selftest: RSA-3072 ENTRY_KEYS and FSELF structural validation passed");
+        Console.WriteLine(
+            "selftest: sc2 RSA banks, CNT public wrap, ENTRY_KEYS and FSELF validation passed");
 
         string regressionRoot = Path.Combine(
             Path.GetTempPath(), "LibProsperoPkg-selftest-" + Guid.NewGuid().ToString("N"));
@@ -1651,41 +1684,25 @@ internal static class Program
                 },
                 _ => { });
 
-            try
-            {
-                ProsperoPackageBuilder.Build(
-                    new ProsperoBuildOptions
-                    {
-                        SourceFolder = source1,
-                        OutputFolder = Path.Combine(regressionRoot, "strict-output"),
-                        ContentId = deterministicContentId,
-                        TitleId = "PPSA00000",
-                        Mode = ProsperoPackageMode.Application,
-                        Passcode = deterministicPasscode,
-                        NapsPfsImageSeed = deterministicPfsImageSeed,
-                        PublisherImageKey = deterministicPublisherImageKey,
-                        PublisherEntryKeys = deterministicPublisherEntryKeys,
-                        RequirePublisherCompatibility = true,
-                    },
-                    _ => { });
-                throw new InvalidDataException(
-                    "Strict publisher mode accepted a build without an external signer.");
-            }
-            catch (InvalidOperationException ex) when (
-                ex.Message.StartsWith("Strict publisher compatibility requires", StringComparison.Ordinal))
-            {
-                // Expected: strict mode must stop before emitting a package.
-                if (ex.Message.Contains("CMAC", StringComparison.OrdinalIgnoreCase))
-                    throw new InvalidDataException(
-                        "Strict publisher mode incorrectly requires a NAPS CMAC key for the " +
-                        "Publishing Tools 2.79 debug/AC profile.", ex);
-                if (ex.Message.Contains("obcc", StringComparison.OrdinalIgnoreCase) ||
-                    ex.Message.Contains("pfs-image-key", StringComparison.OrdinalIgnoreCase))
+            ProsperoBuildResult strictResult = ProsperoPackageBuilder.Build(
+                new ProsperoBuildOptions
                 {
-                    throw new InvalidDataException(
-                        "Strict publisher mode incorrectly requires an external PFS image key.",
-                        ex);
-                }
+                    SourceFolder = source1,
+                    OutputFolder = Path.Combine(regressionRoot, "strict-output"),
+                    ContentId = deterministicContentId,
+                    TitleId = "PPSA00000",
+                    Mode = ProsperoPackageMode.Application,
+                    Passcode = deterministicPasscode,
+                    NapsPfsImageSeed = deterministicPfsImageSeed,
+                    PublisherImageKey = deterministicPublisherImageKey,
+                    PublisherEntryKeys = deterministicPublisherEntryKeys,
+                    RequirePublisherCompatibility = true,
+                },
+                _ => { });
+            if (!ProsperoPackageArchive.VerifyCntMetadataSignature(strictResult.OutputPath))
+            {
+                throw new InvalidDataException(
+                    "Strict publisher build produced an invalid CNT public wrap.");
             }
 
             string artifactOutput = Path.Combine(regressionRoot, "publisher-artifacts");
@@ -3473,7 +3490,7 @@ internal static class Program
         Console.WriteLine("        [--exclude \"sce_sys/**;movies/*.mp4\"] [--only-if-smaller false]");
         Console.WriteLine("        [--classic true]   (alias for --layout classic)");
         Console.WriteLine("  build-publisher-artifacts <source-folder> <output-dir> <content-id> <passcode> [cmac-key-hex]");
-        Console.WriteLine("  build-pkg <source-dir> <output-dir> <content-id> <app|ac|al> [passcode] [naps-cmac-key-hex|-] [naps-meta-18-file|-] [metadata-private-key.pem|-] [outer-pfs-seed-hex|-] [deterministic] [strict] [afid=<map.tsv>]");
+        Console.WriteLine("  build-pkg <source-dir> <output-dir> <content-id> <app|ac|al> [passcode] [naps-cmac-key-hex|-] [naps-meta-18-file|-] [legacy-metadata-key-ignored|-] [outer-pfs-seed-hex|-] [deterministic] [strict] [afid=<map.tsv>]");
         Console.WriteLine("  pack  <input-file> <output.pfsc> [--compression zlib|kraken|none] [--level N]");
         Console.WriteLine("        [--min-savings-percent 0]");
         Console.WriteLine("  unpack <input-or-image> <output-file> [--offset 0x0]");

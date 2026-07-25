@@ -37,8 +37,8 @@
   </ItemGroup>
 
   <ItemGroup>
-    <!-- Publishing key material embedded for the signer: the PKG-metadata RSA-3072 private key,
-         the publishing passcode key and the mount-image key. -->
+    <!-- Publishing profile material: a legacy self-test PEM plus all public RSA-3072 banks
+         recovered from sc2.exe (passcode, mount-image and token). -->
     <EmbeddedResource Include="Keys\Data\pkg_meta_rsa_key.pem">
       <LogicalName>LibProsperoPkg.Keys.Data.pkg_meta_rsa_key.pem</LogicalName>
     </EmbeddedResource>
@@ -47,6 +47,9 @@
     </EmbeddedResource>
     <EmbeddedResource Include="Keys\Data\mount_image.bin">
       <LogicalName>LibProsperoPkg.Keys.Data.mount_image.bin</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="Keys\Data\token.hex">
+      <LogicalName>LibProsperoPkg.Keys.Data.token.hex</LogicalName>
     </EmbeddedResource>
     <!-- The debug "right" module (sce_sys/about/right.sprx) injected into the inner-PFS file set
          so the produced debug package layout is complete. -->

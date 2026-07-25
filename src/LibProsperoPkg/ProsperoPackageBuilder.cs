@@ -4,7 +4,7 @@
 // High-level PS5 package builder. Turns a prepared application
 // folder into a complete, signed PS5 package entirely in-process: there is no external tool to
 // install and no platform-specific shell-out. The GP5 project model, the inner/outer PFS image,
-// the AES-XTS encryption, the RSA-3072 metadata signature and the finalized debug image are all
+// the AES-XTS encryption, RSA-3072 public wraps and the finalized debug image are all
 // produced by this library. The PS5 publishing key material is wired in through
 // <see cref="LibProsperoPkg.Keys.ProsperoKeys"/> and the signing path through
 // <see cref="LibProsperoPkg.PKG.ProsperoPkgSigner"/>.
@@ -227,8 +227,9 @@ public sealed class ProsperoBuildOptions
     public bool DeterministicBuild { get; set; }
 
     /// <summary>
-    /// Optional publisher RSA-3072 metadata signer. The provider signs SHA-256(CNT[0:0x1000]);
-    /// when omitted, the embedded research profile is used and remains suitable only for self-tests.
+    /// Legacy private-signing hook retained for source compatibility. Current publisher-compatible
+    /// CNT generation does not use it: CNT+0x1000 is a deterministic RSA public-key wrap generated
+    /// from the embedded sc2 passcode bank.
     /// </summary>
     public IProsperoMetadataSigner? MetadataSigner { get; set; }
 
@@ -268,7 +269,7 @@ public static class ProsperoPackageBuilder
         new("^[A-Z]{4}[0-9]{5}$", RegexOptions.Compiled);
 
     /// <summary>True when the wired-in PS5 publishing key material is available.</summary>
-    public static bool KeysAvailable => ProsperoKeys.IsAvailable;
+    public static bool KeysAvailable => ProsperoKeys.IsPublisherRsaProfileAvailable;
 
     /// <summary>
     /// Encrypts a prepared (plaintext) inner PFS image with AES-XTS, deriving the
@@ -478,8 +479,8 @@ public static class ProsperoPackageBuilder
         var sourceFolder = Path.GetFullPath(options.SourceFolder);
 
         log(KeysAvailable
-            ? "PS5 publishing keys (RSA-3072 metadata + passcode + mount-image) loaded."
-            : "Warning: PS5 publishing keys are unavailable; signing is disabled.");
+            ? "PS5 public RSA profile loaded (passcode[7] + mount-image + token)."
+            : "Warning: the PS5 public RSA profile is unavailable; publisher wrapping is disabled.");
         if (!KeysAvailable)
             warnings.Add("PS5 publishing keys are unavailable.");
 
@@ -492,18 +493,13 @@ public static class ProsperoPackageBuilder
     /// <summary>
     /// Produces the final PS5 package via <see cref="LibProsperoPkg.PKG.ProsperoPkgBuilder"/>.
     /// The output is a complete <c>\x7FCNT</c> package with the inner + AES-XTS-encrypted outer PFS,
-    /// all entries, every metadata digest and the header signature. The result is checked in-process
-    /// with the reader and an outer-PFS decrypt round-trip; the detached metadata signature
-    /// pass then exercises the wired-in publishing key material too. On-console acceptance
+    /// all entries, every metadata digest and the CNT header public wrap. The result is checked
+    /// in-process with the reader and an outer-PFS decrypt round-trip. On-console acceptance
     /// depends on console mode and firmware.
     /// </summary>
     private static ProsperoBuildResult BuildCore(
         ProsperoBuildOptions options, string sourceFolder, Action<string> log, List<string> warnings)
     {
-        using ProsperoRsaMetadataSigner? sidecarSigner = options.MetadataSigner is null
-            ? ProsperoPublishingSidecar.TryLoadMetadataSigner()
-            : null;
-        IProsperoMetadataSigner? metadataSigner = options.MetadataSigner ?? sidecarSigner;
         byte[]? napsCmacKey = options.NapsOuterBlockCmacKey
             ?? ProsperoPublishingSidecar.TryLoadNapsCmacKey();
         byte[]? napsPfsImageKey = options.NapsPfsImageKey;
@@ -529,8 +525,6 @@ public static class ProsperoPackageBuilder
                 $"{ProsperoPublishingSidecar.NapsPfsImageSeedFileName} does not match OuterPfsSeed.");
         }
 
-        if (sidecarSigner is not null)
-            log($"Loaded publisher metadata signer {sidecarSigner.ProfileName} from {ProsperoPublishingSidecar.DefaultDirectory}.");
         if (options.NapsOuterBlockCmacKey is null && napsCmacKey is not null)
             log($"Loaded {ProsperoPublishingSidecar.NapsCmacKeyFileName} from {ProsperoPublishingSidecar.DefaultDirectory}.");
         if (options.NapsPfsImageSeed is null && napsPfsImageSeed is not null)
@@ -561,8 +555,8 @@ public static class ProsperoPackageBuilder
 
         // A CNT package holds only metadata and is NOT a full, installable package: only a finalized
         // \x7FFIH image is. So for the debug-image path the CNT is an intermediate that must NOT survive
-        // next to the final package — the user asked for the final FIH image only. Build it (and its
-        // detached .metasig) under a temporary name and delete both once the FIH is finalized.
+        // next to the final package — the user asked for the final FIH image only. Build it under a
+        // temporary name and delete it once the FIH is finalized.
         string cntPath = wantsFih
             ? Path.Combine(options.OutputFolder, "." + Path.GetFileName(finalPath) + ".cnt.tmp")
             : finalPath;
@@ -588,28 +582,19 @@ public static class ProsperoPackageBuilder
             PublisherEntryKeys = publisherEntryKeys,
             OuterPfsSeed = options.OuterPfsSeed,
             DeterministicBuild = options.DeterministicBuild,
-            MetadataSigner = metadataSigner,
+            MetadataSigner = options.MetadataSigner,
             LicenseProvider = options.LicenseProvider,
         };
 
         bool usesNaps = options.UsePublisherPprNaps &&
                         options.Mode != ProsperoPackageMode.AdditionalContentNoData;
-        if (options.RequirePublisherCompatibility)
-        {
-            var missing = new List<string>();
-            if (metadataSigner is null)
-                missing.Add("a caller-supplied trusted RSA-3072 metadata signer");
-            if (missing.Count != 0)
-                throw new InvalidOperationException(
-                    "Strict publisher compatibility requires " + string.Join(", ", missing) + ".");
-        }
+        if (options.RequirePublisherCompatibility && !ProsperoKeys.IsPublisherRsaProfileAvailable)
+            throw new InvalidOperationException(
+                "Strict publisher compatibility requires the complete sc2 public RSA profile.");
         if (usesNaps && napsCmacKey is null)
             log(
                 "NAPS outer-block CMAC is disabled: Publishing Tools 2.79 debug/AC leaves the " +
                 "eight-byte tags zero unless a keyed profile is explicitly selected.");
-        if (metadataSigner is null)
-            warnings.Add(
-                "Publisher metadata signer was not supplied; the embedded research RSA-3072 profile is not trusted by current prospero-pub-cmd builds.");
         log("Building the PS5 package...");
         LibProsperoPkg.PKG.ProsperoPkgBuilder.Build(buildProps, cntPath, out byte[]? nestedImageDigest, out var siInputs, log);
 
@@ -629,9 +614,6 @@ public static class ProsperoPackageBuilder
         {
             warnings.Add("Output container validation failed: " + ex.Message);
         }
-
-        // PKG-metadata signing pass using the wired-in publishing key material.
-        SignPackage(cntPath, options, metadataSigner, log, warnings);
 
         // A CNT alone is metadata only, so unless the caller explicitly asked for the metadata
         // container we finalize it into a debug (FIH) image — the only form a debug-mode console
@@ -680,9 +662,8 @@ public static class ProsperoPackageBuilder
         }
         finally
         {
-            // Remove the intermediate CNT and its detached signature so only the final FIH remains.
+            // Remove the intermediate CNT so only the final FIH remains.
             TryDelete(cntPath);
-            TryDelete(cntPath + ".metasig");
             if (siInputs?.TemporaryInnerImagePath is string temporaryInner)
                 TryDelete(temporaryInner);
         }
@@ -696,84 +677,6 @@ public static class ProsperoPackageBuilder
     {
         try { if (File.Exists(path)) File.Delete(path); }
         catch { /* best-effort cleanup of intermediate artifacts */ }
-    }
-
-    /// <summary>
-    /// Produces a detached PKG-metadata signature for the finished package using the
-    /// embedded PKG-metadata RSA-3072 key (and consumes the content id + passcode to derive the
-    /// package EKPFS). The signature is RSA-3072 PKCS#1 v1.5 over the SHA-256 of the container's
-    /// metadata region (header + entry table) and is written next to the package as
-    /// <c>&lt;pkg&gt;.metasig</c>.
-    /// </summary>
-    /// <remarks>
-    /// The detached signature and the checked key material are self-validated; a fully accepted
-    /// retail image additionally requires reference-controlled secrets.
-    /// </remarks>
-    private static void SignPackage(
-        string pkgPath,
-        ProsperoBuildOptions options,
-        IProsperoMetadataSigner? metadataSigner,
-        Action<string> log,
-        List<string> warnings)
-    {
-        IProsperoMetadataSigner signer = metadataSigner ?? ProsperoPkgSigner.EmbeddedMetadataSigner;
-        if (metadataSigner is null && !ProsperoPkgSigner.IsAvailable)
-        {
-            warnings.Add("PS5 PKG-metadata key unavailable; signature skipped.");
-            return;
-        }
-
-        try
-        {
-            if (metadataSigner is null && !ProsperoPkgSigner.VerifyKeyMaterial())
-            {
-                warnings.Add("PS5 PKG-metadata key self-check failed; signature skipped.");
-                return;
-            }
-
-            // Consume the content id + passcode to derive the package EKPFS (index 1).
-            var ekpfs = ProsperoPkgSigner.ComputeEkpfs(options.ContentId, options.Passcode);
-            log($"Derived package EKPFS (fingerprint {Convert.ToHexString(ekpfs.AsSpan(0, 4))}).");
-
-            // Hash the container's metadata region (everything before the body) and sign it.
-            var pkg = ProsperoPkgReader.Read(pkgPath);
-            long fileLength = new FileInfo(pkgPath).Length;
-            long metadataLength = (long)(pkg.Header?.BodyOffset ?? 0);
-            if (metadataLength <= 0 || metadataLength > fileLength)
-                metadataLength = Math.Min(0x1000, fileLength);
-
-            byte[] digest;
-            using (var fs = new FileStream(pkgPath, FileMode.Open, FileAccess.Read, FileShare.Read))
-            using (var sha = SHA256.Create())
-            {
-                var region = new byte[metadataLength];
-                int read = 0;
-                while (read < region.Length)
-                {
-                    int n = fs.Read(region, read, region.Length - read);
-                    if (n == 0) break;
-                    read += n;
-                }
-                digest = sha.ComputeHash(region, 0, read);
-            }
-
-            byte[] signature = signer.SignSha256(digest);
-            bool? verified = signer is IProsperoMetadataSignatureVerifier verifier
-                ? verifier.VerifySha256(digest, signature)
-                : null;
-
-            string sigPath = pkgPath + ".metasig";
-            File.WriteAllBytes(sigPath, signature);
-            log($"PKG-metadata signature written to {Path.GetFileName(sigPath)} " +
-                $"({signature.Length} bytes, RSA-3072 PKCS#1 SHA-256, provider={signer.ProfileName}), " +
-                $"valid={verified?.ToString() ?? "not checked"}.");
-            if (verified == false)
-                warnings.Add("PKG-metadata signature failed self-verification.");
-        }
-        catch (Exception ex)
-        {
-            warnings.Add("PKG-metadata signing failed: " + ex.Message);
-        }
     }
 
     /// <summary>

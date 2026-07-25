@@ -248,7 +248,10 @@ public class KeysEntry : Entry
                 Keys[i] = new PkgEntryKey
                 {
                     digest = Crypto.Sha3_256(passcodeKey).Xor(passcodeKey),
-                    key = Crypto.RsaPkcs1EncryptKey(modulus, passcodeKey, deterministic),
+                    // sc2's publisher profile always derives PKCS#1 PS deterministically from
+                    // modulus+message. DeterministicBuild controls unrelated build inputs, not
+                    // this on-disk public-wrap primitive.
+                    key = Crypto.RsaPkcs1EncryptKey(modulus, passcodeKey, deterministic: true),
                 };
             }
             else
@@ -264,7 +267,7 @@ public class KeysEntry : Entry
         Keys[0].key = publisherProfile
             ? Crypto.RsaPkcs1EncryptKey(
                 LibProsperoPkg.Keys.ProsperoKeys.PasscodeKey.Slice(0, 384).ToArray(),
-                Encoding.ASCII.GetBytes(passcode), deterministic)
+                Encoding.ASCII.GetBytes(passcode), deterministic: true)
             : Crypto.RSA2048EncryptKey(Util.CryptoKeys.PkgPublicKeys[0], Encoding.ASCII.GetBytes(passcode));
     }
     public byte[] seedDigest;

@@ -27,7 +27,10 @@ public static class ProsperoPackageArchive
 {
     public const int OuterBlockSize = 0x10000;
 
-    /// <summary>Verifies the embedded CNT RSA-3072 metadata signature at CNT+0x1000.</summary>
+    /// <summary>
+    /// Verifies the deterministic RSA-3072 public wrap stored at CNT+0x1000. The historical method
+    /// name is retained for API compatibility; this field is not a private-key signature.
+    /// </summary>
     public static bool VerifyCntMetadataSignature(string packagePath)
     {
         using var input = File.OpenRead(packagePath);
@@ -35,8 +38,24 @@ public static class ProsperoPackageArchive
         long cntBase = package.Fih is null ? 0 : checked((long)package.Fih.EmbeddedCntOffset);
         const int signedHeaderSize = 0x1000;
         byte[] header = ReadRange(input, cntBase, signedHeaderSize);
-        byte[] signature = ReadRange(input, checked(cntBase + signedHeaderSize), ProsperoPkgSigner.SignatureSize);
-        return ProsperoPkgSigner.VerifyDigest(Crypto.Sha256(header), signature);
+        byte[] signature = ReadRange(
+            input,
+            checked(cntBase + signedHeaderSize),
+            ProsperoPublisherRsa.ModulusSize);
+        // A temporary combined CNT+PFS artifact still stores the physical image position at
+        // +0x410, while sc2's metadata output and the final FIH-embedded CNT use 0x10000.
+        // The builder intentionally wraps the final form, so normalize a non-zero temporary value
+        // before reproducing the wrap.
+        ulong pfsImageOffset = BinaryPrimitives.ReadUInt64BigEndian(
+            header.AsSpan(ProsperoImageDigests.CntPfsImageOffsetField, 8));
+        if (pfsImageOffset != 0 &&
+            pfsImageOffset != ProsperoImageDigests.FihRelativeImageOffset)
+        {
+            BinaryPrimitives.WriteUInt64BigEndian(
+                header.AsSpan(ProsperoImageDigests.CntPfsImageOffsetField, 8),
+                ProsperoImageDigests.FihRelativeImageOffset);
+        }
+        return ProsperoPublisherRsa.VerifyCntHeaderWrap(header, signature);
     }
 
     public static ProsperoPackageMap Inspect(string path)
