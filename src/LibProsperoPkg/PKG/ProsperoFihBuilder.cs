@@ -26,8 +26,9 @@
 // The FIH header's structural fields are magic, signed byte, PFS image offset/size, and
 // embedded-CNT/SC offset and size. The embedded CNT and shared PFS image are the output of
 // ProsperoPkgBuilder, so the produced file is parsed and validated by ProsperoPkgReader
-// (Type=FullDebug, embedded CNT round-trips). The FIH game-digest at 0x30/0x70/0xD0 is
-// SHA3-256 of the plaintext outer superblock. The CNT package-digest self-seal at CNT+0xFE0
+// (Type=FullDebug, embedded CNT round-trips). FIH 0x30 is SHA3-256 of the plaintext outer
+// superblock; 0x70/0xD0 are the GeneralDigests Game/Target slots (the debug profile commonly
+// makes them equal). The CNT package-digest self-seal at CNT+0xFE0
 // is SHA3-256 of CNT[0:0xFE0]. The CNT GeneralDigests block and per-entry digest table are
 // SHA3-256 of plaintext CNT regions and entries. For publisher PPR/NAPS, the distinct FIH slot
 // at 0xB0 is SHA3-256(naps_pkg_layout.dat), and FIH 0xA8 stores that blob's exact byte length.
@@ -40,6 +41,7 @@
 using System;
 using System.Buffers.Binary;
 using System.IO;
+using System.Linq;
 
 namespace LibProsperoPkg.PKG;
 
@@ -49,8 +51,10 @@ public enum ProsperoFihVariant
     /// <summary>Debug finalized image (signed byte 0x00) for debug-mode consoles.</summary>
     Debug,
 
-    /// <summary>Official finalized image (signed byte 0x80). The finalization digest table is
-    /// debug/retail-key gated and not reproduced; emitting this is for structural tooling only.</summary>
+    /// <summary>
+    /// Official finalized image (signed byte 0x80). A trusted
+    /// <see cref="IProsperoRetailFinalizationProvider"/> is mandatory.
+    /// </summary>
     Official,
 }
 
@@ -86,6 +90,10 @@ public static class ProsperoFihBuilder
     /// lets the SI be built with a deterministic <c>playgo-chunk.crc</c> derived from the finalized
     /// image. Ignored when <paramref name="siArchive"/> is non-null.
     /// </param>
+    /// <param name="siArchiveStreamFactory">
+    /// File-backed alternative to <paramref name="siArchiveFactory"/>. It receives a readable,
+    /// seekable stream containing FIH + PFS + CNT and supports mount images larger than 2 GiB.
+    /// </param>
     /// <param name="nestedImageDigest">
     /// Optional 32-byte FIH 0xB0 publisher nested-layout digest.
     /// layout blob. In the publisher PPR/NAPS path it is SHA3-256(<c>naps_pkg_layout.dat</c>), while
@@ -99,37 +107,68 @@ public static class ProsperoFihBuilder
     /// Number of nonterminal NAPS FIDX/file extents (<c>NumFiles - 1</c>).
     /// </param>
     /// <param name="nwonlyAppFileCount">Application-payload file count for the FIH file-count field.</param>
+    /// <param name="outerSuperblockIndex">
+    /// Optional known 64-KiB block index of the outer superblock. Publisher builds pass it to avoid
+    /// scanning a potentially hundreds-of-gigabytes PFS image.
+    /// </param>
+    /// <param name="retailFinalizationProvider">
+    /// Trusted provider for the standard 0x300-byte Retail FIH material. Required for
+    /// <see cref="ProsperoFihVariant.Official"/> and ignored for Debug.
+    /// </param>
     public static System.Collections.Generic.IReadOnlyList<string> BuildFromCnt(
         string cntPath, string fihOutputPath, ProsperoFihVariant variant = ProsperoFihVariant.Debug,
         Action<string>? logger = null, byte[]? siArchive = null,
-        Func<byte[], byte[]>? siArchiveFactory = null, byte[]? nestedImageDigest = null,
+        Func<byte[], byte[]>? siArchiveFactory = null,
+        Func<Stream, byte[]>? siArchiveStreamFactory = null,
+        byte[]? nestedImageDigest = null,
         long nestedImageSize = 0, long nestedMetaBaseBlocks = 0,
-        uint nwonlyContentVersionHi = 0, int nwonlyNapsFileCount = 0, int nwonlyAppFileCount = 0)
+        uint nwonlyContentVersionHi = 0, int nwonlyNapsFileCount = 0, int nwonlyAppFileCount = 0,
+        int outerSuperblockIndex = -1,
+        IProsperoRetailFinalizationProvider? retailFinalizationProvider = null)
     {
         ArgumentException.ThrowIfNullOrEmpty(cntPath);
         ArgumentException.ThrowIfNullOrEmpty(fihOutputPath);
+        if (variant == ProsperoFihVariant.Official && retailFinalizationProvider is null)
+        {
+            throw new InvalidOperationException(
+                "Official FIH generation requires a Retail finalization provider. " +
+                "Writing signed byte 0x80 without protected FIH material is refused.");
+        }
         var log = logger ?? (_ => { });
         var warnings = new System.Collections.Generic.List<string>();
 
-        byte[] cnt = File.ReadAllBytes(cntPath);
-        if (cnt.Length < ProsperoPkgLayout.HeaderSize ||
-            cnt[0] != ProsperoPkgLayout.CntMagic[0] || cnt[1] != ProsperoPkgLayout.CntMagic[1] ||
-            cnt[2] != ProsperoPkgLayout.CntMagic[2] || cnt[3] != ProsperoPkgLayout.CntMagic[3])
+        string inputFullPath = Path.GetFullPath(cntPath);
+        string outputFullPath = Path.GetFullPath(fihOutputPath);
+        if (string.Equals(
+                inputFullPath, outputFullPath,
+                OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal))
+            throw new ArgumentException("CNT input and FIH output paths must be different.");
+
+        using var cntStream = new FileStream(
+            inputFullPath, FileMode.Open, FileAccess.Read, FileShare.Read,
+            bufferSize: 1 << 20, FileOptions.RandomAccess);
+        byte[] cntHeader = ReadStreamRange(cntStream, 0, ProsperoPkgLayout.HeaderSize);
+        if (cntHeader[0] != ProsperoPkgLayout.CntMagic[0] ||
+            cntHeader[1] != ProsperoPkgLayout.CntMagic[1] ||
+            cntHeader[2] != ProsperoPkgLayout.CntMagic[2] ||
+            cntHeader[3] != ProsperoPkgLayout.CntMagic[3])
             throw new InvalidDataException("Input is not a PS5 CNT metadata package.");
 
-        ulong pfsImageOffset = BinaryPrimitives.ReadUInt64BigEndian(cnt.AsSpan(CntPfsImageOffsetField));
-        ulong pfsImageSize = BinaryPrimitives.ReadUInt64BigEndian(cnt.AsSpan(CntPfsImageSizeField));
+        ulong pfsImageOffset = BinaryPrimitives.ReadUInt64BigEndian(
+            cntHeader.AsSpan(CntPfsImageOffsetField));
+        ulong pfsImageSize = BinaryPrimitives.ReadUInt64BigEndian(
+            cntHeader.AsSpan(CntPfsImageSizeField));
         if (pfsImageOffset == 0 || pfsImageSize == 0 ||
-            pfsImageOffset + pfsImageSize > (ulong)cnt.Length)
+            pfsImageOffset > (ulong)cntStream.Length ||
+            pfsImageSize > (ulong)cntStream.Length - pfsImageOffset)
             throw new InvalidDataException("CNT package has no embedded PFS image to finalize.");
+        if (pfsImageOffset > int.MaxValue)
+            throw new InvalidDataException(
+                "CNT metadata preceding the PFS image exceeds the supported 2-GiB metadata limit.");
 
         // Split the CNT into its metadata blob (header + entries + body, everything before the
         // image) and the shared encrypted PFS image.
-        int metaLen = (int)pfsImageOffset;
-        byte[] metadata = new byte[metaLen];
-        Array.Copy(cnt, 0, metadata, 0, metaLen);
-        byte[] image = new byte[(int)pfsImageSize];
-        Array.Copy(cnt, (int)pfsImageOffset, image, 0, (int)pfsImageSize);
+        byte[] metadata = ReadStreamRange(cntStream, 0, checked((int)pfsImageOffset));
 
         // In the finalized image the embedded CNT's pfs_image_offset must point at the shared
         // image stored at the start of the body region (FIH offset 0x10000).
@@ -137,44 +176,97 @@ public static class ProsperoFihBuilder
             ProsperoPkgLayout.FihHeaderRegionSize);
 
         ulong embeddedCntOffset = (ulong)ProsperoPkgLayout.FihHeaderRegionSize + pfsImageSize;
-        byte[] header = BuildFihHeaderBlock(variant, pfsImageSize, embeddedCntOffset, image, warnings,
+        var (sbOffsetInImage, gameDigest, imageDigest) = AnalyzeImageRange(
+            cntStream, checked((long)pfsImageOffset), checked((long)pfsImageSize),
+            outerSuperblockIndex);
+        byte[] header = BuildFihHeaderBlock(
+            variant, pfsImageSize, embeddedCntOffset,
+            sbOffsetInImage, gameDigest, imageDigest, warnings,
             nestedImageDigest: nestedImageDigest, nestedImageSize: nestedImageSize,
             nestedMetaBaseBlocks: nestedMetaBaseBlocks,
             nwonlyContentVersionHi: nwonlyContentVersionHi,
             nwonlyNapsFileCount: nwonlyNapsFileCount,
             nwonlyAppFileCount: nwonlyAppFileCount);
+        if (variant == ProsperoFihVariant.Official)
+            ApplyOfficialDigestSlots(header, metadata);
 
         log($"Writing finalized {(variant == ProsperoFihVariant.Debug ? "debug" : "official")} (FIH) image: " +
             $"image=0x{pfsImageSize:X} @0x{ProsperoPkgLayout.FihHeaderRegionSize:X}, CNT @0x{embeddedCntOffset:X}.");
 
-        using (var fs = new FileStream(fihOutputPath, FileMode.Create, FileAccess.Write, FileShare.None))
+        byte[]? si = siArchive;
+
+        if (variant == ProsperoFihVariant.Official)
+        {
+            ProsperoRetailFinalizationResult result = retailFinalizationProvider!.FinalizeFih(
+                new ProsperoRetailFinalizationRequest
+                {
+                    FihHeader = header,
+                }) ?? throw new InvalidOperationException("The Retail finalization provider returned null.");
+
+            if (result.FihFinalizationMaterial is null ||
+                result.FihFinalizationMaterial.Length != ProsperoPkgLayout.FihRetailFinalizationSize)
+            {
+                throw new InvalidDataException(
+                    $"The Retail FIH finalization material must contain exactly " +
+                    $"0x{ProsperoPkgLayout.FihRetailFinalizationSize:X} bytes.");
+            }
+            if (IsAllZero(result.FihFinalizationMaterial))
+                throw new InvalidDataException("The Retail FIH finalization material is all zero.");
+
+            result.FihFinalizationMaterial.CopyTo(
+                header, ProsperoPkgLayout.FihRetailFinalizationOffset);
+            si = result.SupplementalData
+                ?? throw new InvalidDataException(
+                    "The Retail finalization provider returned null supplemental data.");
+            ResealOfficialCnt(metadata, header, retailFinalizationProvider);
+            log(
+                $"Applied Retail finalization: FIH+0x{ProsperoPkgLayout.FihRetailFinalizationOffset:X} " +
+                $"size=0x{ProsperoPkgLayout.FihRetailFinalizationSize:X}, " +
+                $"CNT authentication=0x{ProsperoPublisherRsa.ModulusSize:X}, supplemental=0x{si.Length:X}.");
+        }
+        using (var fs = new FileStream(
+                   outputFullPath, FileMode.Create, FileAccess.ReadWrite, FileShare.None,
+                   bufferSize: 1 << 20, FileOptions.SequentialScan))
         {
             fs.Write(header, 0, header.Length);                 // 0x00000 .. 0x10000
-            fs.Write(image, 0, image.Length);                   // 0x10000 .. +pfs_image_size
+            CopyStreamRange(
+                cntStream, fs, checked((long)pfsImageOffset), checked((long)pfsImageSize));
             fs.Write(metadata, 0, metadata.Length);             // embedded CNT
+            fs.Flush();
 
-            // The trailing SI segment may be supplied directly, or built on demand from the
-            // finalized mount image (header + image + metadata) so its playgo-chunk.crc is the
-            // CRC-32C reduction produced for the finalized image.
-            byte[]? si = siArchive;
-            if (si is null && siArchiveFactory is not null)
+            if (variant == ProsperoFihVariant.Debug && si is null &&
+                siArchiveStreamFactory is not null)
             {
-                byte[] mountImage = new byte[header.Length + image.Length + metadata.Length];
-                Buffer.BlockCopy(header, 0, mountImage, 0, header.Length);
-                Buffer.BlockCopy(image, 0, mountImage, header.Length, image.Length);
-                Buffer.BlockCopy(metadata, 0, mountImage, header.Length + image.Length, metadata.Length);
+                fs.Position = 0;
+                si = siArchiveStreamFactory(fs);
+            }
+            else if (variant == ProsperoFihVariant.Debug && si is null &&
+                     siArchiveFactory is not null)
+            {
+                if (fs.Length > int.MaxValue)
+                {
+                    throw new InvalidOperationException(
+                        "The byte-array SI factory cannot process a mount image larger than 2 GiB. " +
+                        "Use siArchiveStreamFactory.");
+                }
+                fs.Position = 0;
+                byte[] mountImage = new byte[checked((int)fs.Length)];
+                fs.ReadExactly(mountImage);
                 si = siArchiveFactory(mountImage);
             }
+
             if (si is { Length: > 0 })
             {
+                fs.Position = fs.Length;
                 fs.Write(si, 0, si.Length);                     // trailing SI segment
                 log($"Appended SI segment: 0x{si.Length:X} bytes after the embedded CNT.");
             }
         }
 
         warnings.Add(
-            "The finalized image carries a valid embedded CNT and PFS image: the game-digest " +
-            "(0x30/0x70/0xD0) is SHA3-256 of the plaintext outer superblock, the CNT package-digest " +
+            "The finalized image carries a valid embedded CNT and PFS image: FIH 0x30 is " +
+            "SHA3-256 of the plaintext outer superblock and 0x70/0xD0 carry GeneralDigests " +
+            "Game/Target, the CNT package-digest " +
             "self-seal sits at CNT+0xFE0, and the GeneralDigests block (content/header/system/param/" +
             "playgo/target) plus the per-entry digest table are SHA3-256 of the plaintext CNT regions " +
             "and entries. " +
@@ -184,7 +276,9 @@ public static class ProsperoFihBuilder
                 : "The FIH 0xB0 slot holds a fallback SHA3-256 of the outer image: a standalone finalize " +
                   "has only the encrypted CNT and cannot recover the plaintext inner image; the CNT build " +
                   "path emits the nested-image-content digest.") +
-            " The image targets debug-mode consoles.");
+            (variant == ProsperoFihVariant.Debug
+                ? " The image targets debug-mode consoles."
+                : " The image carries provider-issued standard Retail FIH finalization material."));
         log("Done (FIH).");
         return warnings;
     }
@@ -205,6 +299,28 @@ public static class ProsperoFihBuilder
         byte[]? nestedImageDigest = null, long nestedImageSize = 0, long nestedMetaBaseBlocks = 0,
         uint nwonlyContentVersionHi = 0, int nwonlyNapsFileCount = 0, int nwonlyAppFileCount = 0)
     {
+        var (sbOffsetInImage, gameDigest) =
+            ProsperoImageDigests.ComputeSblockDigestFromImage(image);
+        byte[] imageDigest = gameDigest ?? ProsperoImageDigests.Sha3_256(image);
+        return BuildFihHeaderBlock(
+            variant, pfsImageSize, embeddedCntOffset,
+            sbOffsetInImage, gameDigest, imageDigest, warnings,
+            nestedImageDigest, nestedImageSize, nestedMetaBaseBlocks,
+            nwonlyContentVersionHi, nwonlyNapsFileCount, nwonlyAppFileCount);
+    }
+
+    internal static byte[] BuildFihHeaderBlock(
+        ProsperoFihVariant variant, ulong pfsImageSize, ulong embeddedCntOffset,
+        long sbOffsetInImage, byte[]? gameDigest, byte[] imageDigest,
+        System.Collections.Generic.List<string>? warnings = null,
+        byte[]? nestedImageDigest = null, long nestedImageSize = 0,
+        long nestedMetaBaseBlocks = 0, uint nwonlyContentVersionHi = 0,
+        int nwonlyNapsFileCount = 0, int nwonlyAppFileCount = 0)
+    {
+        ArgumentNullException.ThrowIfNull(imageDigest);
+        if (imageDigest.Length != ProsperoImageDigests.DigestSize)
+            throw new ArgumentException("Image digest must contain exactly 32 bytes.", nameof(imageDigest));
+
         byte[] h = new byte[ProsperoPkgLayout.FihHeaderRegionSize];
 
         // ---- Structural fields (little-endian). ----
@@ -229,12 +345,12 @@ public static class ProsperoFihBuilder
             BinaryPrimitives.WriteUInt64LittleEndian(h.AsSpan(ProsperoPkgLayout.FihDataRegionBlockCountField), (ulong)nestedMetaBaseBlocks);
 
         // ---- Finalized-image digest table. ----
-        // game-digest == sblock-digest == SHA3-256(plaintext outer superblock block, 0x10000 bytes),
-        // stored three times at 0x30/0x70/0xD0.
+        // sblock-digest = SHA3-256(plaintext outer superblock block, 0x10000 bytes), stored at
+        // 0x30. Debug initializes 0x70/0xD0 to the same value; Official finalization replaces
+        // those slots from CNT GeneralDigests Game/Target before the provider signs the FIH.
         // The FIH also records the
         // superblock's absolute offset (0x20) and size (0x28) so the loader can locate the hashed
         // block. See ProsperoImageDigests for the full digest construction.
-        var (sbOffsetInImage, gameDigest) = ProsperoImageDigests.ComputeSblockDigestFromImage(image);
         if (sbOffsetInImage >= 0 && gameDigest is not null)
         {
             ulong sbAbsoluteOffset = (ulong)ProsperoPkgLayout.FihHeaderRegionSize + (ulong)sbOffsetInImage;
@@ -288,8 +404,9 @@ public static class ProsperoFihBuilder
             }
 
             warnings?.Add(
-                "FIH game-digest (0x30/0x70/0xD0) is SHA3-256 of the plaintext outer " +
-                "superblock; the superblock offset/size are recorded at 0x20/0x28. The CNT package-digest " +
+                "FIH 0x30 is SHA3-256 of the plaintext outer superblock; 0x70/0xD0 are " +
+                "GeneralDigests Game/Target, and the superblock offset/size are recorded at " +
+                "0x20/0x28. The CNT package-digest " +
                 "(CNT+0xFE0), content/header/system/param/playgo GeneralDigests and the per-entry digest " +
                 "table are SHA3-256 of the plaintext CNT regions and entries. The FIH " +
                 "0xB0 slot holds SHA3-256(naps_pkg_layout.dat) when the publisher builder threads it in, " +
@@ -300,10 +417,9 @@ public static class ProsperoFihBuilder
         {
             // No data-first plaintext superblock in this image (e.g. the legacy zlib inner path):
             // fall back to a well-formed, parseable best-effort game-digest.
-            byte[] fallback = ProsperoImageDigests.Sha3_256(image);
-            CopyDigest(h, 0x30, fallback);
-            CopyDigest(h, 0x70, fallback);
-            CopyDigest(h, 0xD0, fallback);
+            CopyDigest(h, 0x30, imageDigest);
+            CopyDigest(h, 0x70, imageDigest);
+            CopyDigest(h, 0xD0, imageDigest);
             warnings?.Add(
                 "FIH game-digest filled best-effort: no plaintext outer superblock was found in the " +
                 "image (the SHA3-256(superblock) path applies to the nwonly outer-PFS image).");
@@ -316,7 +432,7 @@ public static class ProsperoFihBuilder
         // Cycle-free either way: the naps is final before the CNT digest table is computed.
         CopyDigest(h, 0xB0, nestedImageDigest is { Length: 32 }
             ? nestedImageDigest
-            : ProsperoImageDigests.Sha3_256(image));
+            : imageDigest);
 
         return h;
     }
@@ -324,6 +440,163 @@ public static class ProsperoFihBuilder
     private static void CopyDigest(byte[] dst, int offset, byte[] digest32)
     {
         Array.Copy(digest32, 0, dst, offset, Math.Min(32, digest32.Length));
+    }
+
+    private static bool IsAllZero(ReadOnlySpan<byte> value)
+    {
+        foreach (byte b in value)
+        {
+            if (b != 0)
+                return false;
+        }
+        return true;
+    }
+
+    private static void ApplyOfficialDigestSlots(byte[] fih, byte[] cnt)
+    {
+        ProsperoPkg package = ReadMetadataPackage(cnt);
+        ProsperoPkgEntry? general = package.Entries.FirstOrDefault(
+            entry => entry.RawId == (uint)ProsperoEntryId.GeneralDigests);
+        if (general is null)
+            throw new InvalidDataException("Official CNT has no GeneralDigests entry.");
+
+        int dataOffset = checked((int)general.DataOffset);
+        int dataSize = checked((int)general.DataSize);
+        const int gameSlotOffset = 0x40;
+        const int targetSlotOffset = 0x180;
+        if (dataOffset < 0 || dataSize < targetSlotOffset + ProsperoImageDigests.DigestSize ||
+            dataOffset > cnt.Length - dataSize)
+        {
+            throw new InvalidDataException("CNT GeneralDigests payload is outside the metadata region.");
+        }
+
+        cnt.AsSpan(dataOffset + gameSlotOffset, ProsperoImageDigests.DigestSize)
+            .CopyTo(fih.AsSpan(0x70, ProsperoImageDigests.DigestSize));
+        cnt.AsSpan(dataOffset + targetSlotOffset, ProsperoImageDigests.DigestSize)
+            .CopyTo(fih.AsSpan(0xD0, ProsperoImageDigests.DigestSize));
+    }
+
+    private static void ResealOfficialCnt(
+        byte[] cnt, byte[] finalizedFih, IProsperoRetailFinalizationProvider provider)
+    {
+        if (cnt.Length < 0x1000 + ProsperoPublisherRsa.ModulusSize)
+            throw new InvalidDataException("CNT metadata is too short for the header authentication block.");
+
+        // Standard finalization replaces fixed-info-digest with SHA3-256 of the completed FIH.
+        // The GeneralDigests header slot is intentionally preserved: both observed Retail profiles
+        // retain the build-stage value rather than the debug-profile formula over the final mount
+        // descriptor. Consequently the GeneralDigests entry and its per-entry digest do not change.
+        ProsperoImageDigests.ComputeFixedInfoDigest(finalizedFih)
+            .CopyTo(cnt, 0x460);
+
+        byte[] rollup = ProsperoImageDigests.ComputeCntHeaderRollupDigest(cnt);
+        rollup.CopyTo(cnt, ProsperoImageDigests.CntHeaderRollupStoredOffset);
+
+        byte[] packageDigest = ProsperoImageDigests.ComputePackageDigest(cnt);
+        packageDigest.CopyTo(cnt, ProsperoImageDigests.PackageDigestStoredOffset);
+
+        byte[] authentication = provider.FinalizeCntHeader(
+            new ProsperoRetailCntFinalizationRequest
+            {
+                CntHeader = cnt.AsMemory(0, 0x1000),
+            }) ?? throw new InvalidOperationException(
+                "The Retail finalization provider returned null CNT authentication material.");
+        if (authentication.Length != ProsperoPublisherRsa.ModulusSize || IsAllZero(authentication))
+        {
+            throw new InvalidDataException(
+                $"The Retail CNT authentication material must contain exactly " +
+                $"0x{ProsperoPublisherRsa.ModulusSize:X} non-zero bytes.");
+        }
+        authentication.CopyTo(cnt, 0x1000);
+    }
+
+    private static ProsperoPkg ReadMetadataPackage(byte[] cnt)
+    {
+        using var stream = new MemoryStream(cnt, writable: false);
+        ProsperoPkg package = ProsperoPkgReader.Read(stream);
+        if (package.Type != ProsperoPkgType.Meta)
+            throw new InvalidDataException("Embedded metadata is not a CNT package.");
+        return package;
+    }
+
+    private static (long SuperblockOffset, byte[]? GameDigest, byte[] ImageDigest)
+        AnalyzeImageRange(Stream stream, long offset, long size, int knownSuperblockIndex)
+    {
+        if (knownSuperblockIndex >= 0)
+        {
+            long relative = checked((long)knownSuperblockIndex * ProsperoImageDigests.BlockSize);
+            if (relative > size - ProsperoImageDigests.BlockSize)
+                throw new InvalidDataException("Known outer superblock index is outside the PFS image.");
+            byte[] superblock = ReadStreamRange(
+                stream, checked(offset + relative), ProsperoImageDigests.BlockSize);
+            if (BinaryPrimitives.ReadUInt64LittleEndian(superblock) != 2UL ||
+                superblock[8] != 0x0B || superblock[9] != 0x2A ||
+                superblock[10] != 0x33 || superblock[11] != 0x01)
+            {
+                throw new InvalidDataException(
+                    "Known outer superblock index does not point to a PFS superblock.");
+            }
+            byte[] digest = ProsperoImageDigests.ComputeSblockDigest(superblock);
+            return (relative, digest, digest);
+        }
+
+        Span<byte> identity = stackalloc byte[12];
+        for (long relative = 0;
+             relative <= size - ProsperoImageDigests.BlockSize;
+             relative += ProsperoImageDigests.BlockSize)
+        {
+            stream.Position = checked(offset + relative);
+            stream.ReadExactly(identity);
+            if (BinaryPrimitives.ReadUInt64LittleEndian(identity) != 2UL ||
+                identity[8] != 0x0B || identity[9] != 0x2A ||
+                identity[10] != 0x33 || identity[11] != 0x01)
+                continue;
+
+            byte[] superblock = ReadStreamRange(
+                stream, checked(offset + relative), ProsperoImageDigests.BlockSize);
+            byte[] digest = ProsperoImageDigests.ComputeSblockDigest(superblock);
+            return (relative, digest, digest);
+        }
+
+        var hash = new LibProsperoPkg.Util.ProsperoSha3.Incremental();
+        byte[] buffer = new byte[1024 * 1024];
+        stream.Position = offset;
+        long remaining = size;
+        while (remaining != 0)
+        {
+            int requested = (int)Math.Min(buffer.Length, remaining);
+            int read = stream.Read(buffer, 0, requested);
+            if (read == 0) throw new EndOfStreamException();
+            hash.AppendData(buffer.AsSpan(0, read));
+            remaining -= read;
+        }
+        return (-1, null, hash.GetHashAndReset());
+    }
+
+    private static byte[] ReadStreamRange(Stream stream, long offset, int size)
+    {
+        if (offset < 0 || size < 0 || offset > stream.Length || size > stream.Length - offset)
+            throw new InvalidDataException("Requested CNT range is outside the input stream.");
+        byte[] value = new byte[size];
+        stream.Position = offset;
+        stream.ReadExactly(value);
+        return value;
+    }
+
+    private static void CopyStreamRange(Stream input, Stream output, long offset, long size)
+    {
+        if (offset < 0 || size < 0 || offset > input.Length || size > input.Length - offset)
+            throw new InvalidDataException("Requested PFS range is outside the CNT input.");
+        input.Position = offset;
+        byte[] buffer = new byte[1024 * 1024];
+        while (size != 0)
+        {
+            int requested = (int)Math.Min(buffer.Length, size);
+            int read = input.Read(buffer, 0, requested);
+            if (read == 0) throw new EndOfStreamException();
+            output.Write(buffer, 0, read);
+            size -= read;
+        }
     }
 
 }

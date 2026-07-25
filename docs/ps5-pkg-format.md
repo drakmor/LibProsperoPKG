@@ -185,8 +185,13 @@ Finalization wraps the `\x7FCNT` container and the shared PFS image into the ins
 | `0x05` | Signed byte | `0x00` = debug, `0x80` = retail/submitted |
 | `0x10` | PFS image offset | u64; always `0x10000` |
 | `0x18` | PFS image size | u64 |
+| `0x20` / `0x28` | Outer superblock offset / size | absolute u64 offset; size `0x10000` |
+| `0x30` | Sblock digest | SHA3-256 of the plaintext outer superblock |
 | `0x58` | Embedded CNT (SC) offset | u64 |
-| `0xA0` | Embedded CNT (SC) size | u64 |
+| `0x70` | Game digest | GeneralDigests Game slot; not necessarily equal to `0x30` |
+| `0xA0` | Stored inner-image size | u64 |
+| `0xA8` / `0xB0` | NAPS layout size / digest | byte length and SHA3-256 of `naps_pkg_layout.dat` |
+| `0xD0` | Target digest | GeneralDigests Target slot; not necessarily equal to `0x30` or `0x70` |
 
 The header + digest-table region is always **`0x10000`** bytes, and the PFS segment always
 begins at `0x10000`. The FIH offset (`0`) and FIH size (`0x10000`) are constant; only the
@@ -198,20 +203,61 @@ The single byte at offset `0x05` is what distinguishes a **debug** finalized ima
 from a **retail/submitted** one (`0x80`). A console in debug mode relaxes finalized-image
 verification and accepts the debug variant.
 
-### 5.3 Finalization digest table
+### 5.3 Digests and Retail finalization
 
-The remainder of the FIH region holds the finalized digests. The `game-digest` (`0x30`/`0x70`/`0xD0`)
-is `SHA3-256` of the plaintext outer superblock, and the embedded CNT carries the package-digest
-self-seal, the CNT-header rollup, the per-entry digest table and the GeneralDigests block
-(content/header/system/param/playgo/target). LibProsperoPkg reproduces **all of these byte-exact**
-(verified against real debug packages). In publisher PPR/NAPS images, FIH `0xA8` is the exact byte
-length of `naps_pkg_layout.dat` and FIH `0xB0` is `SHA3-256` of that same blob. Both fields were
-verified byte-for-byte against `dlc_baseline.pkg` and are threaded through the build path.
-See [implementation-status.md](implementation-status.md).
+FIH `0x30`, `0x70`, and `0xD0` are distinct semantic slots. `0x30` is SHA3-256 of the plaintext
+outer superblock; `0x70` copies the CNT GeneralDigests Game slot and `0xD0` copies its Target slot.
+They happen to be equal in the earlier debug corpus, but are different in the Retail APP reference
+and therefore must not be generated as three copies. The embedded CNT also carries the package
+self-seal, header rollup, per-entry digest table and GeneralDigests block.
 
-### 5.4 The SI segment
+Two standard Retail references were checked: a GD/APP package
+`IP9100-PPSA01325_00-PREINMASTER00000` and the AC package
+`EP9000-PPSA01521_00-BURNINGSHORESPS5`. Both have state `0x00038001`, exactly `0x300` bytes of
+protected material at FIH `0xF000..0xF2FF`, zeroes through `0xFFFF`, and no bytes after the
+embedded CNT. Their CNT `fixed-info-digest` is SHA3-256 of the completed FIH, including this
+`0x300` block.
 
-The image ends with a trailing **STORED ZIP** archive of install-time metadata. Verified
+FGC/Flexible Content is a separate finalization protocol. `fa.exe` writes `0xA00` bytes at
+FIH `0xF000`: `cert0[0x380] || RSA3072-signature[0x180] || cert1[0x380] ||
+RSA3072-signature[0x180]`. It also updates/signs the PFS superblock and CNT, consumes FGC token
+certificate chains (`PFS0/1`, `FIH0/1`, `CNT0/1`) and a partner RSA-3072 private key. It cannot
+be substituted for the standard three-block Retail result.
+
+`ProsperoFlexibleContentFinalizer` implements this FGC path without either publisher executable.
+Token format 0 supplies the issued access token directly. Token format 1 verifies the stored
+SHA3-256 access-token digest and decrypts a compact direct-key JWE; its 16-byte A128GCM key is
+`SHAKE128("encryptby" || passcode || "4token", 16)`. Both formats verify
+`SHAKE128("passcode" || passcode, 32)` and require the RSA modulus in every 0x380-byte certificate
+to match the supplied RSA-3072 private key.
+
+The managed finalization order is:
+
+1. update PFS superblock system version at `+0x360`, clear/recompute the `+0x380` ICV as
+   SHA3-256 over `0x000..0x59F`, then sign SHA3-256 of `0x000..0xBFFF` into the 0xA00 area at
+   `+0xC000`;
+2. set the FIH finalized/FGC state bits (`stateAndVersion |= 0x8010`), copy the complete
+   superblock digest to FIH `+0x30`, and sign SHA3-256 of `0x000..0xEFFF` into FIH `+0xF000`;
+3. mark CNT finalized, write the superblock and completed-FIH digests at CNT `+0x440/+0x460`,
+   place the issued access token in the reserved `IMAGE_KEY` entry, update the reversed
+   superblock digest slot in `imagedigs.dat`, recompute entry/body/descriptor/header/package
+   digests, then sign SHA3-256 of CNT `0x000..0x0FFF` into CNT `+0x1000`.
+
+Each signing area is `cert0 || sig0 || cert1 || sig1`; RSA signatures use PKCS#1 v1.5 with a
+SHA-256 `DigestInfo` around the already-computed SHA3-256 value. The command-line form is:
+
+```text
+finalize-fgc <fih.dat> <pfsmeta.dat> <cnt.dat> <manifest.json>
+             <fgc-token.json> <partner-private-key.pem> <passcode>
+```
+
+A synthetic end-to-end regression covers token v0, token v1 with a real compact A128GCM JWE,
+all three authentication areas, ICV/digests, `IMAGE_KEY` and `imagedigs.dat`; a genuine
+publisher-issued FGC corpus is still needed for byte-exact cross-validation.
+
+### 5.4 The debug SI segment
+
+Debug publisher images may end with a trailing **STORED ZIP** archive of install-time metadata. Verified
 member order against reference debug packages (every member uncompressed / `STORED`):
 
 | Path | Notes |
@@ -234,6 +280,11 @@ recomputed from the finalized mount image (CRC-32C). The `naps_meta_300` `R` is 
 data-region size and is legitimately `0` when the inner image fits in one 0x10000 block (tiny synthetic
 inputs); real multi-MB game/app content yields the expected non-zero value (e.g. `0x40000` for the
 reference Downloads package).
+
+This ZIP description is not a requirement for standard Retail APP/AC. Both checked Retail packages
+end exactly after CNT (`supplement = 0`); no encrypted Retail install-metadata archive is appended.
+An install-metadata object may still exist as an intermediate publishing input for another profile,
+but it must not be inferred from these final package layouts.
 
 `pfsimage.xml` is reproduced faithfully through its `<config>`, `<digests>`, `<params>`,
 `<container>`, `<mount-image>` and `<entries>` sections — including the toolchain constants

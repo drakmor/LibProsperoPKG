@@ -35,7 +35,7 @@ namespace LibProsperoPkg.PKG;
 /// (<c>sce_suppl</c> ZIP). The package builder surfaces these out of
 /// <see cref="ProsperoPkgBuilder.Build(ProsperoPkgBuildProperties,string,out byte[],out ProsperoSiBuildInputs,Action{string})"/>
 /// so the finalizer (<see cref="ProsperoFihBuilder.BuildFromCnt"/>) can assemble the segment from the
-/// finalized mount image via <see cref="ProsperoSiArchive.BuildDebugSiSegment"/>.
+/// finalized mount image via <c>ProsperoSiArchive.BuildDebugSiSegment</c>.
 /// </summary>
 internal sealed class ProsperoSiBuildInputs
 {
@@ -88,6 +88,7 @@ internal sealed class ProsperoSiBuildInputs
     public long NestedMetaBaseBlocks { get; init; }
     public uint ContentVersionHigh { get; init; }
     public int AppFileCount { get; init; }
+    public int OuterSuperblockIndex { get; init; } = -1;
 }
 
 /// <summary>The PS5 volume kind, which selects the content-type code stamped into the header.</summary>
@@ -695,7 +696,8 @@ public static class ProsperoPkgBuilder
 
             ProsperoPfsImageXmlOptions siXml = FinishContainer(
                 pkg, fs, props, nestedImageDigest, log, napsLayout.Length, nestedMetaBaseBlocks,
-                contentVersionHigh, (int)napsFileCount, appFileCount);
+                contentVersionHigh, (int)napsFileCount, appFileCount,
+                outer.SuperblockIndex);
             byte[]? playGoChunkDat =
                 (pkg.Entries.FirstOrDefault(e => (uint)e.Id == PlayGoChunkDatEntryId)
                     as GenericEntry)?.FileData;
@@ -736,6 +738,7 @@ public static class ProsperoPkgBuilder
                 NestedMetaBaseBlocks = nestedMetaBaseBlocks,
                 ContentVersionHigh = contentVersionHigh,
                 AppFileCount = appFileCount,
+                OuterSuperblockIndex = outer.SuperblockIndex,
             };
             transferredInnerFile = true;
         }
@@ -1375,7 +1378,7 @@ public static class ProsperoPkgBuilder
         Pkg pkg, Stream s, ProsperoPkgBuildProperties props, byte[]? nestedImageDigest,
         Action<string> log, long nestedImageSize = 0, long nestedMetaBaseBlocks = 0,
         uint nwonlyContentVersionHi = 0, int nwonlyNapsFileCount = 0,
-        int nwonlyAppFileCount = 0)
+        int nwonlyAppFileCount = 0, int knownOuterSuperblockIndex = -1)
     {
         // Read the outer PFS image (encrypted blocks + plaintext superblock) so the PS5 mount digests can be
         // computed for the mount image — both are SHA3-256, NOT SHA-256:
@@ -1384,17 +1387,30 @@ public static class ProsperoPkgBuilder
         // The FIH block is cycle-free here (it depends only on the image + sizes, never on the CNT digest
         // table) so it is identical to the one ProsperoFihBuilder.BuildFromCnt writes when finalizing.
         log("Calculating PFS image digests (SHA3-256)...");
-        byte[] image = new byte[(int)pkg.Header.pfs_image_size];
-        s.Position = (long)pkg.Header.pfs_image_offset;
-        s.ReadExactly(image);
-
-        var (sbOffset, sblockDigest) = ProsperoImageDigests.ComputeSblockDigestFromImage(image);
-        pkg.Header.pfs_image_digest = sblockDigest ?? ProsperoImageDigests.Sha3_256(image);
-        if (sbOffset >= 0 && sbOffset + PfsSeedOffset + 16 <= image.Length)
-            pkg.Header.image_seed = image.AsSpan(sbOffset + PfsSeedOffset, 16).ToArray();
+        long imageOffset = checked((long)pkg.Header.pfs_image_offset);
+        long imageSize = checked((long)pkg.Header.pfs_image_size);
+        long sbOffset = knownOuterSuperblockIndex >= 0
+            ? checked((long)knownOuterSuperblockIndex * ProsperoImageDigests.BlockSize)
+            : LocateSuperblockInRange(s, imageOffset, imageSize);
+        byte[]? sblockDigest = null;
+        byte[] imageDigest;
+        if (sbOffset >= 0)
+        {
+            byte[] superblock = ReadStreamRange(
+                s, checked(imageOffset + sbOffset), ProsperoImageDigests.BlockSize);
+            sblockDigest = ProsperoImageDigests.ComputeSblockDigest(superblock);
+            imageDigest = sblockDigest;
+            pkg.Header.image_seed = superblock.AsSpan(PfsSeedOffset, 16).ToArray();
+        }
+        else
+        {
+            imageDigest = HashStreamRange(s, imageOffset, imageSize);
+        }
+        pkg.Header.pfs_image_digest = imageDigest;
         byte[] fihBlock = ProsperoFihBuilder.BuildFihHeaderBlock(
             ProsperoFihVariant.Debug, pkg.Header.pfs_image_size,
-            ProsperoImageDigests.FihRelativeImageOffset + pkg.Header.pfs_image_size, image,
+            ProsperoImageDigests.FihRelativeImageOffset + pkg.Header.pfs_image_size,
+            sbOffset, sblockDigest, imageDigest,
             warnings: null, nestedImageDigest: nestedImageDigest, nestedImageSize: nestedImageSize,
             nestedMetaBaseBlocks: nestedMetaBaseBlocks,
             nwonlyContentVersionHi: nwonlyContentVersionHi,
@@ -1449,7 +1465,7 @@ public static class ProsperoPkgBuilder
         // SI pfsimage.xml options can be assembled from the builder's own output. The inner-PFS seed is read
         // from the plaintext outer superblock at sbOffset+0x370.
         return BuildSiXmlOptions(
-            pkg, image, sbOffset, Path.GetFullPath(props.SourceFolder!),
+            pkg, pkg.Header.image_seed, Path.GetFullPath(props.SourceFolder!),
             props.PrimaryId ?? props.ContentId);
     }
 
@@ -1473,18 +1489,15 @@ public static class ProsperoPkgBuilder
 
     /// <summary>
     /// Builds the reproducible <see cref="ProsperoPfsImageXmlOptions"/> for the trailing debug SI segment
-    /// from the finalized CNT (<paramref name="pkg"/>) and outer image (<paramref name="image"/>). Every
+    /// from the finalized CNT (<paramref name="pkg"/>) and the captured outer-image seed. Every
     /// value maps to something the builder already produced — the general digests, the header/body/
     /// fixed-info digests, the container geometry and the CNT entry table — so the emitted pfsimage.xml is
     /// self-consistent with the produced package.
     /// </summary>
     private static ProsperoPfsImageXmlOptions BuildSiXmlOptions(
-        Pkg pkg, byte[] image, int sbOffsetInImage, string sourceFolder, string primaryId)
+        Pkg pkg, byte[] imageSeed, string sourceFolder, string primaryId)
     {
-        // Inner-PFS superblock seed: 16 bytes at superblock+0x370 (zeros in our build — self-consistent).
-        byte[] seed = new byte[16];
-        if (sbOffsetInImage >= 0 && sbOffsetInImage + PfsSeedOffset + seed.Length <= image.Length)
-            Array.Copy(image, sbOffsetInImage + PfsSeedOffset, seed, 0, seed.Length);
+        byte[] seed = imageSeed is { Length: 16 } ? imageSeed.ToArray() : new byte[16];
 
         ParamJsonInfo pj = ReadParamJsonInfo(sourceFolder);
 
@@ -1537,6 +1550,53 @@ public static class ProsperoPkgBuilder
             SblockDigest = pkg.Header.pfs_image_digest,
             FixedInfoDigest = pkg.Header.pfs_signed_digest,
         };
+    }
+
+    private static long LocateSuperblockInRange(Stream stream, long offset, long size)
+    {
+        if (!stream.CanRead || !stream.CanSeek)
+            throw new ArgumentException("Image stream must be readable and seekable.", nameof(stream));
+        Span<byte> identity = stackalloc byte[12];
+        for (long relative = 0;
+             relative <= size - ProsperoImageDigests.BlockSize;
+             relative += ProsperoImageDigests.BlockSize)
+        {
+            stream.Position = checked(offset + relative);
+            stream.ReadExactly(identity);
+            if (BinaryPrimitives.ReadUInt64LittleEndian(identity) == 2UL &&
+                identity[8] == 0x0B && identity[9] == 0x2A &&
+                identity[10] == 0x33 && identity[11] == 0x01)
+                return relative;
+        }
+        return -1;
+    }
+
+    private static byte[] ReadStreamRange(Stream stream, long offset, int size)
+    {
+        if (offset < 0 || size < 0 || offset > stream.Length || size > stream.Length - offset)
+            throw new InvalidDataException("Requested image range is outside the stream.");
+        byte[] value = new byte[size];
+        stream.Position = offset;
+        stream.ReadExactly(value);
+        return value;
+    }
+
+    private static byte[] HashStreamRange(Stream stream, long offset, long size)
+    {
+        if (offset < 0 || size < 0 || offset > stream.Length || size > stream.Length - offset)
+            throw new InvalidDataException("Requested image range is outside the stream.");
+        var hash = new ProsperoSha3.Incremental();
+        byte[] buffer = new byte[1024 * 1024];
+        stream.Position = offset;
+        while (size != 0)
+        {
+            int requested = (int)Math.Min(buffer.Length, size);
+            int read = stream.Read(buffer, 0, requested);
+            if (read == 0) throw new EndOfStreamException();
+            hash.AppendData(buffer.AsSpan(0, read));
+            size -= read;
+        }
+        return hash.GetHashAndReset();
     }
 
     /// <summary>Plaintext superblock offset of the 16-byte inner-PFS seed (superblock+0x370).</summary>

@@ -71,6 +71,48 @@ public static class ProsperoPlayGo
     }
 
     /// <summary>
+    /// Streamed equivalent of <see cref="BuildChunkCrc(ReadOnlySpan{byte})"/>. The bytes from the
+    /// stream's current position through <paramref name="length"/> are reduced without buffering the
+    /// complete mount image; the original position is restored.
+    /// </summary>
+    public static byte[] BuildChunkCrc(Stream finalizedMountImage, long length)
+    {
+        ArgumentNullException.ThrowIfNull(finalizedMountImage);
+        if (!finalizedMountImage.CanRead || !finalizedMountImage.CanSeek)
+            throw new ArgumentException(
+                "Finalized mount-image stream must be readable and seekable.",
+                nameof(finalizedMountImage));
+        if (length < 0 || length > finalizedMountImage.Length - finalizedMountImage.Position)
+            throw new ArgumentOutOfRangeException(nameof(length));
+        if (length == 0) return [];
+
+        long blockCount64 = checked(
+            (length + ChunkCrcBlockSize - 1) / ChunkCrcBlockSize);
+        if (blockCount64 > int.MaxValue / 4)
+            throw new InvalidDataException("Mount image has too many blocks for a CRC table.");
+        byte[] crc = new byte[checked((int)blockCount64 * 4)];
+        byte[] block = new byte[ChunkCrcBlockSize];
+        long originalPosition = finalizedMountImage.Position;
+        try
+        {
+            long remaining = length;
+            for (int i = 0; i < (int)blockCount64; i++)
+            {
+                int count = (int)Math.Min(block.Length, remaining);
+                finalizedMountImage.ReadExactly(block.AsSpan(0, count));
+                uint value = ProsperoCrc32C.Compute(block.AsSpan(0, count));
+                BinaryPrimitives.WriteUInt32LittleEndian(crc.AsSpan(i * 4), value);
+                remaining -= count;
+            }
+        }
+        finally
+        {
+            finalizedMountImage.Position = originalPosition;
+        }
+        return crc;
+    }
+
+    /// <summary>
     /// Builds the PS5 <c>sce_sys/playgo-chunk.dat</c> (<c>plgx</c> container, version 0x1000) for the
     /// single-image / single-chunk / single-scenario profile used by PS5 system applications.
     /// </summary>

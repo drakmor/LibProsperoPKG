@@ -14,7 +14,9 @@ using System.IO;
 using System.IO.MemoryMappedFiles;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 
 namespace PprPfsKrakenTool;
 
@@ -77,6 +79,7 @@ internal static class Program
                 "check-pkg-imagedigs" => CheckPackageImageDigests(args),
                 "check-pkg-signature" => CheckPackageSignature(args),
                 "resign-pkg" => ResignPackage(args),
+                "finalize-fgc" => FinalizeFlexibleContent(args),
                 "extract-pkg-inner" => ExtractPackageInner(args),
                 "extract-pkg-cnt" => ExtractPackageCnt(args),
                 "extract-pkg-si" => ExtractPackageSi(args),
@@ -98,6 +101,35 @@ internal static class Program
                 Console.Error.WriteLine(exception);
             return 1;
         }
+    }
+
+    private static int FinalizeFlexibleContent(string[] args)
+    {
+        if (args.Length != 8)
+        {
+            throw new ArgumentException(
+                "finalize-fgc requires <fih.dat> <pfsmeta.dat> <cnt.dat> " +
+                "<manifest.json> <fgc-token.json> <partner-private-key.pem> <passcode>.");
+        }
+
+        ProsperoFlexibleContentFinalizationResult result =
+            ProsperoFlexibleContentFinalizer.Finalize(
+                new ProsperoFlexibleContentFinalizationOptions
+                {
+                    FixedInfoHeaderPath = args[1],
+                    PfsMetadataPath = args[2],
+                    SubcontainerPath = args[3],
+                    ManifestPath = args[4],
+                    TokenPath = args[5],
+                    PartnerPrivateKeyPath = args[6],
+                    Passcode = args[7],
+                });
+        Console.WriteLine(
+            $"FGC finalized locally: token-v{result.TokenFormatVersion}, " +
+            $"pfsmeta-sblock=0x{result.SuperblockOffsetInPfsMetadata:X}, " +
+            $"sblock-digest={Convert.ToHexString(result.SuperblockDigest).ToLowerInvariant()}, " +
+            $"fih-digest={Convert.ToHexString(result.FixedInfoDigest).ToLowerInvariant()}");
+        return 0;
     }
 
     private static int EncodeDds(string[] args)
@@ -508,6 +540,32 @@ internal static class Program
             Console.WriteLine(
                 $"entry=0x{entry.RawId:x4} flags=0x{entry.Flags1:x8}/0x{entry.Flags2:x8} " +
                 $"offset=0x{entry.DataOffset:x} size=0x{entry.DataSize:x} name={entry.Name ?? "-"}");
+        if (package.Type == ProsperoPkgType.FullRetail)
+        {
+            using var input = File.OpenRead(args[1]);
+            byte[] fih = ReadPackageRange(input, 0, ProsperoPkgLayout.FihHeaderRegionSize);
+            ReadOnlySpan<byte> standard = fih.AsSpan(
+                ProsperoPkgLayout.FihRetailFinalizationOffset,
+                ProsperoPkgLayout.FihRetailFinalizationSize);
+            ReadOnlySpan<byte> fgcExtension = fih.AsSpan(
+                ProsperoPkgLayout.FihRetailFinalizationOffset + ProsperoPkgLayout.FihRetailFinalizationSize,
+                ProsperoPkgLayout.FihFlexibleContentFinalizationSize -
+                ProsperoPkgLayout.FihRetailFinalizationSize);
+            string profile = CountNonZero(fgcExtension) == 0
+                ? "standard-0x300"
+                : "flexible-content/extended-0xa00";
+            uint state = BinaryPrimitives.ReadUInt32LittleEndian(fih.AsSpan(4, 4));
+            Console.WriteLine(
+                $"retail-profile={profile} state=0x{state:x8} " +
+                $"material-nonzero={CountNonZero(standard)}/{standard.Length}");
+            for (int block = 0; block < standard.Length / 0x100; block++)
+            {
+                byte[] digest = Crypto.Sha256(
+                    standard.Slice(block * 0x100, 0x100).ToArray());
+                Console.WriteLine(
+                    $"retail-material[{block}]-sha256={Convert.ToHexString(digest).ToLowerInvariant()}");
+            }
+        }
         return 0;
     }
 
@@ -571,47 +629,60 @@ internal static class Program
 
     private static int CheckPackageFih(string[] args)
     {
-        if (args.Length is < 2 or > 3)
-            throw new ArgumentException("Usage: check-pkg-fih <package.pkg> [passcode]");
-        string passcode = args.Length == 3 ? args[2] : new string('0', 32);
-        byte[] package = File.ReadAllBytes(args[1]);
+        if (args.Length is < 2 or > 4)
+            throw new ArgumentException("Usage: check-pkg-fih <package.pkg> [passcode] [--quick]");
+        bool quick = args.Skip(2).Any(value =>
+            string.Equals(value, "--quick", StringComparison.OrdinalIgnoreCase));
+        string[] positional = args.Skip(2).Where(value =>
+            !string.Equals(value, "--quick", StringComparison.OrdinalIgnoreCase)).ToArray();
+        if (positional.Length > 1)
+            throw new ArgumentException("Usage: check-pkg-fih <package.pkg> [passcode] [--quick]");
+        string passcode = positional.Length == 1 ? positional[0] : new string('0', 32);
+
+        using var package = File.OpenRead(args[1]);
         if (package.Length < ProsperoPkgLayout.FihHeaderRegionSize)
             throw new InvalidDataException("Package is too short to contain a FIH header.");
+        byte[] fih = ReadPackageRange(package, 0, ProsperoPkgLayout.FihHeaderRegionSize);
 
-        ulong superblockOffset = BinaryPrimitives.ReadUInt64LittleEndian(package.AsSpan(0x20));
-        ulong superblockSize = BinaryPrimitives.ReadUInt64LittleEndian(package.AsSpan(0x28));
-        ulong outerOffset = BinaryPrimitives.ReadUInt64LittleEndian(package.AsSpan(0x10));
-        ulong outerSize = BinaryPrimitives.ReadUInt64LittleEndian(package.AsSpan(0x18));
-        if (superblockSize > int.MaxValue || superblockOffset + superblockSize > (ulong)package.Length)
+        ulong superblockOffset = BinaryPrimitives.ReadUInt64LittleEndian(fih.AsSpan(0x20));
+        ulong superblockSize = BinaryPrimitives.ReadUInt64LittleEndian(fih.AsSpan(0x28));
+        ulong outerOffset = BinaryPrimitives.ReadUInt64LittleEndian(fih.AsSpan(0x10));
+        ulong outerSize = BinaryPrimitives.ReadUInt64LittleEndian(fih.AsSpan(0x18));
+        if (superblockSize > int.MaxValue || superblockOffset > (ulong)package.Length ||
+            superblockSize > (ulong)package.Length - superblockOffset)
             throw new InvalidDataException("FIH superblock range is outside the package.");
 
-        ReadOnlySpan<byte> expectedGame = package.AsSpan(0x30, 32);
+        ReadOnlySpan<byte> expectedGame = fih.AsSpan(0x30, 32);
+        byte[] superblock = ReadPackageRange(
+            package, checked((long)superblockOffset), checked((int)superblockSize));
         byte[] rawGame = ProsperoImageDigests.Sha3_256(
-            package.AsSpan(checked((int)superblockOffset), checked((int)superblockSize)));
-        byte[] plainOuter = ProsperoPackageArchive.DecryptOuterPfs(args[1], passcode);
+            superblock);
         ulong relative = checked(superblockOffset - outerOffset);
-        if (relative + superblockSize > (ulong)plainOuter.Length || outerSize > (ulong)plainOuter.Length)
-            throw new InvalidDataException("FIH superblock range is outside the decrypted outer PFS.");
-        byte[] plainGame = ProsperoImageDigests.Sha3_256(
-            plainOuter.AsSpan(checked((int)relative), checked((int)superblockSize)));
+        if (relative > outerSize || superblockSize > outerSize - relative)
+            throw new InvalidDataException("FIH superblock range is outside the outer PFS.");
 
         Console.WriteLine(
-            $"game-digest raw={expectedGame.SequenceEqual(rawGame)} plaintext={expectedGame.SequenceEqual(plainGame)} " +
-            $"copies70={expectedGame.SequenceEqual(package.AsSpan(0x70, 32))} " +
-            $"copiesd0={expectedGame.SequenceEqual(package.AsSpan(0xd0, 32))}");
+            $"game-digest plaintext-superblock={expectedGame.SequenceEqual(rawGame)} " +
+            $"copies70={expectedGame.SequenceEqual(fih.AsSpan(0x70, 32))} " +
+            $"copiesd0={expectedGame.SequenceEqual(fih.AsSpan(0xd0, 32))}");
 
-        ulong cntOffset = BinaryPrimitives.ReadUInt64LittleEndian(package.AsSpan(0x58));
-        if (cntOffset + 0x5a0 > (ulong)package.Length)
+        ulong cntOffset = BinaryPrimitives.ReadUInt64LittleEndian(fih.AsSpan(0x58));
+        if (cntOffset > (ulong)package.Length || 0x1000UL > (ulong)package.Length - cntOffset)
             throw new InvalidDataException("FIH CNT offset is outside the package.");
-        ReadOnlySpan<byte> cntTail = package.AsSpan(checked((int)cntOffset));
-        ulong cntSize = BinaryPrimitives.ReadUInt64BigEndian(cntTail.Slice(0x4b8, 8));
-        if (cntSize < 0x1180 || cntSize > (ulong)cntTail.Length || cntSize > int.MaxValue)
+        byte[] cntPrefix = ReadPackageRange(package, checked((long)cntOffset), 0x1000);
+        ReadOnlySpan<byte> cnt = cntPrefix;
+        ulong cntSize = BinaryPrimitives.ReadUInt64BigEndian(cnt.Slice(0x4b8, 8));
+        if (cntSize < 0x1180 || cntSize > (ulong)package.Length - cntOffset)
             throw new InvalidDataException("CNT region size is outside the package.");
-        ReadOnlySpan<byte> cnt = cntTail[..checked((int)cntSize)];
-        byte[] fixedInfo = ProsperoImageDigests.ComputeFixedInfoDigest(
-            package.AsSpan(0, ProsperoPkgLayout.FihHeaderRegionSize));
+        byte[] fixedInfo = ProsperoImageDigests.ComputeFixedInfoDigest(fih);
         byte[] packageDigest = ProsperoImageDigests.ComputePackageDigest(cnt);
-        byte[] rollup = ProsperoImageDigests.ComputeCntHeaderRollupDigest(cnt);
+        ulong rollupOffset = BinaryPrimitives.ReadUInt64BigEndian(cnt.Slice(0x20, 8));
+        uint rollupSize = BinaryPrimitives.ReadUInt32BigEndian(cnt.Slice(0x1c, 4));
+        if (rollupSize > int.MaxValue || rollupOffset > cntSize || rollupSize > cntSize - rollupOffset)
+            throw new InvalidDataException("CNT rollup range is outside the CNT region.");
+        byte[] rollupBytes = ReadPackageRange(
+            package, checked((long)(cntOffset + rollupOffset)), checked((int)rollupSize));
+        byte[] rollup = ProsperoImageDigests.Sha3_256(rollupBytes);
         Console.WriteLine(
             $"cnt-pfs-digest={expectedGame.SequenceEqual(cnt.Slice(0x440, 32))} " +
             $"cnt-fixed-digest={fixedInfo.AsSpan().SequenceEqual(cnt.Slice(0x460, 32))} " +
@@ -622,21 +693,62 @@ internal static class Program
         uint imageKeySize = BinaryPrimitives.ReadUInt32BigEndian(cnt.Slice(0x514, 4));
         uint mandatoryOffset = BinaryPrimitives.ReadUInt32BigEndian(cnt.Slice(0x518, 4));
         uint mandatorySize = BinaryPrimitives.ReadUInt32BigEndian(cnt.Slice(0x51c, 4));
-        bool descriptorRangesValid = imageKeyOffset <= cnt.Length && imageKeySize <= cnt.Length - imageKeyOffset
-            && mandatoryOffset <= cnt.Length && mandatorySize <= cnt.Length - mandatoryOffset;
+        bool descriptorRangesValid =
+            imageKeyOffset <= cntSize && imageKeySize <= cntSize - imageKeyOffset &&
+            mandatoryOffset <= cntSize && mandatorySize <= cntSize - mandatoryOffset &&
+            imageKeySize <= int.MaxValue && mandatorySize <= int.MaxValue;
         bool descriptorDigestValid = false;
         if (descriptorRangesValid)
         {
             byte[] descriptorDigest = new byte[64];
-            ProsperoImageDigests.Sha3_256(cnt.Slice((int)imageKeyOffset, (int)imageKeySize)).CopyTo(descriptorDigest, 0);
-            ProsperoImageDigests.Sha3_256(cnt.Slice((int)mandatoryOffset, (int)mandatorySize)).CopyTo(descriptorDigest, 32);
+            byte[] imageKey = ReadPackageRange(
+                package, checked((long)(cntOffset + imageKeyOffset)), checked((int)imageKeySize));
+            byte[] mandatory = ReadPackageRange(
+                package, checked((long)(cntOffset + mandatoryOffset)), checked((int)mandatorySize));
+            ProsperoImageDigests.Sha3_256(imageKey).CopyTo(descriptorDigest, 0);
+            ProsperoImageDigests.Sha3_256(mandatory).CopyTo(descriptorDigest, 32);
             descriptorDigestValid = descriptorDigest.AsSpan().SequenceEqual(cnt.Slice(0x520, 64));
         }
-        bool seedValid = cnt.Slice(0x4a0, 16).SequenceEqual(
-            plainOuter.AsSpan(checked((int)relative + 0x370), 16));
+        bool seedValid = superblock.Length >= 0x380 &&
+            cnt.Slice(0x4a0, 16).SequenceEqual(superblock.AsSpan(0x370, 16));
         Console.WriteLine(
             $"cnt-image-seed={seedValid} descriptor-ranges={descriptorRangesValid} " +
             $"descriptor-digest={descriptorDigestValid} rsa3072={ProsperoPackageArchive.VerifyCntMetadataSignature(args[1])}");
+
+        ProsperoPkg parsed = ProsperoPkgReader.Read(args[1]);
+        int generalIndex = parsed.Entries.ToList().FindIndex(
+            entry => entry.RawId == (uint)ProsperoEntryId.GeneralDigests);
+        int digestTableIndex = parsed.Entries.ToList().FindIndex(
+            entry => entry.RawId == (uint)ProsperoImageDigests.DigestTableEntryId);
+        if (generalIndex >= 0 && digestTableIndex >= 0)
+        {
+            ProsperoPkgEntry generalEntry = parsed.Entries[generalIndex];
+            ProsperoPkgEntry digestEntry = parsed.Entries[digestTableIndex];
+            byte[] general = ReadPackageRange(
+                package,
+                checked((long)cntOffset + generalEntry.DataOffset),
+                checked((int)generalEntry.DataSize));
+            byte[] digestTable = ReadPackageRange(
+                package,
+                checked((long)cntOffset + digestEntry.DataOffset),
+                checked((int)digestEntry.DataSize));
+            byte[] expectedHeaderDigest = ProsperoImageDigests.ComputeHeaderDigest(
+                cnt.Slice(0, ProsperoImageDigests.HeaderDigestPrefixSize),
+                cnt.Slice(0x400, ProsperoImageDigests.HeaderDigestMountDescriptorSize));
+            byte[] actualGeneralDigest = ProsperoImageDigests.ComputeEntryDigest(general);
+            Console.WriteLine(
+                $"fih-game-slot70={fih.AsSpan(0x70, 32).SequenceEqual(general.AsSpan(0x40, 32))} " +
+                $"fih-target-slotd0={fih.AsSpan(0xd0, 32).SequenceEqual(general.AsSpan(0x180, 32))} " +
+                $"debug-header-formula={expectedHeaderDigest.AsSpan().SequenceEqual(general.AsSpan(0x60, 32))} " +
+                $"general-entry-digest={actualGeneralDigest.AsSpan().SequenceEqual(
+                    digestTable.AsSpan(generalIndex * 32, 32))}");
+        }
+
+        if (quick)
+        {
+            Console.WriteLine("nested-layout=skipped (--quick)");
+            return 0;
+        }
 
         string temporary = Path.Combine(Path.GetTempPath(), "libprospero-fih-" + Guid.NewGuid().ToString("N"));
         try
@@ -644,17 +756,40 @@ internal static class Program
             ProsperoPackageArchive.ExtractOuterFiles(args[1], temporary, passcode);
             string layoutPath = Path.Combine(temporary, "uroot", ProsperoNapsLayout.FileName);
             byte[] layout = File.ReadAllBytes(layoutPath);
-            ulong recordedLength = BinaryPrimitives.ReadUInt64LittleEndian(package.AsSpan(0xa8));
+            ulong recordedLength = BinaryPrimitives.ReadUInt64LittleEndian(fih.AsSpan(0xa8));
             byte[] nestedDigest = ProsperoImageDigests.Sha3_256(layout);
             Console.WriteLine(
                 $"nested-size=0x{recordedLength:x}/0x{layout.Length:x} " +
-                $"nested-digest={package.AsSpan(0xb0, 32).SequenceEqual(nestedDigest)}");
+                $"nested-digest={fih.AsSpan(0xb0, 32).SequenceEqual(nestedDigest)}");
         }
         finally
         {
             if (Directory.Exists(temporary)) Directory.Delete(temporary, recursive: true);
         }
         return 0;
+    }
+
+    private static byte[] ReadPackageRange(Stream input, long offset, int size)
+    {
+        if (!input.CanRead || !input.CanSeek)
+            throw new ArgumentException("Package stream must be readable and seekable.", nameof(input));
+        if (offset < 0 || size < 0 || offset > input.Length || size > input.Length - offset)
+            throw new InvalidDataException(
+                $"Package range [0x{offset:X}, +0x{size:X}) is outside the file.");
+        byte[] value = new byte[size];
+        input.Position = offset;
+        input.ReadExactly(value);
+        return value;
+    }
+
+    private static int CountNonZero(ReadOnlySpan<byte> value)
+    {
+        int count = 0;
+        foreach (byte item in value)
+        {
+            if (item != 0) count++;
+        }
+        return count;
     }
 
     private static int CheckPackageSignature(string[] args)
@@ -1705,6 +1840,52 @@ internal static class Program
                     "Strict publisher build produced an invalid CNT public wrap.");
             }
 
+            ProsperoBuildResult retailResult = ProsperoPackageBuilder.Build(
+                new ProsperoBuildOptions
+                {
+                    SourceFolder = source1,
+                    OutputFolder = Path.Combine(regressionRoot, "retail-output"),
+                    ContentId = deterministicContentId,
+                    TitleId = "PPSA00000",
+                    Mode = ProsperoPackageMode.Application,
+                    Passcode = deterministicPasscode,
+                    DeterministicBuild = true,
+                    NapsPfsImageSeed = deterministicPfsImageSeed,
+                    PublisherImageKey = deterministicPublisherImageKey,
+                    PublisherEntryKeys = deterministicPublisherEntryKeys,
+                    LicenseProvider = gdLicenseProvider,
+                    OutputFormat = ProsperoOutputFormat.RetailImage,
+                    RetailFinalizationProvider = new SelfTestRetailFinalizationProvider(),
+                },
+                _ => { });
+            ProsperoPkg retailPackage = ProsperoPkgReader.Read(retailResult.OutputPath);
+            ProsperoPackageMap retailMap = ProsperoPackageArchive.Inspect(retailResult.OutputPath);
+            using (var retailStream = File.OpenRead(retailResult.OutputPath))
+            {
+                byte[] retailFih = ReadPackageRange(
+                    retailStream, 0, ProsperoPkgLayout.FihHeaderRegionSize);
+                byte[] retailCnt = ReadPackageRange(
+                    retailStream,
+                    retailMap.CntOffset,
+                    checked((int)Math.Min(retailMap.CntSize, 0x1000)));
+                byte[] expectedFixed = ProsperoImageDigests.ComputeFixedInfoDigest(retailFih);
+                byte[] expectedPackage = ProsperoImageDigests.ComputePackageDigest(retailCnt);
+                if (retailPackage.Type != ProsperoPkgType.FullRetail ||
+                    retailMap.SupplementSize != 0 ||
+                    CountNonZero(retailFih.AsSpan(
+                        ProsperoPkgLayout.FihRetailFinalizationOffset,
+                        ProsperoPkgLayout.FihRetailFinalizationSize)) == 0 ||
+                    !expectedFixed.AsSpan().SequenceEqual(retailCnt.AsSpan(0x460, 32)) ||
+                    !expectedPackage.AsSpan().SequenceEqual(retailCnt.AsSpan(0xFE0, 32)) ||
+                    !ProsperoPackageArchive.VerifyCntMetadataSignature(retailResult.OutputPath))
+                {
+                    throw new InvalidDataException(
+                        "Provider-backed Retail FIH/CNT resealing regression failed.");
+                }
+            }
+            Console.WriteLine(
+                "selftest: provider-backed standard Retail FIH/CNT resealing passed");
+
             string artifactOutput = Path.Combine(regressionRoot, "publisher-artifacts");
             ProsperoPublisherPprFileBuildResult artifacts =
                 ProsperoPublisherPprBuilder.BuildFileBacked(
@@ -2233,6 +2414,7 @@ internal static class Program
             Console.WriteLine(
                 "selftest: GD/AC/AL license providers, rejection paths and CNT encryption passed");
 
+            SelfTestFlexibleContentFinalization(regressionRoot);
             Console.WriteLine(
                 "selftest: deterministic APP/PPR-NAPS build + file-backed extraction passed " +
                 $"(SHA3-256 {Convert.ToHexString(ProsperoSha3.HashData(package1))})");
@@ -2250,6 +2432,260 @@ internal static class Program
             }
         }
         return 0;
+    }
+
+    private static void SelfTestFlexibleContentFinalization(string parent)
+    {
+        const string contentId = "IV9999-PPSA00001_00-FLEXCONTENTTEST0";
+        const string passcode = "0123456789abcdefghijklmnopqrstuv";
+        string root = Path.Combine(parent, "fgc-finalization");
+        Directory.CreateDirectory(root);
+        string fihPath = Path.Combine(root, "fih.dat");
+        string pfsmetaPath = Path.Combine(root, "pfsmeta.dat");
+        string cntPath = Path.Combine(root, "cnt.dat");
+        string manifestPath = Path.Combine(root, "manifest.json");
+        string tokenPath = Path.Combine(root, "token.json");
+        string privateKeyPath = Path.Combine(root, "partner.pem");
+
+        using RSA rsa = RSA.Create(3072);
+        File.WriteAllText(privateKeyPath, rsa.ExportPkcs8PrivateKeyPem());
+        byte[] modulus = rsa.ExportParameters(false).Modulus!;
+        byte[] certificate = new byte[0x380];
+        modulus.CopyTo(certificate, 0x80);
+        byte[] certificate2 = (byte[])certificate.Clone();
+        certificate2[^1] = 0x5A;
+
+        byte[] accessToken = Enumerable.Range(0, 0x800)
+            .Select(i => (byte)(i * 29 + 7)).ToArray();
+        Span<byte> passcodeDigest = stackalloc byte[32];
+        ProsperoSha3.Shake128Data(
+            Encoding.ASCII.GetBytes($"passcode{passcode}"), passcodeDigest);
+        string Cert(byte[] value) => Convert.ToBase64String(value)
+            .TrimEnd('=').Replace('+', '-').Replace('/', '_');
+        var certificates = new Dictionary<string, string>
+        {
+            ["PFS0"] = Cert(certificate),
+            ["PFS1"] = Cert(certificate2),
+            ["FIH0"] = Cert(certificate),
+            ["FIH1"] = Cert(certificate2),
+            ["CNT0"] = Cert(certificate),
+            ["CNT1"] = Cert(certificate2),
+        };
+        File.WriteAllText(
+            tokenPath,
+            JsonSerializer.Serialize(new
+            {
+                tokenFormatVersion = 0,
+                binary = new
+                {
+                    flexibleContent = new
+                    {
+                        certificates,
+                        accessTokens = new Dictionary<string, string>
+                        {
+                            [contentId] = Cert(accessToken),
+                        },
+                    },
+                },
+                config = new
+                {
+                    flexibleContent = new
+                    {
+                        requiredSystemSoftwareVersion = "0x0000000000001234",
+                        passcodeDigest = "0x" + Convert.ToHexString(passcodeDigest).ToLowerInvariant(),
+                    },
+                },
+            }));
+        File.WriteAllText(
+            manifestPath,
+            JsonSerializer.Serialize(new
+            {
+                contentId,
+                pkgExtents = new[]
+                {
+                    new { type = "pfsmeta", offsetInPkg = 0x10000 },
+                },
+            }));
+
+        byte[] pfsmeta = Enumerable.Range(0, 0x10000)
+            .Select(i => (byte)(i * 11 + 3)).ToArray();
+        File.WriteAllBytes(pfsmetaPath, pfsmeta);
+        byte[] fih = new byte[0x10000];
+        ProsperoPkgLayout.FihMagic.CopyTo(fih.AsSpan());
+        BinaryPrimitives.WriteUInt64LittleEndian(fih.AsSpan(0x20), 0x10000);
+        File.WriteAllBytes(fihPath, fih);
+
+        const int digestOffset = 0x2000;
+        const int imageKeyOffset = 0x2080;
+        const int metasOffset = 0x2880;
+        const int imageDigestsOffset = 0x2900;
+        byte[] cnt = new byte[0x10000];
+        ProsperoPkgLayout.CntMagic.CopyTo(cnt.AsSpan());
+        BinaryPrimitives.WriteUInt32BigEndian(cnt.AsSpan(0x04), 0x02000001);
+        BinaryPrimitives.WriteUInt32BigEndian(cnt.AsSpan(0x10), 4);
+        BinaryPrimitives.WriteUInt16BigEndian(cnt.AsSpan(0x14), 4);
+        BinaryPrimitives.WriteUInt16BigEndian(cnt.AsSpan(0x16), 4);
+        BinaryPrimitives.WriteUInt32BigEndian(cnt.AsSpan(0x18), 0x5A0);
+        BinaryPrimitives.WriteUInt64BigEndian(cnt.AsSpan(0x20), digestOffset);
+        BinaryPrimitives.WriteUInt64BigEndian(cnt.AsSpan(0x28), 0xA00);
+        Encoding.ASCII.GetBytes(contentId).CopyTo(cnt, 0x40);
+        BinaryPrimitives.WriteUInt32BigEndian(cnt.AsSpan(0x510), imageKeyOffset);
+        BinaryPrimitives.WriteUInt32BigEndian(cnt.AsSpan(0x514), (uint)accessToken.Length);
+        BinaryPrimitives.WriteUInt32BigEndian(cnt.AsSpan(0x518), imageDigestsOffset);
+        BinaryPrimitives.WriteUInt32BigEndian(cnt.AsSpan(0x51C), 0x60);
+
+        static void Meta(
+            Span<byte> target, uint id, uint offset, uint size, uint flags1 = 0, uint flags2 = 0)
+        {
+            BinaryPrimitives.WriteUInt32BigEndian(target, id);
+            BinaryPrimitives.WriteUInt32BigEndian(target[0x08..], flags1);
+            BinaryPrimitives.WriteUInt32BigEndian(target[0x0C..], flags2);
+            BinaryPrimitives.WriteUInt32BigEndian(target[0x10..], offset);
+            BinaryPrimitives.WriteUInt32BigEndian(target[0x14..], size);
+        }
+        Meta(cnt.AsSpan(0x5A0, 0x20), (uint)EntryId.DIGESTS, digestOffset, 0x80);
+        Meta(cnt.AsSpan(0x5C0, 0x20), (uint)EntryId.IMAGE_KEY, imageKeyOffset, 0x800);
+        Meta(cnt.AsSpan(0x5E0, 0x20), (uint)EntryId.METAS, metasOffset, 0x80);
+        Meta(cnt.AsSpan(0x600, 0x20), 0x040A, imageDigestsOffset, 0x60);
+        cnt.AsSpan(0x5A0, 0x80).CopyTo(cnt.AsSpan(metasOffset, 0x80));
+        File.WriteAllBytes(cntPath, cnt);
+
+        ProsperoFlexibleContentFinalizationResult result =
+            ProsperoFlexibleContentFinalizer.Finalize(
+                new ProsperoFlexibleContentFinalizationOptions
+                {
+                    FixedInfoHeaderPath = fihPath,
+                    PfsMetadataPath = pfsmetaPath,
+                    SubcontainerPath = cntPath,
+                    ManifestPath = manifestPath,
+                    TokenPath = tokenPath,
+                    PartnerPrivateKeyPath = privateKeyPath,
+                    Passcode = passcode,
+                });
+
+        byte[] finalizedPfs = File.ReadAllBytes(pfsmetaPath);
+        byte[] finalizedFih = File.ReadAllBytes(fihPath);
+        byte[] finalizedCnt = File.ReadAllBytes(cntPath);
+        static bool HasAuth(
+            byte[] target, int offset, byte[] first, byte[] second, RSA verifier)
+        {
+            byte[] digest = ProsperoSha3.HashData(target.AsSpan(0, offset));
+            ReadOnlySpan<byte> sig0 = target.AsSpan(offset + 0x380, 0x180);
+            ReadOnlySpan<byte> sig1 = target.AsSpan(offset + 0x880, 0x180);
+            return target.AsSpan(offset, 0x380).SequenceEqual(first) &&
+                target.AsSpan(offset + 0x500, 0x380).SequenceEqual(second) &&
+                sig0.SequenceEqual(sig1) &&
+                verifier.VerifyHash(
+                    digest, sig0, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+        }
+
+        byte[] icvPreimage = finalizedPfs[..0x5A0];
+        byte[] storedIcv = icvPreimage.AsSpan(0x380, 32).ToArray();
+        icvPreimage.AsSpan(0x380, 32).Clear();
+        byte[] reversedSblock = result.SuperblockDigest.ToArray();
+        Array.Reverse(reversedSblock);
+        if (BinaryPrimitives.ReadUInt64LittleEndian(finalizedPfs.AsSpan(0x360)) != 0x1234 ||
+            !ProsperoSha3.HashData(icvPreimage).AsSpan().SequenceEqual(storedIcv) ||
+            !HasAuth(finalizedPfs, 0xC000, certificate, certificate2, rsa) ||
+            (BinaryPrimitives.ReadUInt32LittleEndian(finalizedFih.AsSpan(0x04)) & 0x8010) != 0x8010 ||
+            !finalizedFih.AsSpan(0x30, 32).SequenceEqual(result.SuperblockDigest) ||
+            !HasAuth(finalizedFih, 0xF000, certificate, certificate2, rsa) ||
+            !ProsperoSha3.HashData(finalizedFih).AsSpan().SequenceEqual(result.FixedInfoDigest) ||
+            !finalizedCnt.AsSpan(imageKeyOffset, accessToken.Length).SequenceEqual(accessToken) ||
+            !finalizedCnt.AsSpan(imageDigestsOffset, 32).SequenceEqual(reversedSblock) ||
+            !HasAuth(finalizedCnt, 0x1000, certificate, certificate2, rsa) ||
+            !ProsperoImageDigests.ComputePackageDigest(finalizedCnt)
+                .AsSpan().SequenceEqual(finalizedCnt.AsSpan(0xFE0, 32)))
+        {
+            throw new InvalidDataException("Dependency-free FGC finalization self-test failed.");
+        }
+
+        File.WriteAllBytes(pfsmetaPath, pfsmeta);
+        File.WriteAllBytes(fihPath, fih);
+        File.WriteAllBytes(cntPath, cnt);
+        Span<byte> tokenKey = stackalloc byte[16];
+        ProsperoSha3.Shake128Data(
+            Encoding.ASCII.GetBytes($"encryptby{passcode}4token"), tokenKey);
+        string protectedHeader = Cert(
+            Encoding.UTF8.GetBytes("{\"alg\":\"dir\",\"enc\":\"A128GCM\"}"));
+        byte[] nonce = Convert.FromHexString("000102030405060708090A0B");
+        byte[] ciphertext = new byte[accessToken.Length];
+        byte[] tag = new byte[16];
+        using (var aes = new AesGcm(tokenKey, tag.Length))
+        {
+            aes.Encrypt(
+                nonce, accessToken, ciphertext, tag,
+                Encoding.ASCII.GetBytes(protectedHeader));
+        }
+        string compactJwe = string.Join(
+            ".", protectedHeader, "", Cert(nonce), Cert(ciphertext), Cert(tag));
+        File.WriteAllText(
+            tokenPath,
+            JsonSerializer.Serialize(new
+            {
+                tokenFormatVersion = 1,
+                binary = new
+                {
+                    flexibleContents = new
+                    {
+                        certificates = new Dictionary<string, object>
+                        {
+                            [contentId] = certificates,
+                        },
+                        accessTokens = new Dictionary<string, string>
+                        {
+                            [contentId] = compactJwe,
+                        },
+                    },
+                },
+                digest = new
+                {
+                    flexibleContents = new
+                    {
+                        accessTokens = new Dictionary<string, string>
+                        {
+                            [contentId] = "0x" +
+                                Convert.ToHexString(ProsperoSha3.HashData(accessToken))
+                                    .ToLowerInvariant(),
+                        },
+                    },
+                },
+                config = new
+                {
+                    flexibleContents = new Dictionary<string, object>
+                    {
+                        [contentId] = new
+                        {
+                            requiredSystemSoftwareVersion = "0x0000000000001234",
+                            passcodeDigest =
+                                "0x" + Convert.ToHexString(passcodeDigest).ToLowerInvariant(),
+                        },
+                    },
+                },
+            }));
+
+        ProsperoFlexibleContentFinalizationResult version1Result =
+            ProsperoFlexibleContentFinalizer.Finalize(
+                new ProsperoFlexibleContentFinalizationOptions
+                {
+                    FixedInfoHeaderPath = fihPath,
+                    PfsMetadataPath = pfsmetaPath,
+                    SubcontainerPath = cntPath,
+                    ManifestPath = manifestPath,
+                    TokenPath = tokenPath,
+                    PartnerPrivateKeyPath = privateKeyPath,
+                    Passcode = passcode,
+                });
+        finalizedCnt = File.ReadAllBytes(cntPath);
+        if (version1Result.TokenFormatVersion != 1 ||
+            !finalizedCnt.AsSpan(imageKeyOffset, accessToken.Length).SequenceEqual(accessToken) ||
+            !HasAuth(finalizedCnt, 0x1000, certificate, certificate2, rsa))
+        {
+            throw new InvalidDataException(
+                "Dependency-free FGC token-v1/JWE finalization self-test failed.");
+        }
+        Console.WriteLine(
+            "selftest: dependency-free FGC token-v0/v1/PFS/FIH/CNT finalization passed");
     }
 
     private static int SelfTestLargeOuter(string[] args)
@@ -2414,6 +2850,36 @@ internal static class Program
 
         public byte[] BuildOuterBlockCheckCodes(ProsperoNapsIntegrityContext context) =>
             Enumerable.Range(0x21, checked(context.PhysicalInnerBlockCount * 4)).Select(i => (byte)i).ToArray();
+    }
+
+    private sealed class SelfTestRetailFinalizationProvider :
+        IProsperoRetailFinalizationProvider
+    {
+        public ProsperoRetailFinalizationResult FinalizeFih(
+            ProsperoRetailFinalizationRequest request)
+        {
+            if (request.FihHeader.Length != ProsperoPkgLayout.FihHeaderRegionSize)
+                throw new InvalidDataException("Self-test Retail provider received an invalid FIH.");
+            byte[] material = new byte[ProsperoPkgLayout.FihRetailFinalizationSize];
+            ProsperoSha3.Shake128Data(
+                request.FihHeader.Span[
+                    ..ProsperoPkgLayout.FihRetailFinalizationOffset],
+                material);
+            return new ProsperoRetailFinalizationResult
+            {
+                FihFinalizationMaterial = material,
+            };
+        }
+
+        public byte[] FinalizeCntHeader(
+            ProsperoRetailCntFinalizationRequest request)
+        {
+            if (request.CntHeader.Length != 0x1000)
+                throw new InvalidDataException(
+                    "Self-test Retail provider received an invalid CNT header.");
+            return ProsperoPublisherRsa.BuildCntHeaderWrap(
+                request.CntHeader.Span);
+        }
     }
 
     private static int BuildPfs(string[] args)
@@ -3519,10 +3985,11 @@ internal static class Program
         Console.WriteLine("  extract-pkg-outer <package.pkg> <output-dir> [passcode]");
         Console.WriteLine("  dump-pkg-outer <package.pkg> <output.pfs> [passcode]");
         Console.WriteLine("  dump-pkg-inner <package.pkg> <output.pfs> [passcode]");
-        Console.WriteLine("  check-pkg-fih <package.pkg> [passcode]");
+        Console.WriteLine("  check-pkg-fih <package.pkg> [passcode] [--quick]");
         Console.WriteLine("  check-pkg-imagedigs <package.pkg> [passcode]");
         Console.WriteLine("  check-pkg-signature <package.pkg>");
         Console.WriteLine("  resign-pkg <input.pkg> <output.pkg>");
+        Console.WriteLine("  finalize-fgc <fih.dat> <pfsmeta.dat> <cnt.dat> <manifest.json> <fgc-token.json> <partner-private-key.pem> <passcode>");
         Console.WriteLine("  extract-pkg-inner <package.pkg> <output-dir> [passcode]");
         Console.WriteLine("  extract-pkg-cnt <package.pkg> <output-dir> [passcode]");
         Console.WriteLine("  extract-pkg-si <package.pkg> <output-dir>");

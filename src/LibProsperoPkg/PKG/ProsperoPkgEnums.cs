@@ -61,6 +61,22 @@ public static class ProsperoPkgLayout
     /// <summary>FIH header offset of the signed byte (0x80 = official, 0x00 = debug).</summary>
     public const int FihSignedByteOffset = 0x05;
 
+    /// <summary>
+    /// Offset of the protected finalization result inside the 0x10000-byte FIH region.
+    /// </summary>
+    public const int FihRetailFinalizationOffset = 0xF000;
+
+    /// <summary>
+    /// Size of the standard Retail APP/AC FIH finalization result: three 0x100-byte blocks.
+    /// </summary>
+    public const int FihRetailFinalizationSize = 0x300;
+
+    /// <summary>
+    /// Size of the distinct FGC/Flexible Content certificate/signature result at FIH+0xF000.
+    /// This is not interchangeable with <see cref="FihRetailFinalizationSize"/>.
+    /// </summary>
+    public const int FihFlexibleContentFinalizationSize = 0xA00;
+
     /// <summary>FIH header offset of the shared encrypted PFS image offset (little-endian u64).</summary>
     public const int FihPfsImageOffsetField = 0x10;
 

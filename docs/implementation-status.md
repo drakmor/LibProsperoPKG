@@ -39,13 +39,21 @@ This document describes the current LibProsperoPkg package-building and reading 
 - Performs EKPFS and PFS key derivation as part of signing.
 - Verifies the published key fingerprint and a sign/verify round-trip.
 
-### Finalized debug image and FIH
+### Finalized image and FIH
 
 - Wraps a `\x7FCNT` container into a finalized debug `\x7FFIH` image with signed byte `0x00`.
 - Reproduces the structural fields: magic, signed byte, PFS image offset and size, embedded CNT offset and size.
 - Produces a reader-round-trippable `FullDebug` image with signed byte `0x00`, PFS image offset `0x10000`, block-aligned PFS image size, and embedded CNT offset inside the file.
 - Supports the PS5 data-first finalized layout: FIH header, outer PFS image, plaintext superblock at a non-zero image block, CNT body, and optional install-metadata archive.
-- Uses the trailing metadata archive as optional debug install metadata. The debug variant is a plain ZIP with stored entries; the encrypted retail variant is not produced.
+- Uses the trailing metadata archive as optional debug install metadata. Standard Retail APP/AC
+  references contain no trailing archive.
+- `ProsperoOutputFormat.RetailImage` and `IProsperoRetailFinalizationProvider` implement the trusted
+  boundary for standard Retail. The provider must return the 0x300-byte FIH material and the
+  0x180-byte CNT-header authentication result; the library refuses a structural-only `0x80` image.
+  It then writes FIH `0x70`/`0xD0` from GeneralDigests Game/Target, updates CNT fixed-info/package
+  digests and installs the returned authentication block.
+- FIH/CNT assembly and SI CRC generation are file-backed. The outer PFS is copied in bounded
+  buffers, so finalized images larger than 2 GiB are no longer materialized in a managed array.
 
 ### Digests
 
@@ -163,8 +171,21 @@ This document describes the current LibProsperoPkg package-building and reading 
 
 ## Known gaps / not implemented
 
-- Retail finalized images with signed byte `0x80` are not implemented. They require console-side finalization material that the library does not have.
-- Retail install-metadata archives are not implemented. The retail variant is encrypted and is not produced by the library.
+- The standard Retail finalization transformations remain an external trusted input. The managed
+  builder now has the complete provider contract and correct post-finalization CNT resealing, but
+  the embedded sc2 key banks are public wrapping/verification material and cannot manufacture the
+  provider's 0x300 FIH or 0x180 CNT authentication results.
+- FGC/Flexible Content finalization is implemented locally by
+  `ProsperoFlexibleContentFinalizer` and exposed by the `finalize-fgc` CLI command. It parses
+  token formats 0 and 1, decrypts the version-1 direct-key JWE, validates the passcode and
+  partner RSA-3072 key, finalizes the PFS superblock and FIH, updates `IMAGE_KEY` and
+  `imagedigs.dat`, reseals CNT digests, and writes all six certificate/signature pairs. This path
+  no longer invokes `fa.exe` or `sc2.exe`; the issued FGC token and its matching partner private
+  key remain required trusted inputs. A synthetic end-to-end RSA/token-v0/token-v1-JWE/PFS/FIH/CNT
+  regression passes. Byte-for-byte comparison against a genuine publisher-issued FGC corpus is
+  still needed.
+- No encrypted Retail SI is treated as a missing output for standard APP/AC: both supplied Retail
+  references have `supplement = 0`. Other profiles need separate corpus evidence.
 - On-console installation acceptance is not guaranteed. Library code verifies structure and round-tripping; acceptance depends on console mode and firmware.
 - The baseline NAPS streaming outer producer and direct CNT/FIH wiring are implemented. Sparse
   AFID/FIDX preservation is supported through an explicit path-to-AFID map: missing numeric slots
@@ -231,8 +252,9 @@ This document describes the current LibProsperoPkg package-building and reading 
 | NAPS layout parser and serializer | Implemented; confirmed field semantics and strict validation |
 | NAPS image planner and decoder | Implemented for raw/Kraken spans, sparse deduplicated zeros, identity and all 12 table-described non-identity shuffle transforms; non-zero KDE predictor still needs a reference vector |
 | NAPS streaming outer producer | Baseline monotonic Kraken/stored writer implemented and wired into CNT/FIH; explicit sparse AFID dedup-zero profiles round-trip, while KDE-predictor/shuffle selection and update/base reuse remain |
-| Retail install-metadata archive | Not implemented |
-| Retail finalized image (`0x80`) | Not implemented |
+| Standard Retail image (`0x80`) | Managed assembly/resealing implemented; trusted 0x300 FIH and 0x180 CNT results supplied through `IProsperoRetailFinalizationProvider` |
+| Standard Retail trailing metadata | Correctly omitted for the verified APP and AC profiles |
+| FGC/Flexible Content finalization | Managed token-v0/v1, PFS/FIH/CNT finalizer and CLI implemented without `fa.exe`/`sc2.exe`; genuine publisher-issued FGC corpus comparison remains |
 | On-console acceptance guarantee | Not implemented; depends on console mode and firmware |
 
 

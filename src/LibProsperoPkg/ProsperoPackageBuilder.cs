@@ -79,6 +79,13 @@ public enum ProsperoOutputFormat
     /// <see cref="LibProsperoPkg.PKG.ProsperoFihBuilder"/>). This is the default output.
     /// </summary>
     DebugImage,
+
+    /// <summary>
+    /// A standard finalized Retail image (<c>\x7FFIH</c>, signed byte 0x80). This mode requires a
+    /// trusted <see cref="IProsperoRetailFinalizationProvider"/> that returns the protected
+    /// 0x300-byte FIH material. The builder refuses to emit a structural-only 0x80 image.
+    /// </summary>
+    RetailImage,
 }
 
 /// <summary>Options describing the PS5 package to build.</summary>
@@ -93,6 +100,12 @@ public sealed class ProsperoBuildOptions
     /// installable package; a bare \x7FCNT is metadata only.
     /// </summary>
     public ProsperoOutputFormat OutputFormat { get; set; } = ProsperoOutputFormat.DebugImage;
+
+    /// <summary>
+    /// Trusted console/tooling boundary used only by <see cref="ProsperoOutputFormat.RetailImage"/>.
+    /// It produces the exact 0x300-byte standard Retail FIH material.
+    /// </summary>
+    public IProsperoRetailFinalizationProvider? RetailFinalizationProvider { get; set; }
 
     /// <summary>Folder whose contents become the package image (must contain <c>sce_sys/</c>).</summary>
     public string SourceFolder { get; set; } = "";
@@ -474,6 +487,21 @@ public static class ProsperoPackageBuilder
                 "An expected NAPS pfs-image-key requires NapsPfsImageSeed or OuterPfsSeed.",
                 nameof(options));
         }
+        if (options.OutputFormat == ProsperoOutputFormat.RetailImage &&
+            options.RetailFinalizationProvider is null)
+        {
+            throw new ArgumentException(
+                "RetailImage requires a trusted RetailFinalizationProvider; " +
+                "a signed byte of 0x80 alone is not a finalized Retail package.",
+                nameof(options));
+        }
+        if (options.OutputFormat == ProsperoOutputFormat.RetailImage &&
+            options.Mode == ProsperoPackageMode.AdditionalContentNoData)
+        {
+            throw new ArgumentException(
+                "RetailImage is not available for the direct PSAL AdditionalContentNoData layout.",
+                nameof(options));
+        }
 
         Directory.CreateDirectory(options.OutputFolder);
         var sourceFolder = Path.GetFullPath(options.SourceFolder);
@@ -550,8 +578,9 @@ public static class ProsperoPackageBuilder
 
         string finalPath = Path.Combine(options.OutputFolder, ComposePkgFileName(options.ContentId, options.Version));
         // PSAL is already a complete direct CNT+SI package and has no FIH/PFS layer.
-        bool wantsFih = options.OutputFormat == ProsperoOutputFormat.DebugImage &&
+        bool wantsFih = options.OutputFormat != ProsperoOutputFormat.MetadataContainer &&
                         options.Mode != ProsperoPackageMode.AdditionalContentNoData;
+        bool wantsRetail = options.OutputFormat == ProsperoOutputFormat.RetailImage;
 
         // A CNT package holds only metadata and is NOT a full, installable package: only a finalized
         // \x7FFIH image is. So for the debug-image path the CNT is an intermediate that must NOT survive
@@ -630,12 +659,14 @@ public static class ProsperoPackageBuilder
 
         try
         {
-            log("Finalizing the CNT into a debug (FIH) image...");
+            log(wantsRetail
+                ? "Finalizing the CNT into a Retail (FIH) image..."
+                : "Finalizing the CNT into a debug (FIH) image...");
 
             // The trailing debug SI segment (sce_suppl) is assembled from the finalized mount image so its
             // playgo-chunk.crc and naps_meta_300 are byte-exact for the produced image. The reproducible
             // pfsimage.xml options + PlayGo chunk descriptor were captured during the CNT build above.
-            Func<byte[], byte[]>? siFactory = siInputs is null
+            Func<Stream, byte[]>? siFactory = wantsRetail || siInputs is null
                 ? null
                 : mountImage => LibProsperoPkg.PKG.ProsperoSiArchive.BuildDebugSiSegment(
                     siInputs.Xml, siInputs.PlayGoChunkDat, mountImage, siInputs.InnerImageSize, warnings,
@@ -644,21 +675,30 @@ public static class ProsperoPackageBuilder
                     siInputs.NapsPfsImageKey, siInputs.NapsPfsImageSeed);
 
             var fihWarnings = LibProsperoPkg.PKG.ProsperoFihBuilder.BuildFromCnt(
-                cntPath, finalPath, LibProsperoPkg.PKG.ProsperoFihVariant.Debug, log,
-                siArchiveFactory: siFactory,
+                cntPath, finalPath,
+                wantsRetail
+                    ? LibProsperoPkg.PKG.ProsperoFihVariant.Official
+                    : LibProsperoPkg.PKG.ProsperoFihVariant.Debug,
+                log,
+                siArchiveStreamFactory: siFactory,
                 nestedImageDigest: nestedImageDigest,
                 nestedImageSize: checked((long)(siInputs?.NapsLayoutSize ?? 0)),
                 nestedMetaBaseBlocks: siInputs?.NestedMetaBaseBlocks ?? 0,
                 nwonlyContentVersionHi: siInputs?.ContentVersionHigh ?? 0,
                 nwonlyNapsFileCount: checked((int)(siInputs?.FihNapsFileCount ?? 0)),
-                nwonlyAppFileCount: siInputs?.AppFileCount ?? 0);
+                nwonlyAppFileCount: siInputs?.AppFileCount ?? 0,
+                outerSuperblockIndex: siInputs?.OuterSuperblockIndex ?? -1,
+                retailFinalizationProvider: options.RetailFinalizationProvider);
             warnings.AddRange(fihWarnings);
 
             var fihType = ProsperoPkgReader.DetectType(finalPath);
-            if (fihType != LibProsperoPkg.PKG.ProsperoPkgType.FullDebug)
-                warnings.Add($"Produced FIH image was detected as {fihType}, expected FullDebug.");
+            var expectedType = wantsRetail
+                ? LibProsperoPkg.PKG.ProsperoPkgType.FullRetail
+                : LibProsperoPkg.PKG.ProsperoPkgType.FullDebug;
+            if (fihType != expectedType)
+                warnings.Add($"Produced FIH image was detected as {fihType}, expected {expectedType}.");
             else
-                log("Validated output container: FullDebug PS5 FIH image.");
+                log($"Validated output container: {expectedType} PS5 FIH image.");
         }
         finally
         {
@@ -668,7 +708,7 @@ public static class ProsperoPackageBuilder
                 TryDelete(temporaryInner);
         }
 
-        log("Done (debug FIH).");
+        log(wantsRetail ? "Done (Retail FIH)." : "Done (debug FIH).");
         return new ProsperoBuildResult { OutputPath = finalPath, Warnings = warnings };
     }
 

@@ -125,7 +125,7 @@ public interface IProsperoNapsIntegrityProvider
 /// Builder for the PS5 <c>naps_meta_*.dat</c> records emitted into the SI segment of a
 /// <c>nwonly</c> finalized image. The 48-byte <c>naps_meta_300/301/302/308</c> descriptor is
 /// derived from the inner-image geometry; <c>naps_meta_18.dat</c> is the
-/// AES-128-XTS TLV metric blob built by <see cref="BuildMeta18"/> from the finalized image and its
+/// AES-128-XTS TLV metric blob built by <c>BuildMeta18</c> from the finalized image and its
 /// content-file set. See <see cref="ProsperoSiArchive"/>.
 /// </summary>
 public static class ProsperoNapsMeta
@@ -234,11 +234,47 @@ public static class ProsperoNapsMeta
     {
         ArgumentNullException.ThrowIfNull(mountImage);
         ArgumentNullException.ThrowIfNull(contentFiles);
-        if (innerImageSize < PfsBlockSize || mountImage.Length < Meta18BlockSize)
+        return BuildMeta18Core(
+            innerImageSize, mountImage.LongLength, mountImage, contentFiles, inner,
+            integrityProvider, pfsImageKey, pfsImageSeed);
+    }
+
+    /// <summary>
+    /// Builds type-18 metadata for a file-backed mount image. This overload needs only the mount
+    /// length because publisher nwonly integrity mapping is derived from <paramref name="inner"/>;
+    /// it avoids retaining a multi-gigabyte FIH/PFS/CNT byte array.
+    /// </summary>
+    public static byte[] BuildMeta18(
+        ulong innerImageSize, long mountImageSize,
+        IReadOnlyList<(string Path, long Size)> contentFiles,
+        LibProsperoPkg.PFS.ProsperoPs5InnerImageResult inner,
+        IProsperoNapsIntegrityProvider? integrityProvider = null,
+        byte[]? pfsImageKey = null,
+        byte[]? pfsImageSeed = null)
+    {
+        ArgumentNullException.ThrowIfNull(contentFiles);
+        ArgumentNullException.ThrowIfNull(inner);
+        return BuildMeta18Core(
+            innerImageSize, mountImageSize, [], contentFiles, inner,
+            integrityProvider, pfsImageKey, pfsImageSeed);
+    }
+
+    private static byte[] BuildMeta18Core(
+        ulong innerImageSize, long mountImageSize, byte[] mountImage,
+        IReadOnlyList<(string Path, long Size)> contentFiles,
+        LibProsperoPkg.PFS.ProsperoPs5InnerImageResult? inner,
+        IProsperoNapsIntegrityProvider? integrityProvider,
+        byte[]? pfsImageKey,
+        byte[]? pfsImageSeed)
+    {
+        if (innerImageSize < PfsBlockSize || mountImageSize < Meta18BlockSize)
             return [];
+        if (mountImageSize < 0 || mountImageSize % Meta18BlockSize != 0)
+            throw new ArgumentOutOfRangeException(
+                nameof(mountImageSize), "Mount-image size must be a non-negative multiple of 64 KiB.");
 
         uint innerBlocks = (uint)(innerImageSize / PfsBlockSize);
-        int outerBlocks = mountImage.Length / Meta18BlockSize;
+        int outerBlocks = checked((int)(mountImageSize / Meta18BlockSize));
 
         // nwonly: build ibcl/i2ob/i2op/ihsh/file over the compressed INNER-image NAPS block map so the
         // installer derives a nonzero, 0x10000-aligned content package_size and clears the 0x80b21185
@@ -551,7 +587,7 @@ public static class ProsperoNapsMeta
 
     /// <summary>
     /// Decrypts a publisher <c>naps_meta_18.dat</c> blob to its TLV plaintext. This is the
-    /// inverse of <see cref="BuildMeta18"/> and is intended for validation and round-trip tooling.
+    /// inverse of <c>BuildMeta18</c> and is intended for validation and round-trip tooling.
     /// </summary>
     public static byte[] DecryptMeta18(byte[] encrypted)
     {

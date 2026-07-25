@@ -278,7 +278,7 @@ public static class ProsperoSiArchive
     /// only when supplied and are never fabricated. The per-content-id <c>playgo-chunk.crc</c> is
     /// either supplied verbatim via <paramref name="playGoChunkCrc"/> or, when
     /// <paramref name="finalizedMountImage"/> is given instead, computed reproducibly from it with
-    /// CRC-32C (see <see cref="ProsperoPlayGo.BuildChunkCrc"/>).
+    /// CRC-32C (see <c>ProsperoPlayGo.BuildChunkCrc</c>).
     /// </summary>
     public static IReadOnlyList<ProsperoSiMember> BuildMembers(
         string contentId,
@@ -417,6 +417,87 @@ public static class ProsperoSiArchive
             playGoChunkCrc: null,
             finalizedMountImage: mountImage); // computes playgo-chunk.crc reproducibly (CRC-32C).
 
+        return WriteZip(members);
+    }
+
+    /// <summary>
+    /// File-backed equivalent of <see cref="BuildDebugSiSegment(ProsperoPfsImageXmlOptions,byte[],byte[],long,ICollection{string},byte[],bool,IReadOnlyList{ValueTuple{string,long}},ProsperoPs5InnerImageResult,IProsperoNapsIntegrityProvider,byte[],byte[])"/>.
+    /// The mount image is read block-by-block for <c>playgo-chunk.crc</c>; it is never copied into
+    /// a single managed byte array.
+    /// </summary>
+    public static byte[] BuildDebugSiSegment(
+        ProsperoPfsImageXmlOptions pfsImageXml, byte[]? playGoChunkDat, Stream mountImage,
+        long innerImageSize = 0, ICollection<string>? warnings = null,
+        byte[]? napsMeta18 = null, bool includePfsImageXml = true,
+        IReadOnlyList<(string Path, long Size)>? contentFiles = null,
+        LibProsperoPkg.PFS.ProsperoPs5InnerImageResult? innerImage = null,
+        IProsperoNapsIntegrityProvider? integrityProvider = null,
+        byte[]? pfsImageKey = null,
+        byte[]? pfsImageSeed = null)
+    {
+        ArgumentNullException.ThrowIfNull(pfsImageXml);
+        ArgumentNullException.ThrowIfNull(mountImage);
+        if (!mountImage.CanRead || !mountImage.CanSeek)
+            throw new ArgumentException(
+                "Mount-image stream must be readable and seekable.", nameof(mountImage));
+
+        ulong innerSize = innerImageSize > 0 ? (ulong)innerImageSize : 0;
+        if (innerSize == 0 && mountImage.Length >= ProsperoPkgLayout.FihInnerImageSizeField + 8)
+        {
+            long position = mountImage.Position;
+            try
+            {
+                Span<byte> sizeBytes = stackalloc byte[8];
+                mountImage.Position = ProsperoPkgLayout.FihInnerImageSizeField;
+                mountImage.ReadExactly(sizeBytes);
+                innerSize = BinaryPrimitives.ReadUInt64LittleEndian(sizeBytes);
+            }
+            finally
+            {
+                mountImage.Position = position;
+            }
+        }
+
+        byte[]? napsMeta300 = innerSize >= ProsperoNapsMeta.Meta300TrailingExtentSize
+            ? ProsperoNapsMeta.BuildMeta300FromInnerImageSize(innerSize)
+            : null;
+        if (napsMeta18 is null &&
+            innerSize >= ProsperoNapsMeta.Meta300TrailingExtentSize &&
+            innerImage is not null)
+        {
+            byte[] generated = ProsperoNapsMeta.BuildMeta18(
+                innerSize,
+                mountImage.Length,
+                contentFiles ?? Array.Empty<(string Path, long Size)>(),
+                innerImage,
+                integrityProvider,
+                pfsImageKey,
+                pfsImageSeed);
+            if (generated.Length != 0) napsMeta18 = generated;
+        }
+
+        byte[]? xmlBytes = includePfsImageXml
+            ? Encoding.UTF8.GetBytes(BuildPfsImageXml(pfsImageXml, warnings))
+            : null;
+        long originalPosition = mountImage.Position;
+        byte[] playGoChunkCrc;
+        try
+        {
+            mountImage.Position = 0;
+            playGoChunkCrc = ProsperoPlayGo.BuildChunkCrc(mountImage, mountImage.Length);
+        }
+        finally
+        {
+            mountImage.Position = originalPosition;
+        }
+
+        IReadOnlyList<ProsperoSiMember> members = BuildMembers(
+            pfsImageXml.ContentId,
+            xmlBytes,
+            playGoChunkDat,
+            napsMeta18,
+            napsMeta300,
+            playGoChunkCrc);
         return WriteZip(members);
     }
 

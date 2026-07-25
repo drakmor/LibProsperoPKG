@@ -10,9 +10,10 @@
 // hashes a plaintext-accessible region:
 //
 // game-digest == sblock-digest = SHA3-256( plaintext outer superblock block, 0x10000 bytes )
-// Stored in the FIH header at 0x30, 0x70 and 0xD0 (three copies), in the CNT image-digest
-// block (entry 0x0080) at +0x40 and +0x180, and in pfsimage.xml as <game-digest> and
-// <sblock-digest>. The FIH locates the superblock via its own offset/size fields at
+// Stored in the FIH header at 0x30 and in the CNT mount descriptor at +0x440. FIH 0x70 and
+// 0xD0 are separate GeneralDigests Game/Target slots; they happen to equal the sblock digest in
+// the earlier debug corpus but differ in verified Retail APP/AC packages. The FIH locates the
+// superblock via its own offset/size fields at
 // 0x20 (absolute superblock offset) / 0x28 (0x10000). Validated on all three packages: the
 // superblock is the data-first outer-PFS metadata block (magic 0x0b2a3301 @ +8, version 2),
 // left PLAINTEXT on disk, so SHA3-256 of it reproduces the stored digest exactly.
@@ -168,7 +169,7 @@ public static class ProsperoImageDigests
 
     /// <summary>
     /// Computes the game-digest / sblock-digest = SHA3-256 of the plaintext outer superblock block
-    /// (0x10000 bytes). This is the value the FIH header stores at 0x30/0x70/0xD0.
+    /// (0x10000 bytes). This is the value the FIH header stores at 0x30.
     /// </summary>
     public static byte[] ComputeSblockDigest(ReadOnlySpan<byte> superblockBlock)
     {

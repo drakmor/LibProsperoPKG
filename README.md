@@ -155,6 +155,31 @@ Console.WriteLine($"Content ID: {pkg.Header.ContentId}");
 Console.WriteLine($"Entries:    {pkg.Entries.Count}");
 ```
 
+### Finalizing Flexible Content without publisher executables
+
+The complete FGC transformation lives in the class library; the command-line tool is only a
+thin wrapper:
+
+```csharp
+using LibProsperoPkg.PKG;
+
+ProsperoFlexibleContentFinalizationResult result =
+    ProsperoFlexibleContentFinalizer.Finalize(
+        new ProsperoFlexibleContentFinalizationOptions
+        {
+            FixedInfoHeaderPath = "fih.dat",
+            PfsMetadataPath = "pfsmeta.dat",
+            SubcontainerPath = "cnt.dat",
+            ManifestPath = "manifest.json",
+            TokenPath = "fgc-token.json",
+            PartnerPrivateKeyPath = "partner-private-key.pem",
+            Passcode = "0123456789abcdefghijklmnopqrstuv",
+        });
+```
+
+No `fa.exe` or `sc2.exe` process is started. The publisher-issued token and its matching partner
+private key are protocol inputs, not executable dependencies.
+
 ---
 
 ## Public surface, at a glance
@@ -162,7 +187,7 @@ Console.WriteLine($"Entries:    {pkg.Entries.Count}");
 | Namespace | Key types |
 |---|---|
 | `LibProsperoPkg` | `ProsperoPackageBuilder`, `ProsperoBuildOptions`, `ProsperoBuildResult`, `ProsperoPackageMode`, `ProsperoOutputFormat`, `InnerImageForm` |
-| `LibProsperoPkg.PKG` | `ProsperoPkgBuilder`, `ProsperoPkgReader`, `ProsperoPkgWriter`, `ProsperoFihBuilder`, `ProsperoPkgSigner`, `ProsperoDdsEncoder`, `ProsperoPkg`, `ProsperoPkgHeader` |
+| `LibProsperoPkg.PKG` | `ProsperoPkgBuilder`, `ProsperoPkgReader`, `ProsperoPkgWriter`, `ProsperoFihBuilder`, `ProsperoFlexibleContentFinalizer`, `ProsperoPkgSigner`, `ProsperoDdsEncoder`, `ProsperoPkg`, `ProsperoPkgHeader` |
 | `LibProsperoPkg.PFS` | `ProsperoPfsLayout`, `ProsperoPfsImage`, `ProsperoPfsc` |
 | `LibProsperoPkg.GP5` | `Gp5Creator`, `Gp5Project` and its element model |
 | `LibProsperoPkg.Keys` | `ProsperoKeys` |
@@ -219,8 +244,16 @@ the builder computes it and a fresh matching `IMAGE_KEY` when primary id, passco
 are known. A preserved raw sidecar still belongs only to its original protected context.
 The verified Publishing Tools 2.79 debug/AC profile disables keyed NAPS outer-block CMAC and
 stores zero tags; `NapsOuterBlockCmacKey` remains available for other explicitly keyed profiles.
-Retail finalization and retail encrypted install metadata are not generated. A console running
-in **debug mode** is the intended target; acceptance still depends on console mode and firmware.
+Standard Retail assembly is exposed through `ProsperoOutputFormat.RetailImage` and
+`IProsperoRetailFinalizationProvider`; incomplete signed-byte-only output is refused. The provider
+supplies the trusted 0x300-byte FIH and 0x180-byte CNT authentication results. The two verified
+Retail APP/AC packages contain no trailing encrypted install-metadata segment. FGC/Flexible Content
+uses a different 0xA00 certificate/signature protocol. It is implemented locally by
+`ProsperoFlexibleContentFinalizer` and the `finalize-fgc` CLI command without invoking `fa.exe` or
+`sc2.exe`; an issued FGC token and its matching partner RSA-3072 private key are still required
+inputs. This does not replace the standard-Retail provider. Without a Retail provider, a console
+running in **debug mode** is the intended target; acceptance still depends on console mode and
+firmware.
 See [docs/implementation-status.md](docs/implementation-status.md) for the precise breakdown.
 
 ---

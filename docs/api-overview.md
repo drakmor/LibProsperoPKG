@@ -44,8 +44,9 @@ The primary entry point.
 - **`ProsperoBuildResult`** — `OutputPath` and a list of non-fatal `Warnings`.
 - **`ProsperoPackageMode`** — `Application`, `Homebrew`, `AdditionalContentData`,
   `AdditionalContentNoData`.
-- **`ProsperoOutputFormat`** — `MetadataContainer` (`\x7FCNT` only, not installable) or
-  `DebugImage` (`\x7FFIH`, the default, installable on a debug-mode console).
+- **`ProsperoOutputFormat`** — `MetadataContainer` (`\x7FCNT` only),
+  `DebugImage` (`\x7FFIH`, the default), or provider-backed `RetailImage` (`\x7FFIH`,
+  signed byte `0x80`).
 - **`InnerImageForm`** — `Plaintext`, `Encrypted`, `Compressed` (zlib PFSC),
   `KrakenCompressed` (PFSv3 Kraken, the `nwonly` codec).
 - **`ProsperoInnerCompression`** (in `LibProsperoPkg.PKG`) — `None`, `Zlib` (installable inner
@@ -66,10 +67,12 @@ The primary entry point.
 | `IProsperoLicenseProvider` / `ProsperoLicenseArtifacts` | Provider boundary for backend/SDK/console-issued decrypted `license.dat` and `license.info`. `ProsperoDirectoryLicenseProvider` loads the conventional two-file representation. The builder validates size, `RIF\0`, content id and entitlement key, then applies the normal volume-specific CNT entry encryption. |
 | `ProsperoCntEntryPolicy` | Central publisher policy for CNT flags, key index and fixed-entry naming. It distinguishes GD `license.info` key index 2 from AC/AL index 4 and applies key index 3 to protected NP/self/image/delta/reserved records. |
 | `ProsperoPkgWriter` | Low-level container writer (`ProsperoPkgWriterEntry`, `ProsperoPkgWriterOptions`). |
-| `ProsperoFihBuilder` | Wrap a `\x7FCNT` into a finalized `\x7FFIH` debug image. |
+| `ProsperoFihBuilder` | File-backed wrapping of `\x7FCNT` into a finalized `\x7FFIH` image. Debug SI can be produced through a stream factory. Standard Retail uses `IProsperoRetailFinalizationProvider` and refuses incomplete 0x80 output. |
+| `IProsperoRetailFinalizationProvider` | Trusted standard-Retail boundary: produces the 0x300-byte FIH material and the 0x180-byte CNT-header authentication result. FGC/Flexible Content is intentionally a separate profile. |
+| `ProsperoFlexibleContentFinalizer` | Dependency-free FGC finalization of publisher-created PFS metadata, FIH and standalone CNT files. `ProsperoFlexibleContentFinalizationOptions` supplies the manifest, token, passcode and matching partner RSA-3072 private key; the result returns the finalized superblock/FIH digests and resolved superblock offset. |
 | `ProsperoPkgSigner` | RSA-3072 metadata signing and EKPFS/PFS key derivation. |
 | `ProsperoNapsLayout` | PS5 `naps_pkg_layout.dat` (`PackageLayout_NAPS`) decoder and serializer for the `nwonly` streaming layout. `Parse`/`DecodeHeader`, `BuildLayout`, per-section `Encode*`/`Decode*` helpers, strict document validation, and `SectionMap`. Normal CblockInfo entries expose run/terminal discrimination and the confirmed ric/publisher bit fields. |
-| `ProsperoImageDigests` | PS5 finalized-image / CNT digest algorithms (single primitive: **SHA3-256**). Computes byte-exact digests for all documented formulas. `ComputeSblockDigest`/`ComputeGameDigest` (`SHA3-256(plaintext outer superblock, 0x10000)` = FIH `0x30/0x70/0xD0`), `ComputeFixedInfoDigest` (`SHA3-256(FIH block)`), `ComputeBodyDigest` (`SHA3-256(CNT body)`), `ComputeEntryDigest` + `BuildEntryDigestTable` (CNT entry `0x0001`; self-slot zeroed), `ComputePackageDigest` (`SHA3-256(CNT[0:0xFE0])` = CNT `+0xFE0` = `<package-digest>`), `ComputeCntHeaderRollupDigest` (`SHA3-256(CNT[off:off+size])` = CNT `+0x100`), `ComputeContentDigest` / `ComputeHeaderDigest` / `ComputeConcatDigest` / `ForceFihRelativeImageOffset` (the GeneralDigests block — content/header/system/playgo/target, wired via `ProsperoPkgBuilder.ComputeGeneralDigests`), `LocateSuperblock`/`ComputeSblockDigestFromImage` (scan `version 2` + magic `0x0b2a3301`), `Sha3_256`. For publisher PPR/NAPS, FIH `0xB0` is `SHA3-256(naps_pkg_layout.dat)` and `0xA8` is its byte length. |
+| `ProsperoImageDigests` | PS5 finalized-image / CNT digest algorithms (single primitive: **SHA3-256**). `FIH+0x30` is the plaintext-superblock digest; `FIH+0x70` and `+0xD0` are the distinct GeneralDigests Game and Target values. Also computes fixed-info, body, per-entry, package, CNT-rollup, content/header/system/playgo/target and NAPS-layout digests. |
 | `ProsperoDdsEncoder` | Re-encode `sce_sys` icon/picture images to BC7 DDS. |
 
 ### Read model

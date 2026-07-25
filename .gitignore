@@ -3,3 +3,8 @@ obj/
 .vs/
 *.user
 *.suo
+
+# Local reverse-engineering captures and generated package samples.
+.analysis/
+.tmp_ppsa01325/
+artifacts/
