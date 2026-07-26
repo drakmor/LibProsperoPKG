@@ -4,13 +4,15 @@
 // Producer for the trailing SI (install-metadata) segment of a finalized image, in the
 // DEBUG variant (FIH signed byte 0x00).
 //
-// Validated format. Decoded byte-for-byte from TestFiles/PS5/PKG/Debug/Downloads.pkg (cross-checked
-// against InternetBrowser.pkg and DebugSettings.pkg): in a debug finalized image the SI segment is
-// a plain ZIP (PK\x03\x04, every member STORED / uncompressed) with this exact member set:
+// Validated legacy/alternate debug SI format. Decoded byte-for-byte from
+// TestFiles/PS5/PKG/Debug/Downloads.pkg (cross-checked against InternetBrowser.pkg and
+// DebugSettings.pkg): the SI segment is a plain ZIP (PK\x03\x04, every member STORED /
+// uncompressed). Publishing Tools 2.79 APP/AC nwonly uses the same core member set but omits
+// pfsimage.xml:
 //
 // common/etc/naps_meta_18.dat 3440 B (per-package metric blob)
 // common/etc/naps_meta_300/301/302/308.dat 48 B each, byte-identical
-// common/etc/pfsimage.xml rich package-configuration descriptor
+// common/etc/pfsimage.xml optional rich package-configuration descriptor
 // common/etc/playgo-chunk.dat 416 B copied from the inner PFS
 // config/<content-id>/playgo-chunk.crc 68 B
 //
@@ -267,7 +269,10 @@ public static class ProsperoSiArchive
     /// <summary>Canonical member path for the 3440-byte metric blob.</summary>
     public const string NapsMeta18Path = "common/etc/naps_meta_18.dat";
 
-    /// <summary>The four byte-identical 48-byte <c>naps_meta_*</c> record ids, in file order.</summary>
+    /// <summary>
+    /// The four record ids whose files share one byte-identical 48-byte payload within a verified
+    /// Publishing Tools 2.79 APP/AC <c>nwonly</c> package, in file order.
+    /// </summary>
     public static ReadOnlySpan<int> NapsMeta300Ids => [300, 301, 302, 308];
 
     /// <summary>

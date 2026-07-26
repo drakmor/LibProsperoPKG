@@ -458,7 +458,7 @@ public static class ProsperoPkgBuilder
 
                 // The block-aligned stored size of pfs_image.dat is what the FIH records at 0xA0 in the
                 // reference data-first layout and is the sole input to the SI's naps_meta_300 record
-                // (R = alignUp(storedSize) - 0x10000). Our outer PFS is superblock-first, so FIH[0xA0] is
+                // (R = alignUp(storedSize) - 0x20000). Our outer PFS is superblock-first, so FIH[0xA0] is
                 // left 0; capture the value here where the stored inner-file size is known.
                 long innerImageAlignedSize =
                     (innerFile.Size + BlockSize - 1) / BlockSize * BlockSize;

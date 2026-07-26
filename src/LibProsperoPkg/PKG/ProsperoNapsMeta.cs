@@ -123,8 +123,9 @@ public interface IProsperoNapsIntegrityProvider
 
 /// <summary>
 /// Builder for the PS5 <c>naps_meta_*.dat</c> records emitted into the SI segment of a
-/// <c>nwonly</c> finalized image. The 48-byte <c>naps_meta_300/301/302/308</c> descriptor is
-/// derived from the inner-image geometry; <c>naps_meta_18.dat</c> is the
+/// <c>nwonly</c> finalized image. In the verified Publishing Tools 2.79 APP/AC profile, the
+/// four <c>naps_meta_300/301/302/308</c> files contain the same 48-byte descriptor within one
+/// package. The descriptor is derived from the inner-image geometry; <c>naps_meta_18.dat</c> is the
 /// AES-128-XTS TLV metric blob built by <c>BuildMeta18</c> from the finalized image and its
 /// content-file set. See <see cref="ProsperoSiArchive"/>.
 /// </summary>
@@ -134,12 +135,15 @@ public static class ProsperoNapsMeta
     public const int Meta300Length = 48;
 
     /// <summary>
-    /// Constant NAPS-meta kind/version id stored at offset 0x18 of every <c>naps_meta_300</c> record
-    /// (<c>0x3E9</c> = 1001). Identical across all debug packages.
+    /// Constant NAPS-meta kind/version id stored at offset 0x18 of every verified APP/AC
+    /// <c>naps_meta_300</c> record (<c>0x3E9</c> = 1001).
     /// </summary>
     public const ulong Meta300KindId = 0x3E9;
 
-    /// <summary>PFS block size (64 KiB) stored at offset 0x28 of the <c>naps_meta_300</c> record.</summary>
+    /// <summary>
+    /// PFS block size (64 KiB) used by the type-18 mapping tables. This is not the value stored at
+    /// offset 0x28 of <c>naps_meta_300</c>; that field is the fixed 128-KiB trailing extent.
+    /// </summary>
     public const ulong PfsBlockSize = 0x10000;
 
     /// <summary>Fixed 128-KiB trailing extent encoded by the NAPS meta-300 profile.</summary>

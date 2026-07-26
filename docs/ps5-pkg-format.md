@@ -255,31 +255,45 @@ A synthetic end-to-end regression covers token v0, token v1 with a real compact 
 all three authentication areas, ICV/digests, `IMAGE_KEY` and `imagedigs.dat`; a genuine
 publisher-issued FGC corpus is still needed for byte-exact cross-validation.
 
-### 5.4 The debug SI segment
+### 5.4 The `nwonly` debug SI segment
 
-Debug publisher images may end with a trailing **STORED ZIP** archive of install-time metadata. Verified
-member order against reference debug packages (every member uncompressed / `STORED`):
+Publisher debug images may end with a trailing **STORED ZIP** archive of install-time metadata.
+The table below describes the verified Publishing Tools 2.79 APP/AC `nwonly` profile; every member
+is uncompressed (`STORED`). Other debug SI profiles may select a different member set.
 
 | Path | Notes |
 |---|---|
 | `common/etc/naps_meta_18.dat` | per-package encrypted TLV metric blob; size varies (e.g. 3440 / 7936 B). Generated automatically. Geometry, file records, `ihsh` SHA3/checksum rows, `rhsh` rolling hashes and `obcc` are local; the 32-byte PFS-image key is derived from primary id, passcode and the 16-byte seed. |
-| `common/etc/naps_meta_300.dat` | 48 B; reproduced byte-exact (`R = alignUp(pfs_image.dat) - 0x10000` at 0x10/0x20, kind id `0x3E9` at 0x18, block size `0x10000` at 0x28) |
-| `common/etc/naps_meta_301.dat` | 48 B, byte-identical to `_300` |
-| `common/etc/naps_meta_302.dat` | 48 B, byte-identical to `_300` |
-| `common/etc/naps_meta_308.dat` | 48 B, byte-identical to `_300` |
-| `common/etc/pfsimage.xml` | machine-readable image descriptor (see below) |
+| `common/etc/naps_meta_300.dat` | 48-byte plaintext geometry descriptor described below |
+| `common/etc/naps_meta_301.dat` | 48 B; byte-identical to `_300` within the same verified APP/AC package |
+| `common/etc/naps_meta_302.dat` | 48 B; byte-identical to `_300` within the same verified APP/AC package |
+| `common/etc/naps_meta_308.dat` | 48 B; byte-identical to `_300` within the same verified APP/AC package |
+| `common/etc/pfsimage.xml` | legacy/alternate debug SI member; omitted by verified 2.79 APP/AC `nwonly` packages |
 | `common/etc/playgo-chunk.dat` | 416 B; identical to the CNT `0x1001` copy |
 | `config/<content-id>/playgo-chunk.crc` | CRC-32C per 64 KiB block of the mount image |
 
+The four `naps_meta_30x` names are distinct callback types, but Publishing Tools 2.79 writes the
+same descriptor payload for all four in this profile. The bytes are package-dependent; only the
+four copies inside one package are asserted to be identical:
+
+| Offset | Type | Value |
+|---:|---|---|
+| `0x00` | `u64le` | `0`, reserved |
+| `0x08` | `u64le` | `0`, reserved |
+| `0x10` | `u64le` | `R = innerImageSize - 0x20000` |
+| `0x18` | `u64le` | `0x3E9` |
+| `0x20` | `u64le` | `R`, repeated |
+| `0x28` | `u64le` | `0x20000`, fixed trailing extent size |
+
 The SI segment is **emitted automatically** by the `nwonly` build: `ProsperoPkgBuilder` captures the
-reproducible `pfsimage.xml` options, the CNT `playgo-chunk.dat`, and the block-aligned inner-image size
+optional `pfsimage.xml` inputs, the CNT `playgo-chunk.dat`, and the block-aligned inner-image size
 during the CNT build, and `ProsperoFihBuilder.BuildFromCnt` appends the ZIP produced by
 `ProsperoSiArchive.BuildDebugSiSegment` after the embedded CNT. `BuildMembers` → `WriteZip` reproduce the
 member order, paths, `STORED` framing and `naps_meta_30x` identity exactly; the `playgo-chunk.crc` is
-recomputed from the finalized mount image (CRC-32C). The `naps_meta_300` `R` is the inner-image
-data-region size and is legitimately `0` when the inner image fits in one 0x10000 block (tiny synthetic
-inputs); real multi-MB game/app content yields the expected non-zero value (e.g. `0x40000` for the
-reference Downloads package).
+recomputed from the finalized mount image (CRC-32C). The `naps_meta_300` `R` is the leading
+inner-image extent before the fixed final `0x20000` bytes and is legitimately `0` only for a
+synthetic inner image whose complete block-aligned size is exactly `0x20000`. Real APP/AC images
+produce a package-specific non-zero `R`.
 
 This ZIP description is not a requirement for standard Retail APP/AC. Both checked Retail packages
 end exactly after CNT (`supplement = 0`); no encrypted Retail install-metadata archive is appended.
@@ -390,7 +404,7 @@ stream. CNT-entry placement for each file is described below.
 | `playgo-ficm.dat` | CNT entry `0x2011` | PlayGo file-in-chunk map; 16-byte header + `fileCount` bytes. `PlayGo.ProsperoPlayGo.BuildFicm`. |
 | `playgo-chunk.crc` | `config/<content-id>/` (SI) | CRC-32C over each 64 KiB block of the finalized mount image. `ProsperoPlayGo.BuildChunkCrc`. |
 | `naps_meta_18.dat` | `sce_suppl/common/etc` (SI) | Per-package AES-XTS TLV metric blob; built by `ProsperoNapsMeta.BuildMeta18`. Exact `obcc` uses the locally derived `sc2 estimate` PFS image key and effective seed, with an optional provider override. |
-| `naps_meta_300/301/302/308.dat` | `sce_suppl/common/etc` (SI) | 48-byte NAPS records; `301/302/308` are byte-identical to `300`. Reproduced byte-exact (`ProsperoNapsMeta`). |
+| `naps_meta_300/301/302/308.dat` | `sce_suppl/common/etc` (SI) | Verified 2.79 APP/AC `nwonly`: four byte-identical 48-byte copies within one package. Each contains `0, 0, R, 0x3E9, R, 0x20000` as `u64le`, where `R = innerImageSize - 0x20000`. Reproduced byte-exact by `ProsperoNapsMeta`; the value of `R` may differ between packages. |
 | `pfsimage.xml` | legacy/alternate SI profiles | Machine-readable image descriptor reproduced through `<entries>` plus the `<chunkinfo>`/`<pfs-image>`/`<nested-image>` introspection trees. Verified Publishing Tools 2.79 APP/AC `nwonly` SI omits this member. |
 
 > **`naps_pkg_layout.dat` is an outer-PFS file, not an SI member.** The publisher PPR/NAPS builder
