@@ -13,6 +13,7 @@
 
 #nullable enable
 using LibProsperoPkg.Content;
+using LibProsperoPkg.GP5;
 using LibProsperoPkg.PFS;
 using LibProsperoPkg.PFS.Compression;
 using LibProsperoPkg.Util;
@@ -20,6 +21,7 @@ using System;
 using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.IO;
+using System.IO.Enumeration;
 using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
@@ -58,8 +60,10 @@ internal sealed class ProsperoSiBuildInputs
     /// <summary>Unpadded byte size of <c>naps_pkg_layout.dat</c>, written to FIH offset 0xA8.</summary>
     public ulong NapsLayoutSize { get; init; }
 
-    /// <summary>FIH +0x94/+0x98 nonterminal NAPS FIDX/file count (<c>NumFiles - 1</c>).</summary>
+    /// <summary>FIH +0x94 nonterminal NAPS FIDX/file count (<c>NumFiles - 1</c>).</summary>
     public uint FihNapsFileCount { get; init; }
+    public int SparseAfidCount { get; init; }
+    public int EmptyFileCount { get; init; }
 
     /// <summary>Protected publisher metric blob copied verbatim into the SI, when supplied.</summary>
     public byte[]? NapsMeta18 { get; init; }
@@ -595,10 +599,13 @@ public static class ProsperoPkgBuilder
             .Select(n => n.FullPath)
             .ToList();
         uint playgoFileCount = checked((uint)playgoPaths.Count * 2u);
-        // NAPS FIDX contains every AFID payload, the block-info/hole boundary, the metadata
-        // boundary, and a terminal mount boundary.  FIH +0x94/+0x98 and afid_to_ino_table[0]
-        // store the nonterminal count, therefore AFID count + 2.
-        uint napsFileCount = checked((uint)inner.AfidLogicalOffsets.Count + 2u);
+        // NAPS FIDX contains every AFID slot, one unreferenced end boundary per empty file,
+        // the metadata boundary, and the terminal mount boundary. FIH +0x94 stores NumFiles-1
+        // and +0x98 stores NumFiles, so this count excludes only the final mount entry.
+        uint napsFileCount = checked(
+            (uint)inner.AfidLogicalOffsets.Count +
+            (uint)inner.EmptyFileLogicalOffsets.Count +
+            1u);
         int appFileCount = inner.Nodes.Count(
             n => !n.IsDirectory && n.ParentInode >= 0 && n.Mode == 0x816D);
         uint contentVersionHigh = ContentVersionHigh(ReadParamJsonInfo(sourceFolder).ContentVersion);
@@ -697,6 +704,7 @@ public static class ProsperoPkgBuilder
             ProsperoPfsImageXmlOptions siXml = FinishContainer(
                 pkg, fs, props, nestedImageDigest, log, napsLayout.Length, nestedMetaBaseBlocks,
                 contentVersionHigh, (int)napsFileCount, appFileCount,
+                inner.SparseAfidHoles.Count, inner.EmptyFileLogicalOffsets.Count,
                 outer.SuperblockIndex);
             byte[]? playGoChunkDat =
                 (pkg.Entries.FirstOrDefault(e => (uint)e.Id == PlayGoChunkDatEntryId)
@@ -712,7 +720,9 @@ public static class ProsperoPkgBuilder
             };
 
             var contentFiles = inner.Nodes
-                .Where(n => !n.IsDirectory && n.ParentInode >= 0)
+                // Empty files have inode/dirent metadata but no data-bearing AFID and are omitted
+                // from the publisher NAPS meta18 "file" records.
+                .Where(n => !n.IsDirectory && n.ParentInode >= 0 && n.Size != 0)
                 .OrderBy(n => n.Afid)
                 .Select(n => (Path: n.FullPath.TrimStart('/'), Size: n.Size))
                 .ToList();
@@ -725,6 +735,8 @@ public static class ProsperoPkgBuilder
                 InnerImageSize = (long)packedAlignedSize,
                 NapsLayoutSize = (ulong)napsLayout.Length,
                 FihNapsFileCount = napsFileCount,
+                SparseAfidCount = inner.SparseAfidHoles.Count,
+                EmptyFileCount = inner.EmptyFileLogicalOffsets.Count,
                 NapsMeta18 = props.NapsMeta18,
                 NapsIntegrityProvider = props.NapsIntegrityProvider,
                 NapsPfsImageKey = pfsImageKey,
@@ -928,25 +940,46 @@ public static class ProsperoPkgBuilder
         }
         else
         {
-            // A GP5 project is an explicit file manifest. Loose files beside it are build inputs or
-            // backups, not implicit package members. Preserve each declared destination path and resolve
-            // the source path relative to the project file, matching prospero-pub-cmd.
-            XDocument document = XDocument.Load(project, LoadOptions.None);
+            Gp5Project manifest = Gp5Project.ReadFrom(project);
             string projectDirectory = Path.GetDirectoryName(project)!;
-            foreach (XElement file in document.Descendants("file"))
+            if (manifest.Layout == Gp5Layout.Flat)
             {
-                string? destination = (string?)file.Attribute("dst_path");
-                string? source = (string?)file.Attribute("src_path");
-                if (string.IsNullOrWhiteSpace(destination))
-                    continue;
-                // Publishing Tools omits src_path when the host path is identical to dst_path
-                // relative to the GP5 directory.
-                source = string.IsNullOrWhiteSpace(source) ? destination : source;
-                string sourcePath = Path.GetFullPath(Path.Combine(
-                    projectDirectory, source.Replace('\\', Path.DirectorySeparatorChar)));
-                if (!File.Exists(sourcePath))
-                    throw new FileNotFoundException($"GP5 source file was not found for '{destination}'.", sourcePath);
-                AddMappedFile(root, destination, sourcePath);
+                // Flat GP5 is an explicit manifest. Loose files beside it are build inputs or backups,
+                // not implicit package members.
+                foreach (Gp5File file in manifest.Files)
+                    AddManifestFile(root, file, projectDirectory, destinationPrefix: "");
+                foreach (Gp5Dir directory in manifest.Folders)
+                    ApplyManifestDirectory(root, directory, projectDirectory, destinationPrefix: "");
+            }
+            else
+            {
+                // Normal GP5 recursively maps rootdir. An omitted src_path means the project directory,
+                // which is the profile used by unpacked-game projects such as ds.GP5.
+                string rootSource = ResolveManifestPath(
+                    projectDirectory,
+                    manifest.RootDir.SourcePath,
+                    projectDirectory);
+                if (!Directory.Exists(rootSource))
+                    throw new DirectoryNotFoundException(
+                        $"GP5 rootdir source was not found: {rootSource}");
+                string[] dirExcludes = ParseExcludeMasks(manifest.RootDir.DirExclude);
+                string[] fileExcludes = ParseExcludeMasks(manifest.RootDir.FileExclude);
+                string[] globalExcludes = ParseExcludeMasks(manifest.GlobalExclude);
+                Populate(
+                    root,
+                    rootSource,
+                    rootSource,
+                    dirExcludes,
+                    fileExcludes,
+                    globalExcludes);
+
+                // Rootdir children are publisher overlays. A non-virtual directory replaces the
+                // recursively discovered destination; virtual directories merge into it.
+                foreach (Gp5Dir directory in manifest.RootDir.Directories)
+                    ApplyManifestDirectory(root, directory, projectDirectory, destinationPrefix: "");
+                foreach (Gp5File file in manifest.RootDir.Files)
+                    AddManifestFile(
+                        root, file, projectDirectory, destinationPrefix: "", replaceExisting: true);
             }
         }
 
@@ -992,9 +1025,102 @@ public static class ProsperoPkgBuilder
         static void AddFile(FSDir dir, string name, byte[] data) =>
             dir.Files.Add(new FSFile(s => s.Write(data, 0, data.Length), name, data.Length) { Parent = dir });
 
-        static void AddMappedFile(FSDir rootDir, string destination, string sourcePath)
+        static string ResolveManifestPath(
+            string projectDirectory,
+            string? source,
+            string fallback)
         {
-            string[] parts = destination.Replace('\\', '/').Trim('/').Split('/', StringSplitOptions.RemoveEmptyEntries);
+            string value = string.IsNullOrWhiteSpace(source) ? fallback : source;
+            value = Environment.ExpandEnvironmentVariables(value)
+                .Replace('\\', Path.DirectorySeparatorChar);
+            return Path.GetFullPath(Path.IsPathRooted(value)
+                ? value
+                : Path.Combine(projectDirectory, value));
+        }
+
+        static void AddManifestFile(
+            FSDir rootDir,
+            Gp5File file,
+            string projectDirectory,
+            string destinationPrefix,
+            bool replaceExisting = false)
+        {
+            string destination = CombineDestination(destinationPrefix, file.DestinationPath);
+            if (string.IsNullOrWhiteSpace(destination))
+                return;
+            string sourcePath = ResolveManifestPath(
+                projectDirectory,
+                file.SourcePath,
+                Path.Combine(projectDirectory, destination.Replace('/', Path.DirectorySeparatorChar)));
+            if (!File.Exists(sourcePath))
+                throw new FileNotFoundException(
+                    $"GP5 source file was not found for '{destination}'.", sourcePath);
+            AddMappedFile(rootDir, destination, sourcePath, replaceExisting);
+        }
+
+        static void ApplyManifestDirectory(
+            FSDir rootDir,
+            Gp5Dir mapping,
+            string projectDirectory,
+            string destinationPrefix)
+        {
+            string destination = CombineDestination(destinationPrefix, mapping.DestinationPath);
+            FSDir target = EnsureMappedDirectory(
+                rootDir,
+                destination,
+                replaceLeaf: !mapping.Virtual);
+            if (!string.IsNullOrWhiteSpace(mapping.SourcePath))
+            {
+                string sourcePath = ResolveManifestPath(
+                    projectDirectory,
+                    mapping.SourcePath,
+                    projectDirectory);
+                if (!Directory.Exists(sourcePath))
+                    throw new DirectoryNotFoundException(
+                        $"GP5 source directory was not found for '{destination}': {sourcePath}");
+                Populate(target, sourcePath);
+            }
+            foreach (Gp5Dir child in mapping.Directories)
+                ApplyManifestDirectory(
+                    rootDir, child, projectDirectory, destination);
+            foreach (Gp5File file in mapping.Files)
+                AddManifestFile(
+                    rootDir, file, projectDirectory, destination, replaceExisting: true);
+        }
+
+        static FSDir EnsureMappedDirectory(
+            FSDir rootDir,
+            string destination,
+            bool replaceLeaf)
+        {
+            string[] parts = SplitDestination(destination);
+            FSDir dir = rootDir;
+            for (int i = 0; i < parts.Length; i++)
+            {
+                FSDir? next = dir.Dirs.FirstOrDefault(
+                    child => string.Equals(child.name, parts[i], StringComparison.Ordinal));
+                if (next is not null && replaceLeaf && i == parts.Length - 1)
+                {
+                    dir.Dirs.Remove(next);
+                    next = null;
+                }
+                if (next is null)
+                {
+                    next = new FSDir { name = parts[i], Parent = dir };
+                    dir.Dirs.Add(next);
+                }
+                dir = next;
+            }
+            return dir;
+        }
+
+        static void AddMappedFile(
+            FSDir rootDir,
+            string destination,
+            string sourcePath,
+            bool replaceExisting = false)
+        {
+            string[] parts = SplitDestination(destination);
             if (parts.Length == 0) return;
             FSDir dir = rootDir;
             for (int i = 0; i < parts.Length - 1; i++)
@@ -1008,18 +1134,74 @@ public static class ProsperoPkgBuilder
                 dir = next;
             }
             string name = parts[^1];
-            if (dir.Files.Any(f => string.Equals(f.name, name, StringComparison.Ordinal)))
+            FSFile? existing = dir.Files.FirstOrDefault(
+                file => string.Equals(file.name, name, StringComparison.Ordinal));
+            if (existing is not null && !replaceExisting)
                 throw new InvalidDataException($"GP5 declares destination '{destination}' more than once.");
+            if (existing is not null)
+                dir.Files.Remove(existing);
             dir.Files.Add(new FSFile(sourcePath) { name = name, Parent = dir });
         }
 
-        static void Populate(FSDir node, string path)
+        static string CombineDestination(string prefix, string child) =>
+            string.Join(
+                '/',
+                new[] { prefix, child }
+                    .Where(value => !string.IsNullOrWhiteSpace(value))
+                    .Select(value => value.Replace('\\', '/').Trim('/')));
+
+        static string[] SplitDestination(string destination) =>
+            destination.Replace('\\', '/').Trim('/')
+                .Split('/', StringSplitOptions.RemoveEmptyEntries);
+
+        static string[] ParseExcludeMasks(string? value) =>
+            string.IsNullOrWhiteSpace(value)
+                ? Array.Empty<string>()
+                : value.Split(
+                    [';', ','],
+                    StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+        static bool IsExcluded(
+            string name,
+            string relativePath,
+            IReadOnlyList<string> masks)
         {
+            string normalized = relativePath.Replace('\\', '/');
+            return masks.Any(mask =>
+                FileSystemName.MatchesSimpleExpression(mask, name, ignoreCase: true) ||
+                FileSystemName.MatchesSimpleExpression(
+                    mask.Replace('\\', '/'), normalized, ignoreCase: true));
+        }
+
+        static void Populate(
+            FSDir node,
+            string path,
+            string? sourceRoot = null,
+            IReadOnlyList<string>? dirExcludes = null,
+            IReadOnlyList<string>? fileExcludes = null,
+            IReadOnlyList<string>? globalExcludes = null)
+        {
+            sourceRoot ??= path;
+            dirExcludes ??= Array.Empty<string>();
+            fileExcludes ??= Array.Empty<string>();
+            globalExcludes ??= Array.Empty<string>();
             foreach (var sub in Directory.EnumerateDirectories(path).OrderBy(Path.GetFileName, StringComparer.Ordinal))
             {
+                string relative = Path.GetRelativePath(sourceRoot, sub);
+                if (IsExcluded(Path.GetFileName(sub), relative, dirExcludes) ||
+                    IsExcluded(Path.GetFileName(sub), relative, globalExcludes))
+                {
+                    continue;
+                }
                 var child = new FSDir { name = Path.GetFileName(sub), Parent = node };
                 node.Dirs.Add(child);
-                Populate(child, sub);
+                Populate(
+                    child,
+                    sub,
+                    sourceRoot,
+                    dirExcludes,
+                    fileExcludes,
+                    globalExcludes);
             }
             foreach (var file in Directory.EnumerateFiles(path).OrderBy(Path.GetFileName, StringComparer.Ordinal))
             {
@@ -1027,6 +1209,12 @@ public static class ProsperoPkgBuilder
                 if (name.EndsWith(".gp4", StringComparison.OrdinalIgnoreCase) ||
                     name.EndsWith(".gp5", StringComparison.OrdinalIgnoreCase))
                     continue;
+                string relative = Path.GetRelativePath(sourceRoot, file);
+                if (IsExcluded(name, relative, fileExcludes) ||
+                    IsExcluded(name, relative, globalExcludes))
+                {
+                    continue;
+                }
                 node.Files.Add(new FSFile(file) { name = name, Parent = node });
             }
         }
@@ -1162,6 +1350,10 @@ public static class ProsperoPkgBuilder
         byte[]? publisherPfsImageKey = null)
     {
         bool noData = props.VolumeType == ProsperoVolumeType.AdditionalContentNoData;
+        bool upgradableApplication =
+            props.VolumeType == ProsperoVolumeType.Application &&
+            ReadParamJsonInfo(sourceFolder).ApplicationDrmType.Equals(
+                "upgradable", StringComparison.OrdinalIgnoreCase);
         uint contentType = ContentTypeFor(props.VolumeType);
         var pkg = new Pkg
         {
@@ -1179,17 +1371,23 @@ public static class ProsperoPkgBuilder
                 body_offset = BodyOffset,
                 body_size = 0,
                 content_id = props.ContentId,
-                drm_type = props.VolumeType == ProsperoVolumeType.Application ? 0u : DrmTypePs5,
+                drm_type = props.VolumeType == ProsperoVolumeType.Application &&
+                           !upgradableApplication
+                    ? 0u
+                    : DrmTypePs5,
                 content_type = contentType,
                 content_flags = ContentFlagsFor(props.VolumeType) |
-                    (props.UsePublisherPprNaps && !noData ? (ContentFlags)0x00020000 : 0),
+                    (props.UsePublisherPprNaps && !noData ? (ContentFlags)0x00020000 : 0) |
+                    (upgradableApplication ? (ContentFlags)0x08000000 : 0),
                 promote_size = 0,
                 // prospero-pub-cmd 2.79 producer identity used by the current publisher corpus.
                 version_date = 0x20240508,
                 version_hash = 0x090FBFC1,
                 iro_tag = IROTag.None,
                 ekc_version = props.VolumeType is ProsperoVolumeType.Application
-                    or ProsperoVolumeType.AdditionalContentNoData ? 0u : 1u,
+                    or ProsperoVolumeType.AdditionalContentNoData
+                    ? upgradableApplication ? 1u : 0u
+                    : 1u,
                 sc_entries1_hash = new byte[32],
                 sc_entries2_hash = new byte[32],
                 digest_table_hash = new byte[32],
@@ -1314,7 +1512,9 @@ public static class ProsperoPkgBuilder
 
         pkg.Digests.FileData = new byte[pkg.Entries.Count * Pkg.HASH_SIZE];
 
-        LayOutEntries(pkg, paramJson, props.VolumeType);
+        LayOutEntries(
+            pkg, paramJson, props.VolumeType,
+            ReadParamJsonInfo(sourceFolder).ApplicationDrmType);
         return pkg;
     }
 
@@ -1329,7 +1529,8 @@ public static class ProsperoPkgBuilder
     }
 
     private static void LayOutEntries(
-        Pkg pkg, byte[] paramJson, ProsperoVolumeType volumeType)
+        Pkg pkg, byte[] paramJson, ProsperoVolumeType volumeType,
+        string applicationDrmType)
     {
         // Publisher ENTRY_NAMES follows the sorted MetaEntry table, not lexical filename order.
         // The table therefore starts with playgo-chunk.dat (id 0x1001), followed by presentation
@@ -1338,7 +1539,7 @@ public static class ProsperoPkgBuilder
         foreach (var entry in pkg.Entries.OrderBy(e => (uint)e.Id))
         {
             ProsperoCntEntryProfile profile = ProsperoCntEntryPolicy.Resolve(
-                (uint)entry.Id, volumeType, entry.Name);
+                (uint)entry.Id, volumeType, entry.Name, applicationDrmType);
             if (profile.IncludeName)
                 pkg.EntryNames.GetOffset(entry.Name);
         }
@@ -1348,7 +1549,7 @@ public static class ProsperoPkgBuilder
         foreach (var entry in pkg.Entries)
         {
             ProsperoCntEntryProfile profile = ProsperoCntEntryPolicy.Resolve(
-                (uint)entry.Id, volumeType, entry.Name);
+                (uint)entry.Id, volumeType, entry.Name, applicationDrmType);
             var meta = new MetaEntry
             {
                 id = entry.Id,
@@ -1449,7 +1650,8 @@ public static class ProsperoPkgBuilder
         Pkg pkg, Stream s, ProsperoPkgBuildProperties props, byte[]? nestedImageDigest,
         Action<string> log, long nestedImageSize = 0, long nestedMetaBaseBlocks = 0,
         uint nwonlyContentVersionHi = 0, int nwonlyNapsFileCount = 0,
-        int nwonlyAppFileCount = 0, int knownOuterSuperblockIndex = -1)
+        int nwonlyAppFileCount = 0, int nwonlySparseAfidCount = 0,
+        int nwonlyEmptyFileCount = 0, int knownOuterSuperblockIndex = -1)
     {
         // Read the outer PFS image (encrypted blocks + plaintext superblock) so the PS5 mount digests can be
         // computed for the mount image — both are SHA3-256, NOT SHA-256:
@@ -1486,7 +1688,9 @@ public static class ProsperoPkgBuilder
             nestedMetaBaseBlocks: nestedMetaBaseBlocks,
             nwonlyContentVersionHi: nwonlyContentVersionHi,
             nwonlyNapsFileCount: nwonlyNapsFileCount,
-            nwonlyAppFileCount: nwonlyAppFileCount);
+            nwonlyAppFileCount: nwonlyAppFileCount,
+            nwonlySparseAfidCount: nwonlySparseAfidCount,
+            nwonlyEmptyFileCount: nwonlyEmptyFileCount);
         pkg.Header.pfs_signed_digest = ProsperoImageDigests.ComputeFixedInfoDigest(fihBlock);
 
         // General digests (PS5 nwonly scheme: type 0x102 [set at creation so the layout reserves 0x1E0],
@@ -1700,13 +1904,13 @@ public static class ProsperoPkgBuilder
     private static uint ContentVersionHigh(string contentVersion)
     {
         if (string.IsNullOrWhiteSpace(contentVersion)) return 0;
-        string major = contentVersion.Split('.')[0].Trim();
-        if (major.Length is 0 or > 2 || !byte.TryParse(
-                major, System.Globalization.NumberStyles.None,
-                System.Globalization.CultureInfo.InvariantCulture, out byte value))
+        string digits = string.Concat(contentVersion.Where(char.IsDigit));
+        if (digits.Length != 8)
             return 0;
-        uint bcd = (uint)(((value / 10) << 4) | (value % 10));
-        return bcd << 24;
+        uint bcd = 0;
+        foreach (char digit in digits)
+            bcd = (bcd << 4) | (uint)(digit - '0');
+        return bcd;
     }
 
     // Best-effort param.json reader for the pfsimage.xml string fields. Any parse failure falls back to
@@ -1921,13 +2125,20 @@ public static class ProsperoPkgBuilder
             DateTimeKind.Local => props.TimeStamp.ToUniversalTime(),
             _ => DateTime.SpecifyKind(props.TimeStamp, DateTimeKind.Utc),
         };
-        root["pubtools"] = new JsonObject
+        JsonNode? measuredSnd0Loudness =
+            (root["pubtools"] as JsonObject)?["loudnessSnd0"]?.DeepClone();
+        var pubtools = new JsonObject
         {
             ["creationDate"] = timestampUtc.ToString(
                 "yyyy-MM-dd HH:mm:ss",
                 System.Globalization.CultureInfo.InvariantCulture),
             ["toolVersion"] = "2.79",
         };
+        // The value is the producer's actual audio measurement. Preserve it when rebuilding an
+        // extracted project; never invent a generic value for a different snd0.at9.
+        if (measuredSnd0Loudness is not null)
+            pubtools["loudnessSnd0"] = measuredSnd0Loudness;
+        root["pubtools"] = pubtools;
 
         if (props.VolumeType == ProsperoVolumeType.AdditionalContentNoData)
         {
@@ -1963,21 +2174,33 @@ public static class ProsperoPkgBuilder
                 $"0x{value:X16}".ToLowerInvariant();
 
             ulong executableSdkVersion = 0;
+            bool hasExecutableSdkVersion = false;
+            bool executableIsLooseElf = false;
             string? executablePath = ResolveSourceFile(sourceFolder, "eboot.bin");
             if (executablePath is not null)
             {
                 byte[] executable = File.ReadAllBytes(executablePath);
-                ProsperoFself.TryGetSdkVersion(
+                executableIsLooseElf = ProsperoFself.IsElf(executable);
+                hasExecutableSdkVersion = ProsperoFself.TryGetSdkVersion(
                     executable, out executableSdkVersion);
             }
-            if (executableSdkVersion == 0)
+            // A loose stripped ELF needs the compatibility fallback because img_create will turn it
+            // into an FSELF. An existing SELF with a valid all-zero trailer is different: publisher
+            // preserves sdkVersion=0 instead of inventing 4.51.
+            if (!hasExecutableSdkVersion && executableIsLooseElf)
                 executableSdkVersion = FallbackPublisherSdkVersion;
 
-            ulong sdkVersion = Math.Max(
-                HexVersion(root["sdkVersion"]), executableSdkVersion);
+            // Publisher treats the executable, not a stale extracted param.json value, as the SDK
+            // authority. Publishing Tools 2.79 also normalizes a future required-system value to the
+            // newest version understood by that producer (9.00 in the observed corpus).
+            ulong sdkVersion = executableSdkVersion;
             root["sdkVersion"] = VersionText(sdkVersion);
+            const ulong Publisher279RequiredSystemCeiling = 0x0900000000000000;
             ulong requiredSystemVersion = Math.Max(
-                HexVersion(root["requiredSystemSoftwareVersion"]), sdkVersion);
+                Math.Min(
+                    HexVersion(root["requiredSystemSoftwareVersion"]),
+                    Publisher279RequiredSystemCeiling),
+                sdkVersion);
             root["requiredSystemSoftwareVersion"] =
                 VersionText(requiredSystemVersion);
 
@@ -1998,7 +2221,12 @@ public static class ProsperoPkgBuilder
                 ["default"] = 0,
             };
             root["contentBadgeType"] ??= 1;
-            root["addcont"] ??= new JsonObject
+            // Extracted update params may carry install-time origin/target markers and concrete
+            // sharing service ids. img_create consumes those inputs but does not copy them into the
+            // canonical CNT param entry.
+            root.Remove("originContentVersion");
+            root.Remove("targetContentVersion");
+            root["addcont"] = new JsonObject
             {
                 ["serviceIdForSharing"] = new JsonArray(
                     Enumerable.Range(0, 7)
@@ -2060,12 +2288,24 @@ public static class ProsperoPkgBuilder
             return File.Exists(loose) ? Path.GetFullPath(loose) : null;
         }
 
-        XDocument document = XDocument.Load(project, LoadOptions.None);
+        Gp5Project manifest = Gp5Project.ReadFrom(project);
         string projectDirectory = Path.GetDirectoryName(project)!;
-        string? resolved = null;
-        foreach (XElement file in document.Descendants("file"))
+        if (manifest.Layout == Gp5Layout.Normal)
         {
-            string? destination = (string?)file.Attribute("dst_path");
+            string rootSource = ResolveGp5SourcePath(
+                projectDirectory,
+                manifest.RootDir.SourcePath,
+                projectDirectory);
+            string candidate = Path.Combine(
+                rootSource,
+                normalized.Replace('/', Path.DirectorySeparatorChar));
+            return File.Exists(candidate) ? Path.GetFullPath(candidate) : null;
+        }
+
+        string? resolved = null;
+        foreach (Gp5File file in manifest.Files)
+        {
+            string destination = file.DestinationPath;
             if (string.IsNullOrWhiteSpace(destination)
                 || !string.Equals(
                     destination.Replace('\\', '/').Trim('/'),
@@ -2075,10 +2315,12 @@ public static class ProsperoPkgBuilder
                 continue;
             }
 
-            string? source = (string?)file.Attribute("src_path");
-            source = string.IsNullOrWhiteSpace(source) ? destination : source;
-            string candidate = Path.GetFullPath(Path.Combine(
-                projectDirectory, source.Replace('\\', Path.DirectorySeparatorChar)));
+            string candidate = ResolveGp5SourcePath(
+                projectDirectory,
+                file.SourcePath,
+                Path.Combine(
+                    projectDirectory,
+                    destination.Replace('/', Path.DirectorySeparatorChar)));
             if (!File.Exists(candidate))
                 throw new FileNotFoundException(
                     $"GP5 source file was not found for '{destination}'.", candidate);
@@ -2108,26 +2350,61 @@ public static class ProsperoPkgBuilder
             return result;
         }
 
-        XDocument document = XDocument.Load(project, LoadOptions.None);
+        Gp5Project manifest = Gp5Project.ReadFrom(project);
         string projectDirectory = Path.GetDirectoryName(project)!;
-        foreach (XElement file in document.Descendants("file"))
+        if (manifest.Layout == Gp5Layout.Normal)
         {
-            string? destination = (string?)file.Attribute("dst_path");
-            string? source = (string?)file.Attribute("src_path");
-            if (string.IsNullOrWhiteSpace(destination))
-                continue;
-            source = string.IsNullOrWhiteSpace(source) ? destination : source;
-            string normalized = destination.Replace('\\', '/').Trim('/');
-            if (!normalized.StartsWith("sce_sys/", StringComparison.OrdinalIgnoreCase))
-                continue;
-            string relative = normalized["sce_sys/".Length..];
-            string candidate = Path.GetFullPath(Path.Combine(
-                projectDirectory, source.Replace('\\', Path.DirectorySeparatorChar)));
-            if (!File.Exists(candidate))
-                throw new FileNotFoundException(
-                    $"GP5 source file was not found for '{destination}'.", candidate);
-            if (!result.TryAdd(relative, candidate))
-                throw new InvalidDataException($"GP5 contains duplicate destination '{normalized}'.");
+            string rootSource = ResolveGp5SourcePath(
+                projectDirectory,
+                manifest.RootDir.SourcePath,
+                projectDirectory);
+            string sceSys = Path.Combine(rootSource, "sce_sys");
+            string[] dirExcludes = ParseGp5ExcludeMasks(manifest.RootDir.DirExclude);
+            string[] fileExcludes = ParseGp5ExcludeMasks(manifest.RootDir.FileExclude);
+            string[] globalExcludes = ParseGp5ExcludeMasks(manifest.GlobalExclude);
+            if (Directory.Exists(sceSys))
+            {
+                foreach (string file in Directory.EnumerateFiles(
+                             sceSys, "*", SearchOption.AllDirectories))
+                {
+                    string rootRelative = Path.GetRelativePath(rootSource, file)
+                        .Replace('\\', '/');
+                    string fileName = Path.GetFileName(file);
+                    if (MatchesGp5Exclude(fileName, rootRelative, fileExcludes) ||
+                        MatchesGp5Exclude(fileName, rootRelative, globalExcludes) ||
+                        IsInGp5ExcludedDirectory(
+                            rootRelative, dirExcludes, globalExcludes))
+                    {
+                        continue;
+                    }
+                    string relative = Path.GetRelativePath(sceSys, file).Replace('\\', '/');
+                    result[relative] = Path.GetFullPath(file);
+                }
+            }
+        }
+        else
+        {
+            foreach (Gp5File file in manifest.Files)
+            {
+                string destination = file.DestinationPath;
+                if (string.IsNullOrWhiteSpace(destination))
+                    continue;
+                string normalized = destination.Replace('\\', '/').Trim('/');
+                if (!normalized.StartsWith("sce_sys/", StringComparison.OrdinalIgnoreCase))
+                    continue;
+                string relative = normalized["sce_sys/".Length..];
+                string candidate = ResolveGp5SourcePath(
+                    projectDirectory,
+                    file.SourcePath,
+                    Path.Combine(
+                        projectDirectory,
+                        normalized.Replace('/', Path.DirectorySeparatorChar)));
+                if (!File.Exists(candidate))
+                    throw new FileNotFoundException(
+                        $"GP5 source file was not found for '{destination}'.", candidate);
+                if (!result.TryAdd(relative, candidate))
+                    throw new InvalidDataException($"GP5 contains duplicate destination '{normalized}'.");
+            }
         }
 
         // Publishing Tools obtain AC/AL licenses from their backend rather than ordinary GP5 file
@@ -2143,6 +2420,45 @@ public static class ProsperoPkgBuilder
         return result;
     }
 
+    private static string[] ParseGp5ExcludeMasks(string? value) =>
+        string.IsNullOrWhiteSpace(value)
+            ? Array.Empty<string>()
+            : value.Split(
+                [';', ','],
+                StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+    private static bool MatchesGp5Exclude(
+        string name,
+        string relativePath,
+        IReadOnlyList<string> masks)
+    {
+        string normalized = relativePath.Replace('\\', '/');
+        return masks.Any(mask =>
+            FileSystemName.MatchesSimpleExpression(mask, name, ignoreCase: true) ||
+            FileSystemName.MatchesSimpleExpression(
+                mask.Replace('\\', '/'), normalized, ignoreCase: true));
+    }
+
+    private static bool IsInGp5ExcludedDirectory(
+        string fileRelativePath,
+        IReadOnlyList<string> dirMasks,
+        IReadOnlyList<string> globalMasks)
+    {
+        string[] parts = fileRelativePath.Replace('\\', '/')
+            .Split('/', StringSplitOptions.RemoveEmptyEntries);
+        string relative = "";
+        for (int i = 0; i < parts.Length - 1; i++)
+        {
+            relative = relative.Length == 0 ? parts[i] : relative + "/" + parts[i];
+            if (MatchesGp5Exclude(parts[i], relative, dirMasks) ||
+                MatchesGp5Exclude(parts[i], relative, globalMasks))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private static byte[]? ResolveGp5EntitlementKey(string sourceFolder)
     {
         string? project = Directory.EnumerateFiles(sourceFolder, "*.gp5", SearchOption.TopDirectoryOnly)
@@ -2151,9 +2467,8 @@ public static class ProsperoPkgBuilder
         if (project is null)
             return null;
 
-        XDocument document = XDocument.Load(project, LoadOptions.None);
-        string? value = (string?)document.Descendants("package").FirstOrDefault()?
-            .Attribute("entitlement_key");
+        Gp5Project manifest = Gp5Project.ReadFrom(project);
+        string? value = manifest.Volume.Package.EntitlementKey;
         if (string.IsNullOrWhiteSpace(value))
             return null;
         byte[] key;
@@ -2170,6 +2485,19 @@ public static class ProsperoPkgBuilder
             throw new InvalidDataException(
                 $"GP5 package entitlement_key must be 16 bytes (got {key.Length}).");
         return key;
+    }
+
+    private static string ResolveGp5SourcePath(
+        string projectDirectory,
+        string? source,
+        string fallback)
+    {
+        string value = string.IsNullOrWhiteSpace(source) ? fallback : source;
+        value = Environment.ExpandEnvironmentVariables(value)
+            .Replace('\\', Path.DirectorySeparatorChar);
+        return Path.GetFullPath(Path.IsPathRooted(value)
+            ? value
+            : Path.Combine(projectDirectory, value));
     }
 
     private static byte[] DeriveDeterministicOuterSeed(string contentId, string passcode)

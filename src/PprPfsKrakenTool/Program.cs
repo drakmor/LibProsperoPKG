@@ -68,6 +68,7 @@ internal static class Program
                 "pack" => PackFile(args),
                 "unpack" => UnpackFile(args),
                 "list" => ListPfs(args),
+                "list-dirs" => ListPfsDirectories(args),
                 "inspect-file" => InspectPfsFile(args),
                 "analyze-afid" => AnalyzeAfid(args),
                 "export-afid-map" => ExportAfidMap(args),
@@ -80,6 +81,7 @@ internal static class Program
                 "check-naps-meta18-obcc" => CheckNapsMeta18Obcc(args),
                 "probe-publisher-obcc" => ProbePublisherObcc(args),
                 "dump-naps" => DumpNaps(args),
+                "summary-naps" => SummaryNaps(args),
                 "check-naps-cmac" => CheckNapsCmac(args),
                 "encode-dds" => EncodeDds(args),
                 "roundtrip-gp5" => RoundTripGp5(args),
@@ -446,6 +448,90 @@ internal static class Program
         }
         for (int i = 0; i < document.OuterBlockDigests.Count; i++)
             Console.WriteLine($"outer-cmac[{i}]={Convert.ToHexString(document.OuterBlockDigests[i]).ToLowerInvariant()}");
+        return 0;
+    }
+
+    private static int SummaryNaps(string[] args)
+    {
+        if (args.Length != 2)
+            throw new ArgumentException("summary-naps requires <naps_pkg_layout.dat>.");
+        NapsLayoutDocument document = ProsperoNapsLayout.Parse(File.ReadAllBytes(args[1]));
+        int normal = document.CblockInfos.Count(entry => !entry.IsRunBase && !entry.IsTerminal);
+        int run = document.CblockInfos.Count(entry => entry.IsRunBase);
+        int terminal = document.CblockInfos.Count(entry => entry.IsTerminal);
+        int maxDelta = document.CblockInfoOffsetByUblock.Count == 0
+            ? 0
+            : document.CblockInfoOffsetByUblock.Max(entry =>
+                entry.DeltaFromBase.Length == 0 ? 0 : entry.DeltaFromBase.Max());
+        long compressedWindowBase = 0;
+        long previous128KWindow = -1;
+        int physical128KTransitions = 0;
+        int physical128KTransitionsWithRun = 0;
+        int runsAtCbiWindow = 0;
+        int runsOutsideCbiWindow = 0;
+        int runsAligned64K = 0;
+        int runsAligned128K = 0;
+        int runsAligned256K = 0;
+        int pendingRunIndex = -1;
+        bool immediatelyPrecededByRun = false;
+        for (int cbiIndex = 0; cbiIndex < document.CblockInfos.Count; cbiIndex++)
+        {
+            NapsCblockInfoEntry entry = document.CblockInfos[cbiIndex];
+            if (entry.IsRunBase)
+            {
+                compressedWindowBase = (long)entry.CoffsetStart256K << 18;
+                if (cbiIndex % 16 == 0) runsAtCbiWindow++;
+                else runsOutsideCbiWindow++;
+                pendingRunIndex = cbiIndex;
+                immediatelyPrecededByRun = true;
+                continue;
+            }
+            long physicalOffset =
+                compressedWindowBase | entry.CoffsetStartMod256K;
+            if (pendingRunIndex >= 0)
+            {
+                if ((physicalOffset & 0xFFFF) == 0) runsAligned64K++;
+                if ((physicalOffset & 0x1FFFF) == 0) runsAligned128K++;
+                if ((physicalOffset & 0x3FFFF) == 0) runsAligned256K++;
+                pendingRunIndex = -1;
+            }
+            if (entry.IsTerminal)
+                break;
+            long window = physicalOffset >> 17;
+            if (previous128KWindow >= 0 && window != previous128KWindow)
+            {
+                physical128KTransitions++;
+                if (immediatelyPrecededByRun)
+                    physical128KTransitionsWithRun++;
+            }
+            previous128KWindow = window;
+            immediatelyPrecededByRun = false;
+        }
+        Console.WriteLine($"layout-bytes={new FileInfo(args[1]).Length}");
+        Console.WriteLine($"files={document.FileOffsets.Count}");
+        Console.WriteLine($"ublocks={document.Counts.UBlockCount}");
+        Console.WriteLine($"u2c={document.CblockInfoOffsetByUblock.Count}");
+        Console.WriteLine($"cbi={document.CblockInfos.Count}");
+        Console.WriteLine($"cbi-normal={normal}");
+        Console.WriteLine($"cbi-run={run}");
+        Console.WriteLine($"cbi-terminal={terminal}");
+        Console.WriteLine($"u2c-max-delta={maxDelta}");
+        Console.WriteLine($"physical-128k-transitions={physical128KTransitions}");
+        Console.WriteLine(
+            $"physical-128k-transitions-with-run={physical128KTransitionsWithRun}");
+        Console.WriteLine($"runs-at-cbi16={runsAtCbiWindow}");
+        Console.WriteLine($"runs-outside-cbi16={runsOutsideCbiWindow}");
+        Console.WriteLine(
+            $"runs-aligned-64k={runsAligned64K} " +
+            $"runs-aligned-128k={runsAligned128K} " +
+            $"runs-aligned-256k={runsAligned256K}");
+        foreach (IGrouping<string, NapsCblockInfoEntry> group in document.CblockInfos
+                     .Where(entry => !entry.IsRunBase && !entry.IsTerminal)
+                     .GroupBy(entry => $"{entry.Even}/{entry.Odd}")
+                     .OrderBy(group => group.Key, StringComparer.Ordinal))
+        {
+            Console.WriteLine($"mode-{group.Key}={group.Count()}");
+        }
         return 0;
     }
 
@@ -1150,6 +1236,9 @@ internal static class Program
             (uint)EntryId.LICENSE_INFO, ProsperoVolumeType.Application);
         ProsperoCntEntryProfile acLicenseInfo = ProsperoCntEntryPolicy.Resolve(
             (uint)EntryId.LICENSE_INFO, ProsperoVolumeType.AdditionalContentData);
+        ProsperoCntEntryProfile upgradableAppLicenseInfo = ProsperoCntEntryPolicy.Resolve(
+            (uint)EntryId.LICENSE_INFO, ProsperoVolumeType.Application,
+            applicationDrmType: "upgradable");
         uint[] rareProtectedEntries =
         [
             (uint)EntryId.SELFINFO_DAT,
@@ -1164,6 +1253,9 @@ internal static class Program
             acLicenseInfo.Flags1 != 0x80000000 ||
             acLicenseInfo.Flags2 != 0x00004000 ||
             acLicenseInfo.IncludeName ||
+            upgradableAppLicenseInfo.Flags1 != 0x80000000 ||
+            upgradableAppLicenseInfo.Flags2 != 0x00004000 ||
+            upgradableAppLicenseInfo.IncludeName ||
             rareProtectedEntries.Any(id =>
             {
                 ProsperoCntEntryProfile profile = ProsperoCntEntryPolicy.Resolve(
@@ -1256,6 +1348,10 @@ internal static class Program
         Console.WriteLine("selftest: NAPS ihsh/rhsh and CRC32C primitive known-answer tests passed");
 
         SelfTestPublisherCbiHalfModes();
+        SelfTestEmptyFileCbiPolicy();
+        SelfTestEmptyDirectoryPreservation();
+        SelfTestMultiBlockDirectoryPacking();
+        SelfTestMultiBlockNapsFihAccounting();
 
         var obccKatContext = new ProsperoNapsIntegrityContext
         {
@@ -1788,6 +1884,16 @@ internal static class Program
 
             byte[] sparseNapsBytes = ProsperoNwonlyNapsGenerator.Generate(sparseInner);
             NapsLayoutDocument sparseNaps = ProsperoNapsLayout.Parse(sparseNapsBytes);
+            if (sparseNaps.FileOffsets.Count !=
+                    sparseInner.AfidLogicalOffsets.Count + 2 ||
+                sparseNaps.FileOffsets[1].Type != 0x40 ||
+                sparseNaps.FileOffsets[3].Type != 0x40 ||
+                sparseNaps.FileOffsets[^2].Type != 0 ||
+                sparseNaps.FileOffsets[^1].Type != 0x40)
+            {
+                throw new InvalidDataException(
+                    "Sparse AFID slots must use FIDX type 0x40 without a separate dataEnd entry.");
+            }
             using var sparsePhysical = new MemoryStream(sparseInner.Image, writable: false);
             using var sparseLogical = new MemoryStream();
             ProsperoNapsImage.Decompress(sparsePhysical, sparseNaps, sparseLogical);
@@ -3567,6 +3673,144 @@ internal static class Program
             "selftest: all observed publisher CBI stored/raw-newLZ/sub-newLZ modes passed");
     }
 
+    private static void SelfTestEmptyFileCbiPolicy()
+    {
+        List<NapsCblockPlanEntry> blocks = ProsperoNapsLayoutBuilder.DeriveDataRegionBlocks(
+        [
+            new NapsFilePlacement
+            {
+                OnDiskOffset = 0,
+                LogicalOffset = 0,
+                OnDiskSize = 0,
+                UncompressedSize = 0,
+                StoreRaw = true,
+            },
+            new NapsFilePlacement
+            {
+                OnDiskOffset = 0,
+                LogicalOffset = 0,
+                OnDiskSize = 1,
+                UncompressedSize = 1,
+                StoreRaw = true,
+            },
+        ], Array.Empty<long>());
+
+        if (blocks.Count != 1 ||
+            blocks[0].EvenChunkCompressedLength != 1 ||
+            blocks[0].StreamLength != 1)
+        {
+            throw new InvalidDataException(
+                "An empty AFID/FIDX file must not produce a CblockInfo data record.");
+        }
+
+        Console.WriteLine("selftest: empty files do not emit invalid CblockInfo records");
+    }
+
+    private static void SelfTestMultiBlockNapsFihAccounting()
+    {
+        const int superblockIndex = 20;
+        const long layoutSize = 0x25000;
+        byte[] digest = new byte[32];
+        byte[] fih = ProsperoFihBuilder.BuildFihHeaderBlock(
+            ProsperoFihVariant.Debug,
+            pfsImageSize: 32L * 0x10000,
+            embeddedCntOffset: 33L * 0x10000,
+            sbOffsetInImage: superblockIndex * 0x10000L,
+            gameDigest: digest,
+            imageDigest: digest,
+            warnings: null,
+            nestedImageDigest: digest,
+            nestedImageSize: layoutSize,
+            nwonlyNapsFileCount: 438,
+            nwonlySparseAfidCount: 13,
+            nwonlyEmptyFileCount: 1);
+        uint innerBlocks = BinaryPrimitives.ReadUInt32LittleEndian(
+            fih.AsSpan(ProsperoPkgLayout.FihInnerImageBlockCountField));
+        if (innerBlocks != superblockIndex - 3)
+            throw new InvalidDataException(
+                $"Multi-block NAPS FIH accounting produced {innerBlocks}, expected 17.");
+        if (BinaryPrimitives.ReadUInt32LittleEndian(
+                fih.AsSpan(ProsperoPkgLayout.FihMetaBlockCountField)) != 438 ||
+            BinaryPrimitives.ReadUInt32LittleEndian(
+                fih.AsSpan(ProsperoPkgLayout.FihMetaBlockCountMirrorField)) != 439 ||
+            BinaryPrimitives.ReadUInt32LittleEndian(
+                fih.AsSpan(ProsperoPkgLayout.FihSparseAfidCountField)) != 13 ||
+            BinaryPrimitives.ReadUInt32LittleEndian(
+                fih.AsSpan(ProsperoPkgLayout.FihEmptyFileCountField)) != 1)
+        {
+            throw new InvalidDataException(
+                "Multi-block NAPS FIH file/sparse/empty accounting fields are inconsistent.");
+        }
+        Console.WriteLine("selftest: multi-block NAPS FIH superblock accounting passed");
+    }
+
+    private static void SelfTestMultiBlockDirectoryPacking()
+    {
+        ProsperoPs5InnerFile[] files = Enumerable.Range(0, 1800)
+            .Select(i => new ProsperoPs5InnerFile
+            {
+                Path = $"/data/file-{i:D4}-{new string('x', 28)}.bin",
+                Data = Array.Empty<byte>(),
+            })
+            .ToArray();
+        ProsperoPs5InnerImageResult image =
+            new ProsperoPs5InnerImageAssembler(0, 0).Build(files);
+        ProsperoPs5MetaNode directory = image.Nodes.Single(
+            node => node.IsDirectory && node.FullPath == "data");
+        if (directory.Size <= ProsperoPs5InnerMetadata.BlockSize)
+            throw new InvalidDataException(
+                "Dense-directory fixture did not cross a metadata block.");
+
+        long relative = checked(
+            (long)directory.LogicalOffset - image.MetaBaseLogical);
+        ReadOnlySpan<byte> payload = image.MetadataPlaintext.AsSpan(
+            checked((int)relative), checked((int)directory.Size));
+        for (int block = 0; block < payload.Length;
+             block += ProsperoPs5InnerMetadata.BlockSize)
+        {
+            int offset = 0;
+            while (offset + 16 <= ProsperoPs5InnerMetadata.BlockSize)
+            {
+                int entSize = BinaryPrimitives.ReadInt32LittleEndian(
+                    payload.Slice(block + offset + 0x0C, 4));
+                if (entSize == 0)
+                    break;
+                if (entSize < 16 ||
+                    offset + entSize > ProsperoPs5InnerMetadata.BlockSize)
+                {
+                    throw new InvalidDataException(
+                        "A publisher directory entry crosses a 64-KiB block.");
+                }
+                offset += entSize;
+            }
+        }
+        Console.WriteLine(
+            "selftest: multi-block directory entries are block-contained");
+    }
+
+    private static void SelfTestEmptyDirectoryPreservation()
+    {
+        ProsperoPs5InnerImageResult image =
+            new ProsperoPs5InnerImageAssembler(0, 0).Build(
+                [
+                    new ProsperoPs5InnerFile
+                    {
+                        Path = "/eboot.bin",
+                        Data = [0x42],
+                    },
+                ],
+                [
+                    new ProsperoPs5InnerDirectory { Path = "/data/shaders" },
+                ]);
+        if (!image.Nodes.Any(node =>
+                node.IsDirectory && node.FullPath == "data/shaders"))
+        {
+            throw new InvalidDataException(
+                "An explicit empty inner-PFS directory was discarded.");
+        }
+        Console.WriteLine("selftest: explicit empty inner-PFS directories are preserved");
+    }
+
     private static byte[] BuildSubLiteralFixture(int length, int variant)
     {
         const int period = 0x1000;
@@ -3999,6 +4243,38 @@ internal static class Program
             Console.WriteLine($"{(compressed ? "compressed" : "raw")}\t{stored}\t{logical}\t{file.FullName}");
         }
         return 0;
+    }
+
+    private static int ListPfsDirectories(string[] args)
+    {
+        if (args.Length < 2)
+            throw new ArgumentException(
+                "list-dirs requires <image.pfs> [--offset auto|0x0].");
+        Dictionary<string, string> options = ReadOptions(args, 2);
+        EnsureOnlyOptions(options, "offset");
+        long superblockOffset = ResolvePfsSuperblockOffset(args[1], options);
+
+        using var mapped = MemoryMappedFile.CreateFromFile(
+            args[1], FileMode.Open, mapName: null, capacity: 0, MemoryMappedFileAccess.Read);
+        using var view = mapped.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
+        var reader = new PfsReader(
+            view, superblockOffset, encryptedDataAlreadyDecrypted: true);
+        WriteDirectories(reader.GetURoot());
+        return 0;
+
+        static void WriteDirectories(PfsReader.Dir parent)
+        {
+            foreach (PfsReader.Dir directory in parent.children
+                         .OfType<PfsReader.Dir>()
+                         .OrderBy(directory => directory.name, StringComparer.Ordinal))
+            {
+                string path = directory.FullName.Replace('\\', '/').TrimStart('/');
+                if (path.StartsWith("uroot/", StringComparison.Ordinal))
+                    path = path["uroot/".Length..];
+                Console.WriteLine(path);
+                WriteDirectories(directory);
+            }
+        }
     }
 
     private static int AnalyzeAfid(string[] args)
@@ -4748,6 +5024,7 @@ internal static class Program
         Console.WriteLine("        [--min-savings-percent 0]");
         Console.WriteLine("  unpack <input-or-image> <output-file> [--offset 0x0]");
         Console.WriteLine("  list <image.pfs> [--offset auto|0x0]");
+        Console.WriteLine("  list-dirs <image.pfs> [--offset auto|0x0]");
         Console.WriteLine("  inspect-file <image.pfs> <path> [--offset auto|0x0]");
         Console.WriteLine("  analyze-afid <image.pfs> [--offset auto|0x0]");
         Console.WriteLine("  export-afid-map <image.pfs> <output.tsv> [--offset auto|0x0]");
@@ -4761,6 +5038,7 @@ internal static class Program
         Console.WriteLine("  probe-publisher-obcc <package.pkg> <naps_meta_18.dat> <pfs_image.dat> [passcode]");
         Console.WriteLine("  probe-publisher-obcc <package.pkg> <naps_meta_18.dat> <pfs_image.dat> <pfs-image-key-hex> <pfs-image-seed-hex>");
         Console.WriteLine("  dump-naps <naps_pkg_layout.dat>");
+        Console.WriteLine("  summary-naps <naps_pkg_layout.dat>");
         Console.WriteLine("  check-naps-cmac <naps_pkg_layout.dat> <pfs_image.dat> <16-byte-key-hex>");
         Console.WriteLine("  encode-dds <input.png> <output.dds>");
         Console.WriteLine("  roundtrip-gp5 <input.gp5> <output.gp5>");

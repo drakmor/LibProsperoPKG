@@ -71,17 +71,6 @@ public static class ProsperoNwonlyNapsGenerator
                 previousEnd = placements[i].OnDiskOffset + placements[i].OnDiskSize;
             }
         }
-        foreach (ProsperoPs5SparseAfidHole hole in result.SparseAfidHoles)
-        {
-            ProsperoPs5InnerPlacement? next = placements
-                .Where(placement => placement.LogicalOffset > hole.LogicalOffset)
-                .OrderBy(placement => placement.LogicalOffset)
-                .Cast<ProsperoPs5InnerPlacement?>()
-                .FirstOrDefault();
-            if (next is ProsperoPs5InnerPlacement nextPlacement)
-                runSet.Add(nextPlacement.OnDiskOffset);
-        }
-
         // ---- Tail: padding blocks + metadata blocks + terminator ------------------------------------
         var tail = new List<NapsCblockPlanEntry>();
 
@@ -162,11 +151,19 @@ public static class ProsperoNwonlyNapsGenerator
         // Terminator marks the mount end.
         tail.Add(new NapsCblockPlanEntry { StartRun = true, OnDiskOffset = metaCursor, LogicalOffset = mountSize, Terminator = true });
 
-        // ---- fidx: afid logical offsets + dataEnd + metaBase + mount --------------------------------
+        // ---- fidx: AFID starts + metadata base + mount ----------------------------------------------
+        // A sparse AFID slot is expressed only by FIDX type 0x40. It consumes one logical 256-KiB
+        // extent, but does not emit a CblockInfo record of its own: the reader resolves it through
+        // the shared zero mapping. The publisher also does not insert a separate dataEnd FIDX
+        // boundary; the metadata-base entry closes the final AFID/padding span.
         var fidx = new List<long>(result.AfidLogicalOffsets);
-        fidx.Add(dataEnd);
+        fidx.AddRange(result.EmptyFileLogicalOffsets);
         fidx.Add(metaBase);
         fidx.Add(mountSize);
+        var fidxTypes = Enumerable.Repeat((byte)0, fidx.Count).ToArray();
+        foreach (ProsperoPs5SparseAfidHole hole in result.SparseAfidHoles)
+            fidxTypes[checked((int)hole.Afid)] = 0x40;
+        fidxTypes[^1] = 0x40;
 
         // Publisher header includes one terminal accounting ublock beyond ceil(mount/UBlock).
         int numUBlocks = checked((int)((mountSize + Ublock256K - 1) / Ublock256K) + 1);
@@ -195,19 +192,6 @@ public static class ProsperoNwonlyNapsGenerator
 
         List<NapsCblockPlanEntry> blocks =
             ProsperoNapsLayoutBuilder.DeriveDataRegionBlocks(files, runSet);
-        blocks.AddRange(result.SparseAfidHoles.Select(hole =>
-            new NapsCblockPlanEntry
-            {
-                StartRun = true,
-                OnDiskOffset = result.BlockInfoOnDiskOffset,
-                LogicalOffset = hole.LogicalOffset,
-                EvenChunkCompressedLength = 8,
-                StreamLength = 0x10,
-                Even = 1,
-                Odd = 1,
-                KdePredictor = 0,
-                ShuffleIndex = 0,
-            }));
         blocks = blocks
             .OrderBy(block => block.LogicalOffset)
             .ToList();
@@ -219,6 +203,7 @@ public static class ProsperoNwonlyNapsGenerator
                 NumUBlocks = numUBlocks,
                 NumOuterBlocks = numOuterBlocks,
                 FileLogicalOffsets = fidx,
+                FileOffsetTypes = fidxTypes,
                 Blocks = blocks,
                 OuterBlockDigests = outerBlockDigests,
             });

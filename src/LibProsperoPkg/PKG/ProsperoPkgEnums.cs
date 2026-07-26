@@ -112,7 +112,9 @@ public static class ProsperoPkgLayout
     public const int FihInnerImageLogicalSizeField = 0xA8;
     public const int FihContentVersionField = 0x9C;
     public const int FihOuterFileCountField = 0xF0;
+    public const int FihSparseAfidCountField = 0xF4;
     public const int FihFlatPathTableBlockCountField = 0xF8;
+    public const int FihEmptyFileCountField = 0xFC;
     public const uint FihOuterFileCount = 1;
     public const uint FihFlatPathTableBlockCount = 2;
 }

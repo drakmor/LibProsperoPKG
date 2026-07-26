@@ -274,7 +274,7 @@ This document describes the current LibProsperoPkg package-building and reading 
   `game`/`sblock`, `header`, `system`, `param`, `package`, `body`, and `fixed-info`. These are SHA3-256
   products, not separate keyed console secrets. Only direct use of the low-level `BuildPfsImageXml`
   API without completed CNT/FIH inputs can leave an all-zero placeholder, which is reported as a warning.
-- Byte-identical reproduction of a specific `nwonly` package remains limited by exact Kraken encoder choices at compression level 7. The generated package is valid and internally consistent, but downstream NAPS layout values and digests that depend on exact compressed bytes can differ.
+- Byte-identical reproduction of a specific `nwonly` package remains limited by exact Kraken encoder choices at compression level 7. The generated package is valid and internally consistent for the accepted differential corpora below, but downstream NAPS layout values and digests that depend on exact compressed bytes can differ. A 35-thousand-file Minecraft update corpus is still rejected early by Publishing Tools 2.79 despite matching file/directory trees and inner-PFS geometry; that large mixed-compression case is therefore not yet claimed compatible.
 - External cross-testing is explicit. A fresh C# matrix consisting of empty, small and multi-block
   AC, a complete SDK APP (ELF-to-SELF, two PRX, NP title, licenses and all required media), and PSAL
   was checked by Publishing Tools 2.79. APP and all AC cases pass
@@ -286,6 +286,46 @@ This document describes the current LibProsperoPkg package-building and reading 
   remain inputs for profiles that require them, and trusted provider results remain mandatory for
   standard Retail finalization. The recovered `obcc` pipeline was separately validated 3/3 against
   a fresh 2.79 build; the verified profile intentionally stores zero NAPS outer-block CMAC tags.
+- A second differential matrix now builds the same normal-rootdir GP5 with Publishing Tools 2.79
+  and `LibProsperoPkg`. It covers an empty file, an explicitly empty directory, sizes immediately
+  around 64/128/256-KiB boundaries, a 512-KiB file, a long nested path,
+  `dir_exclude`/`file_exclude`, and dense variants with 400, 1,000, 2,500, 5,000, 10,000 and
+  20,000 tiny files. The 400-file variant extracts to 424 byte-identical files and six identical
+  directories. Its native and managed outer PFS are both `0x290000` bytes; their AFID TSV maps are
+  identical (423 data-bearing paths and 13 sparse slots), all 445 normal CblockInfo records and
+  every mode count match, and the U2C maximum delta is 224 in both. The 20,000-file variant
+  extracts to 20,024 byte-identical files and the same six directories. Every generated package
+  is accepted by `prospero-pub-cmd img_info`; the one-record RUN difference in the 400-file case
+  is a valid compressor flush-schedule choice.
+- A separate large-outer APP uses four 289,426,675-byte hard-linked executable extents. Publishing
+  Tools produces outer PFS `0x451A0000`; the managed build produces `0x451C0000`. Both are accepted
+  by `img_info`, proving the signed indirect hierarchy, `imagedigs.dat`, CNT/FIH offsets and PlayGo
+  size accounting beyond one GiB. `img_verify --format_check on --integrity_check on` reaches
+  directory, consistency and both CRC stages for the managed result; its final errors concern the
+  intentionally invalid/missing test media and SELF metadata, not package format or integrity.
+- Normal GP5 input is now honored by the build pipeline rather than only by the GP5 object model:
+  omitted and explicit `rootdir src_path`, global/directory/file excludes, flat manifests,
+  recursive directory mappings, and virtual/non-virtual overlays are resolved into the inner tree.
+  The same exclusion policy is applied to outer CNT `sce_sys` discovery, preventing excluded DDS
+  files from being reintroduced as media entries.
+- Dense AFID/FIDX generation follows the publisher representation. Ordinal dirent traversal fixes
+  AFID order; sparse slots use FIDX type `0x40` and no private zero CblockInfo; zero-length files
+  retain inode/dirent metadata, add an unreferenced end boundary, and point their inode at the common
+  terminal FIDX. Ordinary stored files cross 64-KiB physical boundaries without padding; only
+  keystone/SELF bootstrap payloads force block alignment. These rules remove the former U2C
+  overflow and make the stock reader accept dense generated images. Empty files are likewise
+  omitted from the data-bearing `naps_meta_18` `file` table.
+- `BuildFromFsTree` and `BuildFromFsTreeToFile` preserve explicit `FSDir` nodes even when they have
+  no files. The flat-file API has an overload accepting `ProsperoPs5InnerDirectory`. Directory
+  entries are padded so no dirent crosses a 64-KiB metadata block. `PprPfsKrakenTool list-dirs`
+  reads directory paths directly from PFS inode/dirent data, which lets the differential test
+  verify empty directories instead of inferring them from extracted files.
+- FIH inner-image accounting no longer assumes that `naps_pkg_layout.dat` occupies one 64-KiB
+  block. `FIH+0x90` is derived as
+  `outerSuperblockBlock - ceil(napsLayoutSize / 0x10000)`, which is required for large APP layouts;
+  `+0x94` is `NumFiles-1`, `+0x98` is `NumFiles`, `+0xF4` is the sparse-AFID count, and `+0xFC`
+  is the zero-length-file count. `+0x9C` stores the complete content version as publisher BCD
+  (`01.044.000` → `0x01044000`), rather than only its leading byte.
 
 ## Summary table
 
@@ -320,13 +360,13 @@ This document describes the current LibProsperoPkg package-building and reading 
 | `pfsimage.xml` structural descriptor | Implemented, including all digest rows and `<chunkinfo>`/`<pfs-image>`/`<nested-image>` trees; the high-level builder is self-consistent, while incomplete direct low-level calls report any omitted digest inputs |
 | Keystone (`sce_sys/keystone`) | Implemented, byte-exact from passcode for version 2 and version 3 |
 | DDS BC7 texture generation | Implemented |
-| GP5 project model | Implemented, including AL, PlayGo languages/scenarios, content configs, implicit sources, and recursive rootdir overlays |
+| GP5 project model and build resolver | Implemented, including AL, PlayGo languages/scenarios, content configs, implicit/explicit rootdir sources, excludes, flat mappings, and recursive rootdir overlays |
 | PSAL direct CNT+SI profile | Implemented and accepted by Publishing Tools 2.79; backend-issued license artifacts remain inputs when required |
 | Deterministic package build | Implemented for PSAL and APP/PPR-NAPS; independently repeated builds are byte-identical |
 | File-backed APP/PPR-NAPS extraction | Implemented; bounded outer-XTS memory and stream-to-file NAPS decode |
 | NAPS layout parser and serializer | Implemented; confirmed field semantics and strict validation |
 | NAPS image planner and decoder | Implemented for raw/Kraken spans, sparse deduplicated zeros, identity and all 12 table-described non-identity shuffle transforms; non-zero KDE predictor still needs a reference vector |
-| NAPS streaming outer producer | Baseline monotonic Kraken/stored writer implemented and wired into CNT/FIH; explicit sparse AFID dedup-zero profiles round-trip, while KDE-predictor/shuffle selection and update/base reuse remain |
+| NAPS streaming outer producer | Baseline monotonic Kraken/stored writer implemented and wired into CNT/FIH; native FIDX `0x40` sparse AFIDs, empty-file terminal references and U2C-safe automatic placement are accepted by Publishing Tools 2.79, while KDE-predictor/shuffle selection and update/base reuse remain |
 | Standard Retail image (`0x80`) | Managed assembly/resealing implemented; trusted 0x300 FIH and 0x180 CNT results supplied through `IProsperoRetailFinalizationProvider` |
 | Standard Retail trailing metadata | Correctly omitted for the verified APP and AC profiles |
 | FGC/Flexible Content finalization | Managed token-v0/v1, PFS/FIH/CNT finalizer and CLI implemented without `fa.exe`/`sc2.exe`; genuine publisher-issued FGC corpus comparison remains |

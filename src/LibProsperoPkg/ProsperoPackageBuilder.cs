@@ -687,6 +687,8 @@ public static class ProsperoPackageBuilder
                 nwonlyContentVersionHi: siInputs?.ContentVersionHigh ?? 0,
                 nwonlyNapsFileCount: checked((int)(siInputs?.FihNapsFileCount ?? 0)),
                 nwonlyAppFileCount: siInputs?.AppFileCount ?? 0,
+                nwonlySparseAfidCount: siInputs?.SparseAfidCount ?? 0,
+                nwonlyEmptyFileCount: siInputs?.EmptyFileCount ?? 0,
                 outerSuperblockIndex: siInputs?.OuterSuperblockIndex ?? -1,
                 retailFinalizationProvider: options.RetailFinalizationProvider);
             warnings.AddRange(fihWarnings);

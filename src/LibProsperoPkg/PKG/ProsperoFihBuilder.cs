@@ -107,6 +107,8 @@ public static class ProsperoFihBuilder
     /// Number of nonterminal NAPS FIDX/file extents (<c>NumFiles - 1</c>).
     /// </param>
     /// <param name="nwonlyAppFileCount">Application-payload file count for the FIH file-count field.</param>
+    /// <param name="nwonlySparseAfidCount">Number of unused AFID slots represented by FIDX holes.</param>
+    /// <param name="nwonlyEmptyFileCount">Number of zero-length files with explicit FIDX end boundaries.</param>
     /// <param name="outerSuperblockIndex">
     /// Optional known 64-KiB block index of the outer superblock. Publisher builds pass it to avoid
     /// scanning a potentially hundreds-of-gigabytes PFS image.
@@ -123,6 +125,7 @@ public static class ProsperoFihBuilder
         byte[]? nestedImageDigest = null,
         long nestedImageSize = 0, long nestedMetaBaseBlocks = 0,
         uint nwonlyContentVersionHi = 0, int nwonlyNapsFileCount = 0, int nwonlyAppFileCount = 0,
+        int nwonlySparseAfidCount = 0, int nwonlyEmptyFileCount = 0,
         int outerSuperblockIndex = -1,
         IProsperoRetailFinalizationProvider? retailFinalizationProvider = null)
     {
@@ -186,7 +189,9 @@ public static class ProsperoFihBuilder
             nestedMetaBaseBlocks: nestedMetaBaseBlocks,
             nwonlyContentVersionHi: nwonlyContentVersionHi,
             nwonlyNapsFileCount: nwonlyNapsFileCount,
-            nwonlyAppFileCount: nwonlyAppFileCount);
+            nwonlyAppFileCount: nwonlyAppFileCount,
+            nwonlySparseAfidCount: nwonlySparseAfidCount,
+            nwonlyEmptyFileCount: nwonlyEmptyFileCount);
         if (variant == ProsperoFihVariant.Official)
             ApplyOfficialDigestSlots(header, metadata);
 
@@ -297,7 +302,8 @@ public static class ProsperoFihBuilder
         ProsperoFihVariant variant, ulong pfsImageSize, ulong embeddedCntOffset,
         byte[] image, System.Collections.Generic.List<string>? warnings = null,
         byte[]? nestedImageDigest = null, long nestedImageSize = 0, long nestedMetaBaseBlocks = 0,
-        uint nwonlyContentVersionHi = 0, int nwonlyNapsFileCount = 0, int nwonlyAppFileCount = 0)
+        uint nwonlyContentVersionHi = 0, int nwonlyNapsFileCount = 0, int nwonlyAppFileCount = 0,
+        int nwonlySparseAfidCount = 0, int nwonlyEmptyFileCount = 0)
     {
         var (sbOffsetInImage, gameDigest) =
             ProsperoImageDigests.ComputeSblockDigestFromImage(image);
@@ -306,7 +312,8 @@ public static class ProsperoFihBuilder
             variant, pfsImageSize, embeddedCntOffset,
             sbOffsetInImage, gameDigest, imageDigest, warnings,
             nestedImageDigest, nestedImageSize, nestedMetaBaseBlocks,
-            nwonlyContentVersionHi, nwonlyNapsFileCount, nwonlyAppFileCount);
+            nwonlyContentVersionHi, nwonlyNapsFileCount, nwonlyAppFileCount,
+            nwonlySparseAfidCount, nwonlyEmptyFileCount);
     }
 
     internal static byte[] BuildFihHeaderBlock(
@@ -315,7 +322,8 @@ public static class ProsperoFihBuilder
         System.Collections.Generic.List<string>? warnings = null,
         byte[]? nestedImageDigest = null, long nestedImageSize = 0,
         long nestedMetaBaseBlocks = 0, uint nwonlyContentVersionHi = 0,
-        int nwonlyNapsFileCount = 0, int nwonlyAppFileCount = 0)
+        int nwonlyNapsFileCount = 0, int nwonlyAppFileCount = 0,
+        int nwonlySparseAfidCount = 0, int nwonlyEmptyFileCount = 0)
     {
         ArgumentNullException.ThrowIfNull(imageDigest);
         if (imageDigest.Length != ProsperoImageDigests.DigestSize)
@@ -362,15 +370,18 @@ public static class ProsperoFihBuilder
 
             // ---- Outer-PFS / nested-image accounting. ----
             // The nwonly outer PFS uses the "data-first" layout
-            //   [pfs_image.dat blocks][naps_pkg_layout.dat block][superblock][structural metadata...],
-            // so the plaintext superblock sits exactly one block (the naps file) after the inner image.
-            //   0x90 inner-image (pfs_image.dat) block count = sbBlockIndex - 1
-            //   0x94 = 0x98 nonterminal NAPS FIDX count      = NumFiles-1 (nwonly), threaded in
-            //   0x9C content-version echo                     = contentVersion major BCD << 24
+            //   [pfs_image.dat blocks][naps_pkg_layout.dat blocks][superblock][structural metadata...].
+            // Small layouts occupy one block, but dense APP layouts span many blocks.
+            //   0x90 inner-image block count = sbBlockIndex - ceil(napsLayoutSize/blockSize)
+            //   0x94 nonterminal NAPS FIDX count              = NumFiles-1 (nwonly), threaded in
+            //   0x98 total NAPS FIDX count                    = NumFiles
+            //   0x9C content-version echo                     = full 8-digit BCD contentVersion
             //   0xA0 block-aligned inner-image size           = 0x90 * blockSize
             //   0xA8 naps_pkg_layout.dat (map[0xD]) length    = nestedImageSize (the 0xB0 digest preimage length)
             //   0xB0 nested-image-content digest              = SHA3-256(naps_pkg_layout.dat) [written below]
-            //   0xF0 app-payload (non-sce_sys) file count / 0xF8 flat-path-table accounting (=2)
+            //   0xF0 app-payload (non-sce_sys) file count
+            //   0xF4 sparse AFID-hole count / 0xF8 flat-path-table accounting (=2)
+            //   0xFC empty-file boundary count
             int blockSize = ProsperoPkgLayout.FihHeaderRegionSize;
             long sbBlockIndex = (long)sbOffsetInImage / blockSize;
             long totalBlocks = (long)pfsImageSize / blockSize;
@@ -378,14 +389,21 @@ public static class ProsperoFihBuilder
                 (long)pfsImageSize % blockSize == 0 && totalBlocks > sbBlockIndex)
             {
                 bool nwonly = nwonlyNapsFileCount > 0;
-                uint innerBlocks = (uint)(sbBlockIndex - 1);
-                // 0x94/0x98: number of nonterminal NAPS FIDX/file extents (NumFiles-1).  The
-                // terminal mount-boundary record is excluded.  The legacy non-nwonly path keeps
-                // its outer metadata-block count.
+                long napsLayoutBlocks = nwonly && nestedImageSize > 0
+                    ? checked((nestedImageSize + blockSize - 1) / blockSize)
+                    : 1;
+                if (napsLayoutBlocks <= 0 || napsLayoutBlocks > sbBlockIndex)
+                    throw new InvalidDataException(
+                        "The NAPS layout extent crosses the outer-PFS superblock.");
+                uint innerBlocks = checked((uint)(sbBlockIndex - napsLayoutBlocks));
+                // 0x94 is the number of nonterminal NAPS FIDX/file extents (NumFiles-1);
+                // 0x98 includes the terminal mount-boundary record (NumFiles).  The legacy
+                // non-nwonly path keeps its outer metadata-block count in both fields.
                 uint metaOrNapsFiles = nwonly ? (uint)nwonlyNapsFileCount : (uint)(totalBlocks - innerBlocks);
+                uint totalNapsFiles = nwonly ? checked(metaOrNapsFiles + 1u) : metaOrNapsFiles;
                 BinaryPrimitives.WriteUInt32LittleEndian(h.AsSpan(ProsperoPkgLayout.FihInnerImageBlockCountField), innerBlocks);
                 BinaryPrimitives.WriteUInt32LittleEndian(h.AsSpan(ProsperoPkgLayout.FihMetaBlockCountField), metaOrNapsFiles);
-                BinaryPrimitives.WriteUInt32LittleEndian(h.AsSpan(ProsperoPkgLayout.FihMetaBlockCountMirrorField), metaOrNapsFiles);
+                BinaryPrimitives.WriteUInt32LittleEndian(h.AsSpan(ProsperoPkgLayout.FihMetaBlockCountMirrorField), totalNapsFiles);
                 BinaryPrimitives.WriteUInt64LittleEndian(h.AsSpan(ProsperoPkgLayout.FihInnerImageSizeField), (ulong)innerBlocks * (ulong)blockSize);
 
                 // 0x9C: content-version echo (high 32 bits of the param/content_ver u64; major BCD in the top byte).
@@ -396,10 +414,18 @@ public static class ProsperoFihBuilder
                 if (nestedImageSize > 0)
                     BinaryPrimitives.WriteUInt64LittleEndian(h.AsSpan(ProsperoPkgLayout.FihInnerImageLogicalSizeField), (ulong)nestedImageSize);
 
-                // 0xF0/0xF8: outer-PFS inode accounting. 0xF0 = app-payload (non-sce_sys) file count;
-                // 0xF8 = flat-path-table accounting value.
+                // 0xF0..0xFC: publisher AFID/inode accounting.
                 uint outerFileCount = nwonly && nwonlyAppFileCount > 0 ? (uint)nwonlyAppFileCount : ProsperoPkgLayout.FihOuterFileCount;
                 BinaryPrimitives.WriteUInt32LittleEndian(h.AsSpan(ProsperoPkgLayout.FihOuterFileCountField), outerFileCount);
+                if (nwonly)
+                {
+                    BinaryPrimitives.WriteUInt32LittleEndian(
+                        h.AsSpan(ProsperoPkgLayout.FihSparseAfidCountField),
+                        checked((uint)nwonlySparseAfidCount));
+                    BinaryPrimitives.WriteUInt32LittleEndian(
+                        h.AsSpan(ProsperoPkgLayout.FihEmptyFileCountField),
+                        checked((uint)nwonlyEmptyFileCount));
+                }
                 BinaryPrimitives.WriteUInt32LittleEndian(h.AsSpan(ProsperoPkgLayout.FihFlatPathTableBlockCountField), ProsperoPkgLayout.FihFlatPathTableBlockCount);
             }
 

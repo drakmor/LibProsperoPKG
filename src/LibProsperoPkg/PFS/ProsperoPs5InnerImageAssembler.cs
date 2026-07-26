@@ -29,6 +29,16 @@ public sealed class ProsperoPs5InnerFile
     public required byte[] Data { get; init; }
 }
 
+/// <summary>
+/// One explicit directory to preserve in the PS5 nwonly inner image.  This is primarily needed for
+/// empty GP5 directories, which cannot be inferred from a flat file list.
+/// </summary>
+public sealed class ProsperoPs5InnerDirectory
+{
+    /// <summary>Absolute path from the user root, e.g. <c>/data/shaders</c>.</summary>
+    public required string Path { get; init; }
+}
+
 /// <summary>The assembled inner image plus the intermediate model (for verification/diagnostics).</summary>
 public sealed class ProsperoPs5InnerImageResult
 {
@@ -65,6 +75,12 @@ public sealed class ProsperoPs5InnerImageResult
 
     /// <summary>The per-file uncompressed logical start offsets, in afid order (the naps fidx values).</summary>
     public required IReadOnlyList<long> AfidLogicalOffsets { get; init; }
+
+    /// <summary>
+    /// Unreferenced FIDX boundaries emitted for zero-length files. Their inodes point at the common
+    /// terminal FIDX entry, matching the publisher's empty-file representation.
+    /// </summary>
+    public IReadOnlyList<long> EmptyFileLogicalOffsets { get; init; } = Array.Empty<long>();
 
     /// <summary>Per-file on-disk/logical placement (afid order), for naps generation.</summary>
     public IReadOnlyList<ProsperoPs5InnerPlacement> Placements { get; init; } = Array.Empty<ProsperoPs5InnerPlacement>();
@@ -221,7 +237,10 @@ public sealed class ProsperoPs5InnerImageAssembler
     /// assembler into <c>ProsperoPkgBuilder</c> for the nwonly Kraken format.
     /// </summary>
     public ProsperoPs5InnerImageResult BuildFromFsTree(FSDir uroot)
-        => Build(RenderFsTree(uroot));
+    {
+        RenderedFsTree tree = RenderFsTree(uroot);
+        return Build(tree.Files, tree.Directories);
+    }
 
     /// <summary>
     /// File-backed counterpart of <see cref="BuildFromFsTree"/>. The final physical image is written
@@ -229,9 +248,16 @@ public sealed class ProsperoPs5InnerImageAssembler
     /// is empty; metadata and per-file integrity inputs remain available in the result.
     /// </summary>
     public ProsperoPs5InnerImageResult BuildFromFsTreeToFile(FSDir uroot, string outputPath)
-        => BuildToFile(RenderFsTree(uroot), outputPath);
+    {
+        RenderedFsTree tree = RenderFsTree(uroot);
+        return BuildToFile(tree.Files, tree.Directories, outputPath);
+    }
 
-    private static IReadOnlyList<ProsperoPs5InnerFile> RenderFsTree(FSDir uroot)
+    private sealed record RenderedFsTree(
+        IReadOnlyList<ProsperoPs5InnerFile> Files,
+        IReadOnlyList<ProsperoPs5InnerDirectory> Directories);
+
+    private static RenderedFsTree RenderFsTree(FSDir uroot)
     {
         ArgumentNullException.ThrowIfNull(uroot);
         var files = new List<ProsperoPs5InnerFile>();
@@ -242,7 +268,10 @@ public sealed class ProsperoPs5InnerImageAssembler
             f.Write(ms);
             files.Add(new ProsperoPs5InnerFile { Path = f.FullPath(), Data = ms.ToArray() });
         }
-        return files;
+        var directories = uroot.GetAllChildrenDirs()
+            .Select(directory => new ProsperoPs5InnerDirectory { Path = directory.FullPath() })
+            .ToList();
+        return new RenderedFsTree(files, directories);
     }
 
     // A sce_sys file whose sce_sys-relative name is a known outer-CNT entry is carried in the OUTER
@@ -262,26 +291,46 @@ public sealed class ProsperoPs5InnerImageAssembler
 
     /// <summary>Assembles the inner image from the supplied files.</summary>
     public ProsperoPs5InnerImageResult Build(IReadOnlyList<ProsperoPs5InnerFile> files)
-        => BuildCore(files, outputPath: null);
+        => BuildCore(files, directories: null, outputPath: null);
+
+    /// <summary>
+    /// Assembles the inner image from files and an explicit directory list.  Parent directories may
+    /// be omitted because they are inferred; explicitly listed empty leaf directories are retained.
+    /// </summary>
+    public ProsperoPs5InnerImageResult Build(
+        IReadOnlyList<ProsperoPs5InnerFile> files,
+        IReadOnlyList<ProsperoPs5InnerDirectory> directories)
+        => BuildCore(files, directories, outputPath: null);
 
     /// <summary>Assembles the inner image directly into a file without retaining its full bytes.</summary>
     public ProsperoPs5InnerImageResult BuildToFile(
         IReadOnlyList<ProsperoPs5InnerFile> files, string outputPath)
+        => BuildToFile(files, directories: null, outputPath);
+
+    /// <summary>
+    /// File-backed counterpart accepting explicit directories, including empty GP5 directories.
+    /// </summary>
+    public ProsperoPs5InnerImageResult BuildToFile(
+        IReadOnlyList<ProsperoPs5InnerFile> files,
+        IReadOnlyList<ProsperoPs5InnerDirectory>? directories,
+        string outputPath)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(outputPath);
         string fullPath = Path.GetFullPath(outputPath);
         Directory.CreateDirectory(Path.GetDirectoryName(fullPath) ?? Directory.GetCurrentDirectory());
-        return BuildCore(files, fullPath);
+        return BuildCore(files, directories, fullPath);
     }
 
     private ProsperoPs5InnerImageResult BuildCore(
-        IReadOnlyList<ProsperoPs5InnerFile> files, string? outputPath)
+        IReadOnlyList<ProsperoPs5InnerFile> files,
+        IReadOnlyList<ProsperoPs5InnerDirectory>? directories,
+        string? outputPath)
     {
         ArgumentNullException.ThrowIfNull(files);
         if (files.Count == 0)
             throw new ArgumentException("At least one inner file is required.", nameof(files));
 
-        Dir uroot = BuildTree(files);
+        Dir uroot = BuildTree(files, directories);
 
         // ---- 1. Assign inodes. ---------------------------------------------------------------------
         // 0 = super-root, 1..3 = the three internal metadata files, 4 = uroot, then sub-directories in
@@ -326,20 +375,63 @@ public sealed class ProsperoPs5InnerImageAssembler
                 .OrderBy(SystemAfidRank)
                 .ThenBy(f => f.FullPath, StringComparer.Ordinal));
         }
-        // Publisher AFIDs use directory post-order outside sce_sys: descendants first, then files
-        // directly in uroot.  For an APP this places data/* before the root eboot.bin.  Inode
-        // numbering remains the independent post-order rule above.
-        foreach (var d in dirsPostOrder)
-            if (d != sceSys && !IsUnder(d, sceSys))
-                foreach (var f in d.Files.OrderBy(f => f.Name, StringComparer.Ordinal))
-                    afidOrder.Add(f);
-        // Files directly in uroot are covered last because uroot is the last post-order directory.
+        // Outside sce_sys the publisher walks the merged directory-entry namespace in ordinal
+        // order. A directory is recursed when its name is encountered among sibling files. Thus a
+        // data/{aaa-dir,edge.bin,zzz-dir} tree places aaa-dir/*, edge.bin, zzz-dir/* in that order.
+        // Inode numbering remains the independent post-order rule above.
+        CollectFilesEntryOrder(uroot, sceSys, afidOrder);
+        // Zero-length files retain inode/dirent metadata but do not consume a normal AFID/FIDX data
+        // slot. Their inode points at the common terminal FIDX marker assigned below.
+        List<FileNode> emptyFiles = afidOrder
+            .Where(file => file.Data.Length == 0)
+            .ToList();
+        afidOrder.RemoveAll(file => file.Data.Length == 0);
+
         List<FileNode?> afidSlots;
         if (_explicitAfids is null)
         {
-            afidSlots = afidOrder.Cast<FileNode?>().ToList();
-            for (uint a = 0; a < afidOrder.Count; a++)
-                afidOrder[(int)a].Afid = a;
+            // The publisher does not leave a very dense sequence of tiny AFID files packed into one
+            // logical 256-KiB window. U2C stores seven CblockInfo deltas relative to one base as u8,
+            // so at most 255 CBI records may begin across each group of eight logical windows.
+            //
+            // Real large APP corpora implement this by inserting empty AFID slots. Every slot advances
+            // the logical stream by exactly 0x40000 and later becomes the shared 16-byte zero token.
+            // Minecraft's native image starts with holes 28,59,90,121,152...: the first window admits
+            // 28 AFID starts (two later non-AFID FIDX boundaries consume the reserve), following
+            // windows admit 30. Large files naturally advance to a new window and reset the budget.
+            // This keeps generated U2C deltas representable without requiring a captured AFID map.
+            const int FirstWindowAfidStarts = 28;
+            const int LaterWindowAfidStarts = 30;
+            const long NapsWindow = 0x40000;
+            afidSlots = [];
+            long predictedLogicalOffset = 0;
+            long currentWindow = -1;
+            int startsInWindow = 0;
+            foreach (FileNode file in afidOrder)
+            {
+                long window = predictedLogicalOffset / NapsWindow;
+                if (window != currentWindow)
+                {
+                    currentWindow = window;
+                    startsInWindow = 0;
+                }
+                int limit = currentWindow == 0
+                    ? FirstWindowAfidStarts
+                    : LaterWindowAfidStarts;
+                if (startsInWindow >= limit)
+                {
+                    afidSlots.Add(null);
+                    predictedLogicalOffset = checked(predictedLogicalOffset + NapsWindow);
+                    currentWindow = predictedLogicalOffset / NapsWindow;
+                    startsInWindow = 0;
+                }
+
+                file.Afid = checked((uint)afidSlots.Count);
+                afidSlots.Add(file);
+                predictedLogicalOffset = checked(
+                    predictedLogicalOffset + file.Data.LongLength);
+                startsInWindow++;
+            }
         }
         else
         {
@@ -391,6 +483,10 @@ public sealed class ProsperoPs5InnerImageAssembler
             .Where(file => file is not null)
             .Select(file => file!)
             .ToList();
+        uint terminalAfid = checked(
+            (uint)afidSlots.Count + (uint)emptyFiles.Count + 1);
+        foreach (FileNode emptyFile in emptyFiles)
+            emptyFile.Afid = terminalAfid;
 
         static string NormalizeAfidPath(string path)
         {
@@ -460,10 +556,7 @@ public sealed class ProsperoPs5InnerImageAssembler
                 if (fileBackedData is not null)
                 {
                     byte[] onDisk = f.OnDiskData!;
-                    bool alignBefore =
-                        f.WholeBlockRaw ||
-                        (f.StoreRaw && fileBackedDataEnd % BlockSize != 0 &&
-                         onDisk.LongLength > BlockSize - fileBackedDataEnd % BlockSize);
+                    bool alignBefore = f.WholeBlockRaw;
                     if (alignBefore)
                         fileBackedDataEnd = RoundUp(fileBackedDataEnd, BlockSize);
                     f.OnDiskOffset = fileBackedDataEnd;
@@ -476,6 +569,8 @@ public sealed class ProsperoPs5InnerImageAssembler
                     f.OnDiskData = null;
                 }
             }
+            foreach (FileNode emptyFile in emptyFiles)
+                emptyFile.LogicalOffset = cursor;
         }
         finally
         {
@@ -548,6 +643,9 @@ public sealed class ProsperoPs5InnerImageAssembler
             Nodes = nodes,
             Ndblock = ndblock,
             AfidLogicalOffsets = afidOffsets,
+            EmptyFileLogicalOffsets = emptyFiles
+                .Select(file => file.LogicalOffset)
+                .ToArray(),
             Placements = placements,
             SparseAfidHoles = sparseAfidHoles,
             BlockInfoOnDiskOffset = blockInfoOnDisk,
@@ -561,7 +659,9 @@ public sealed class ProsperoPs5InnerImageAssembler
 
     // ---- Tree construction -------------------------------------------------------------------------
 
-    private static Dir BuildTree(IReadOnlyList<ProsperoPs5InnerFile> files)
+    private static Dir BuildTree(
+        IReadOnlyList<ProsperoPs5InnerFile> files,
+        IReadOnlyList<ProsperoPs5InnerDirectory>? directories)
     {
         var uroot = new Dir { Name = "uroot", FullPath = "" };
         var dirLookup = new Dictionary<string, Dir>(StringComparer.Ordinal) { [""] = uroot };
@@ -587,6 +687,18 @@ public sealed class ProsperoPs5InnerImageAssembler
                 .Equals("eboot.bin", StringComparison.Ordinal));
         if (!isApplication)
             _ = GetDir("data");
+
+        if (directories is not null)
+        {
+            foreach (ProsperoPs5InnerDirectory directory in directories
+                         .OrderBy(directory => directory.Path, StringComparer.Ordinal))
+            {
+                ArgumentException.ThrowIfNullOrWhiteSpace(directory.Path);
+                string path = directory.Path.Replace('\\', '/').Trim('/');
+                if (path.Length != 0)
+                    _ = GetDir(path);
+            }
+        }
 
         foreach (var f in files.OrderBy(f => f.Path, StringComparer.Ordinal))
         {
@@ -626,6 +738,26 @@ public sealed class ProsperoPs5InnerImageAssembler
             outList.Add(f);
         foreach (var d in dir.SubDirs.OrderBy(d => d.Name, StringComparer.Ordinal))
             CollectFilesPreOrder(d, outList);
+    }
+
+    private static void CollectFilesEntryOrder(
+        Dir directory,
+        Dir? excludedSubtree,
+        List<FileNode> outList)
+    {
+        IEnumerable<(string Name, Dir? Directory, FileNode? File)> entries =
+            directory.SubDirs
+                .Where(child => child != excludedSubtree && !IsUnder(child, excludedSubtree))
+                .Select(child => (child.Name, (Dir?)child, (FileNode?)null))
+                .Concat(directory.Files.Select(file => (file.Name, (Dir?)null, (FileNode?)file)))
+                .OrderBy(entry => entry.Name, StringComparer.Ordinal);
+        foreach ((_, Dir? child, FileNode? file) in entries)
+        {
+            if (file is not null)
+                outList.Add(file);
+            else if (child is not null)
+                CollectFilesEntryOrder(child, excludedSubtree, outList);
+        }
     }
 
     private static bool IsUnder(Dir dir, Dir? ancestor)
@@ -671,13 +803,27 @@ public sealed class ProsperoPs5InnerImageAssembler
         foreach (var f in dir.Files.OrderBy(f => f.Name, StringComparer.Ordinal))
             dir.Dirents.Add(new PfsDirent { Name = f.Name, InodeNumber = f.Inode, Type = DirentType.File });
 
-        // Resolve each child's byte offset within this dirent block.
+        // A dirent may not straddle a 64-KiB directory block. Publisher consumes the unused tail
+        // by enlarging the preceding record's EntSize, so the next record begins at the following
+        // block. Without this rule a dense directory is readable until the first crossing and then
+        // the reader interprets the second half of a name as a new header.
         int off = 0;
         var byName = new Dictionary<string, int>(StringComparer.Ordinal);
-        foreach (var e in dir.Dirents)
+        for (int i = 0; i < dir.Dirents.Count; i++)
         {
+            PfsDirent e = dir.Dirents[i];
+            int inBlock = off % BlockSize;
+            int remaining = BlockSize - inBlock;
+            if (inBlock != 0 && e.EntSize > remaining)
+            {
+                if (i == 0)
+                    throw new InvalidDataException("The first directory entry exceeds one block.");
+                dir.Dirents[i - 1].EntSize = checked(
+                    dir.Dirents[i - 1].EntSize + remaining);
+                off = checked(off + remaining);
+            }
             byName[e.Name] = off;
-            off += e.EntSize;
+            off = checked(off + e.EntSize);
         }
         foreach (var d in dir.SubDirs)
             d.DirentOffsetInParent = byName[d.Name];
@@ -917,28 +1063,6 @@ public sealed class ProsperoPs5InnerImageAssembler
 
     // ---- Data-first image --------------------------------------------------------------------------
 
-    /// <summary>
-    /// Computes the on-disk block index of the block-info table = the block-aligned end of the packed data
-    /// files (raw files block-aligned, compressed files packed), matching ProsperoPs5InnerImageBuilder.Build.
-    /// </summary>
-    private static long ComputeDataRegionBlocks(List<FileNode> afidOrder)
-    {
-        long pos = 0;
-        foreach (var f in afidOrder)
-        {
-            byte[] data = f.OnDiskData!;
-            // Raw files (keystone + executable modules) start block-aligned; the keystone additionally
-            // occupies whole blocks so the data region begins on a fresh block after it. Compressed app
-            // data packs contiguously.
-            if (f.StoreRaw)
-                pos = RoundUp(pos, BlockSize);
-            pos += data.Length;
-            if (f.WholeBlockRaw)
-                pos = RoundUp(pos, BlockSize);
-        }
-        return RoundUp(pos, BlockSize) / BlockSize;
-    }
-
     private byte[] BuildImage(
         List<FileNode> afidOrder, byte[] metaPlain, long logicalDataEnd,
         string? outputPath, long prewrittenDataEnd,
@@ -951,12 +1075,8 @@ public sealed class ProsperoPs5InnerImageAssembler
         // Build payloads with the on-disk packing rule and compute each file's on-disk offset by
         // replaying the same layout the builder performs.
         //   - keystone (WholeBlockRaw): anchors its own whole block (block-aligned before + after).
-        //   - other raw modules: pack contiguously into the current block, but a module that does not fit
-        //     in the current block's remainder starts a fresh block. A module already sitting on a block
-        //     boundary never needs realignment. The metadata/mount geometry stays derived from the
-        //     block-aligned data-region count (ComputeDataRegionBlocks), so packing only shrinks the
-        //     on-disk image; metaBase/ndblock (mount size) are unchanged.
-        //   - compressed app data: packs contiguously.
+        //   - every other raw or compressed data file packs contiguously. Crossing a 64-KiB physical
+        //     boundary is allowed and does not open an artificial RUN.
         var payloads = new List<ProsperoPs5InnerPayload>();
         long pos = outputPath is null ? 0 : prewrittenDataEnd;
         if (outputPath is null)
@@ -964,10 +1084,7 @@ public sealed class ProsperoPs5InnerImageAssembler
             foreach (var f in afidOrder)
             {
                 bool alignAfter = f.WholeBlockRaw;
-                bool alignBefore =
-                    f.WholeBlockRaw ||
-                    (f.StoreRaw && pos % BLK != 0 &&
-                     f.OnDiskData!.Length > BLK - pos % BLK);
+                bool alignBefore = f.WholeBlockRaw;
 
                 var p = new ProsperoPs5InnerPayload
                 {

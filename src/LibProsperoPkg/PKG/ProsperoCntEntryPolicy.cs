@@ -21,7 +21,8 @@ public static class ProsperoCntEntryPolicy
 
     /// <summary>Returns the profile for one entry and package volume type.</summary>
     public static ProsperoCntEntryProfile Resolve(
-        uint id, ProsperoVolumeType volumeType, string? relativeName = null)
+        uint id, ProsperoVolumeType volumeType, string? relativeName = null,
+        string? applicationDrmType = null)
     {
         return id switch
         {
@@ -39,7 +40,13 @@ public static class ProsperoCntEntryPolicy
                 Protected(keyIndex: 3, includeName: false),
             (uint)EntryId.LICENSE_INFO =>
                 Protected(
-                    keyIndex: volumeType == ProsperoVolumeType.Application ? 2 : 4,
+                    // A base GD/application license uses key 2. An upgradable APP is the
+                    // patch/upgrade profile and uses the same key-4 license.info wrapping
+                    // observed for AC/AL, despite retaining content_type 0x20.
+                    keyIndex: volumeType == ProsperoVolumeType.Application &&
+                              !IsUpgradableApplication(applicationDrmType)
+                        ? 2
+                        : 4,
                     includeName: false),
             (uint)EntryId.NPTITLE_DAT or
             (uint)EntryId.NPBIND_DAT or
@@ -64,4 +71,7 @@ public static class ProsperoCntEntryPolicy
         relativeName is not null &&
         (relativeName.Equals("npbind.dat", StringComparison.OrdinalIgnoreCase) ||
          relativeName.EndsWith("/npbind.dat", StringComparison.OrdinalIgnoreCase));
+
+    private static bool IsUpgradableApplication(string? applicationDrmType) =>
+        applicationDrmType?.Equals("upgradable", StringComparison.OrdinalIgnoreCase) == true;
 }

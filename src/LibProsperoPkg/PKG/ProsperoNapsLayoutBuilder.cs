@@ -79,6 +79,13 @@ public sealed class NapsGenerationRequest
     /// total inner logical size and is emitted with <see cref="FinalFileOffsetType"/>.</summary>
     public required IReadOnlyList<long> FileLogicalOffsets { get; init; }
 
+    /// <summary>
+    /// Optional per-entry FIDX types. When present it must have exactly
+    /// <see cref="FileLogicalOffsets"/>.Count elements. Publisher sparse AFID slots use type
+    /// <c>0x40</c>; ordinary file and metadata-boundary entries use zero.
+    /// </summary>
+    public IReadOnlyList<byte>? FileOffsetTypes { get; init; }
+
     /// <summary>Type byte for the final (total-size) fidx entry.</summary>
     public byte FinalFileOffsetType { get; init; } = 0x40;
 
@@ -133,12 +140,15 @@ public sealed class NapsFilePlacement
 /// <para>Generation rules:</para>
 /// <list type="bullet">
 /// <item>A RUN-base record re-bases the compressed cursor: <c>coffEnd = cursor mod 0x40000</c> (captured
-/// before the reset), <c>CoffsetStart256K = 2*floor(onDisk/0x40000)</c>, <c>TweakIdxStart = onDisk &gt;&gt; 15</c>
-/// (0 for the terminator), then the cursor resets to <c>absC = 2*onDisk - (onDisk mod 0x40000)</c>.</item>
-/// <item>A STD record: <c>CoffsetStartMod256K = cursor mod 0x40000</c>, <c>UoffsetStart = (2*(logical mod
-/// 0x40000)) &amp; 0x3FFFF</c>, <c>ClenEvenMinus1 = min(2*(evenComp-1), 0x1FFFE)</c>, plus the even/odd/kde/shuf
+/// before the reset), <c>CoffsetStart256K = floor(onDisk/0x40000)</c>,
+/// <c>TweakIdxStart = onDisk &gt;&gt; 16</c> (0 for the terminator), then the cursor resets to
+/// <c>onDisk</c>.</item>
+/// <item>A STD record: <c>CoffsetStartMod256K = cursor mod 0x40000</c>,
+/// <c>UoffsetStart = logical mod 0x40000</c>,
+/// <c>ClenEvenMinus1 = min(evenComp-1, 0x1FFFF)</c>, plus the even/odd/kde/shuf
 /// flags. The cursor then advances by the block's stream length.</item>
-/// <item>The terminator STD is a sentinel: <c>UoffsetStart = 1</c>, <c>ClenEvenMinus1 = 1</c>, all flags 0.</item>
+/// <item>The terminator STD is a sentinel at the mount boundary: reserved bit 19 is set,
+/// <c>ClenEvenMinus1 = 0</c>, and all mode flags are zero.</item>
 /// <item>u2c packs a per-ublock "first CblockInfo index" table <c>I[u]</c> = the index of the first STD whose
 /// logical start &gt;= <c>u*0x40000</c> (missing ublocks point at the terminator index), in a phase-shifted
 /// 8-block grouping.</item>
@@ -161,6 +171,13 @@ public static class ProsperoNapsLayoutBuilder
             throw new ArgumentException("A naps generation request needs at least one block.", nameof(request));
         if (request.FileLogicalOffsets is null || request.FileLogicalOffsets.Count == 0)
             throw new ArgumentException("A naps generation request needs the afid logical offset table.", nameof(request));
+        if (request.FileOffsetTypes is not null &&
+            request.FileOffsetTypes.Count != request.FileLogicalOffsets.Count)
+        {
+            throw new ArgumentException(
+                "The optional FIDX type table must match the logical-offset table.",
+                nameof(request));
+        }
 
         (List<NapsCblockInfoEntry> cblockInfos, List<(int Index, long Logical)> stdLogical) = WalkBlocks(request.Blocks);
 
@@ -224,6 +241,12 @@ public static class ProsperoNapsLayoutBuilder
 
         foreach (NapsFilePlacement f in files)
         {
+            // Empty files still have an AFID/FIDX entry, but occupy no bytes in the logical or
+            // physical stream.  The publisher therefore emits no STD CblockInfo for them.  Trying
+            // to describe an empty stored tail would encode (length - 1) as 0xFFFFFFFF.
+            if (f.UncompressedSize == 0 && f.OnDiskSize == 0)
+                continue;
+
             if (f.StoreRaw)
             {
                 long full = f.UncompressedSize / UBlock;
@@ -244,7 +267,7 @@ public static class ProsperoNapsLayoutBuilder
                         ShuffleIndex = 0,
                     });
                 }
-                if (tail > 0 || full == 0)
+                if (tail > 0)
                 {
                     long onDisk = f.OnDiskOffset + full * UBlock;
                     blocks.Add(new NapsCblockPlanEntry
@@ -435,7 +458,9 @@ public static class ProsperoNapsLayoutBuilder
         var list = new List<NapsFileOffsetEntry>(fileCount);
         for (int i = 0; i < fileCount; i++)
         {
-            byte type = (i == fileCount - 1) ? request.FinalFileOffsetType : (byte)0;
+            byte type = request.FileOffsetTypes is not null
+                ? request.FileOffsetTypes[i]
+                : (i == fileCount - 1) ? request.FinalFileOffsetType : (byte)0;
             list.Add(new NapsFileOffsetEntry(type, (ulong)request.FileLogicalOffsets[i]));
         }
         return list;
