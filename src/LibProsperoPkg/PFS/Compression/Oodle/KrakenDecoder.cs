@@ -55,14 +55,14 @@ internal static class KrakenDecoder
     /// offset; the final literal tail is reported as (tailLen, 0, 0, -1). Used by diagnostics
     /// to extract the reference parse from a real chunk. Null in production (zero cost).
     /// </summary>
-    internal static System.Action<int, int, int, int>? ParseTrace;
+    internal static System.Action<int, int, int, int>? ParseTrace = null;
 
     /// <summary>
     /// Diagnostic seam: when non-null, invoked with (label, srcOffset) at each newLZ array boundary
     /// ("litStart", "litEnd", "cmdEnd", "offsEnd", "litlenEnd"). Lets a diagnostic map which entropy
     /// array a byte-divergence falls in. Null in production (zero cost).
     /// </summary>
-    internal static System.Action<string, int>? ArrayTrace;
+    internal static System.Action<string, int>? ArrayTrace = null;
 
     // Boundary flag byte bits (the on-disk id=3 entry's per-chunk markers).
     // The low nibble describes the first sub-chunk, the high nibble the second: a 256 KiB block is two
@@ -1115,7 +1115,10 @@ internal static class KrakenDecoder
         public int OutOff, OutEnd;
         public HuffReader(byte[] b, byte[] o) : this()
         {
-            B = b; Out = o;
+            B = b;
+            Out = o;
+            SrcBits = SrcMidBits = SrcEndBits = 0;
+            SrcBitpos = SrcMidBitpos = SrcEndBitpos = 0;
         }
     }
 

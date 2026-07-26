@@ -1070,7 +1070,7 @@ internal static class OodleKrakenEncoder
     /// (<see cref="ParseOptimal"/>) instead of the value-model greedy <see cref="Parse"/>. Default off:
     /// the greedy parse is the validated production default until the DP is byte-identical to the reference.
     /// </summary>
-    internal static bool UseOptimalParse;
+    internal static bool UseOptimalParse = false;
 
     /// <summary>
     /// Production switch (default ON) for the Optimal3 multi-candidate parse on single-chunk
@@ -1223,7 +1223,7 @@ internal static class OodleKrakenEncoder
     /// histogram decay to the greedy seed Tally before the single DP pass builds its cost tables, exactly
     /// as the does for a standalone level-7 chunk. Thread-static so the production path is unaffected.
     /// </summary>
-    [ThreadStatic] internal static bool UseSeedDecay;
+    [ThreadStatic] internal static bool UseSeedDecay = false;
 
     /// <summary>
     /// Diagnostic (default off): run the level-7 forward DP with the suffix-trie match finder
@@ -1248,7 +1248,7 @@ internal static class OodleKrakenEncoder
     /// long matches (≥128 B, e.g. the rep8_4k/zeros4k 4080-byte runs), creating thousands of extra arrivals.
     /// Thread-static, default off so the production path is byte-identical to before; A/B'd via diagnostic comparison.
     /// </summary>
-    [ThreadStatic] internal static bool UseSublenGate;
+    [ThreadStatic] internal static bool UseSublenGate = false;
 
     /// <summary>the sublen-fill window high bound (level 7 ⇒ 128).</summary>
     private const int SublenFillThreshold = 128;
@@ -1272,7 +1272,7 @@ internal static class OodleKrakenEncoder
     /// production path is unchanged; A/B'd via diagnostic comparison (must extend EXTSEED call0 past cmd-20 while keeping the
     /// zeros/rep8_4k vectors byte-exact).
     /// </summary>
-    [ThreadStatic] internal static bool UseTieBreakLast;
+    [ThreadStatic] internal static bool UseTieBreakLast = false;
 
     /// <summary>
     /// Diagnostic (default off): run <see cref="ForwardDp"/> as the reference's LIMITED-LOOKAHEAD, GREEDY-COMMITTED,
@@ -1289,7 +1289,7 @@ internal static class OodleKrakenEncoder
     /// post-decay greedy Tally) to be threaded into <see cref="ForwardDp"/>; when null the classic single-pass DP runs
     /// unchanged (preserving the shipped manifest.json 279==279 byte-identity). Thread-static, default off.
     /// </summary>
-    [ThreadStatic] internal static bool UseWindowedParse;
+    [ThreadStatic] internal static bool UseWindowedParse = false;
 
     /// <summary>The optimal-parse frontier: the furthest position any relaxation has
     /// reached in the current segment. Updated by <see cref="RelaxRep"/>/<see cref="RelaxNew"/>/<see cref="Faef0"/>
@@ -1309,24 +1309,24 @@ internal static class OodleKrakenEncoder
     /// dumps the final arrival row (cost, src, lrl, ml, idx, dist, reps) for every position in
     /// <c>[DpProbeLo, DpProbeHi]</c> after the forward pass. Lets the diagnostic see exactly which arrivals the DP
     /// materialized at the cmd-20 reconvergence (is the match@556→arrival[603] path even created?).</summary>
-    [ThreadStatic] internal static int DpProbeLo;
+    [ThreadStatic] internal static int DpProbeLo = 0;
     /// <summary>Upper bound (inclusive) of the <see cref="DpProbeLo"/> arrival dump; 0 disables.</summary>
-    [ThreadStatic] internal static int DpProbeHi;
+    [ThreadStatic] internal static int DpProbeHi = 0;
     /// <summary>Diagnostic (default 0 = off): when a rep/new relax writes (or attempts) arr[DiagWatchDst],
     /// log pos / ml / loi / base / matchcost / total / won. Pins which path sets a contested arrival cost.</summary>
-    [ThreadStatic] internal static int DiagWatchDst;
+    [ThreadStatic] internal static int DiagWatchDst = 0;
     /// <summary>Diagnostic / reference diagnostic ONLY (default null): when set, <see cref="FindCandidates"/>
     /// ignores the managed hash-chain finder and instead reads the captured per-position match table —
     /// a flat array of <c>npos*8</c> ints (4 <c>(len,dist)</c> pairs/pos, length-descending, len&lt;=0 terminator),
     /// exactly the suffix-trie match finder output in <c>finder_call1.bin</c>. Used to prove the LZ-parse gap is
     /// 100% the finder (len-2/3 short matches the 4-byte-hash finder can't surface) without implementing the trie.</summary>
-    [ThreadStatic] internal static int[]? DiagExternalFinder;
+    [ThreadStatic] internal static int[]? DiagExternalFinder = null;
 
     /// <summary>DIAGNOSTIC only: raw 0x1808-byte codecost blob captured live from the reference
     /// encoder. When set, <see cref="DiagDpFromExternalPassinfo"/> drives the DP
     /// with this EXACT codecost (via <see cref="KrakenOptimalCost.FromRawBlob"/>) instead of building from
     /// the passinfo seed — isolating "wrong codecost" from "wrong DP recurrence".</summary>
-    [ThreadStatic] internal static byte[]? DiagExternalCodeCostBlob;
+    [ThreadStatic] internal static byte[]? DiagExternalCodeCostBlob = null;
 
     /// <summary>Diagnostic (default null): when non-null, <see cref="ForwardDp"/> copies its final
     /// per-position arrival table into this array right after the forward pass (before the backward trace),
@@ -1351,7 +1351,7 @@ internal static class OodleKrakenEncoder
     /// candidates perturbs the greedy <c>Tally</c> histogram that seeds the one-DP-pass cost tables. Thread-static
     /// so the production path (which never sees dist&lt;8) is byte-identical to before.
     /// </summary>
-    [ThreadStatic] internal static bool UseTinyOffsetRemap;
+    [ThreadStatic] internal static bool UseTinyOffsetRemap = false;
 
     /// <summary>
     /// <c>tiny-offset round-up</c> table (read byte-exact against reference behavior): maps a

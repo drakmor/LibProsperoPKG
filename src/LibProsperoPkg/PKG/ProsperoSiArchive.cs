@@ -23,20 +23,18 @@
 // * naps_meta_300/301/302/308.dat -> reproduced byte-exact by ProsperoNapsMeta.BuildMeta300 (a
 // plaintext 48-byte descriptor derived from the inner-image geometry; validated against three reference
 // debug packages).
-// * Several pfsimage.xml <digests> are reproducible and should be supplied by the builder:
+// * Every pfsimage.xml digest is reproducible and is supplied by the high-level builder:
 // game-digest (== inner sblock-digest, SHA3-256 of the plaintext outer superblock), param-digest
 // (SHA3-256 of the param.json CNT entry), body-digest, fixed-info-digest, package-digest
 // (== SHA3-256(CNT[0:0xFE0]), ProsperoImageDigests.ComputePackageDigest, identical to the value the
 // produced CNT stores at +0xFE0), and the full GeneralDigests set — content-digest, header-digest,
 // system-digest, playgo-digest and the target slot (all SHA3-256 of plaintext CNT regions / per-entry
 // digests, ProsperoPkgBuilder.ComputeGeneralDigests, Validated byte-exact against the reference debug
-// packages). When the produced CNT bytes are available, pass these via the corresponding options
-// rather than leaving placeholders.
-// * The remaining members are not reproducible off-console: the distinct FIH 0xB0 slot (a best-effort
-// nested-image-content hash), the keyed/encrypted naps_meta_18.dat metric blob, and the 68-byte
-// playgo-chunk.crc. They are accepted as inputs and emitted verbatim. When a caller does
-// not have them, all-zero placeholders are written for the XML digests and the keyed standalone
-// members are omitted - they are never fabricated.
+// packages). Direct low-level callers can pass these through ProsperoPfsImageXmlOptions; omission
+// produces explicit warnings and zero placeholders.
+// * naps_meta_18.dat is generated and AES-XTS encrypted from the built image geometry, locally
+// derived PFS image key and seed. playgo-chunk.crc is generated from the finalized mount image.
+// Publisher-authored values may still be supplied as byte-exact overrides.
 // See LibProsperoPKG/docs/implementation-status.md.
 
 using LibProsperoPkg.PFS;
@@ -59,7 +57,8 @@ public readonly record struct ProsperoSiMember(string Path, byte[] Content);
 /// One <c>&lt;entry&gt;</c> of the <c>pfsimage.xml</c> <c>&lt;entries&gt;</c> table: a single CNT
 /// (sce_sys) file with its byte offset and size inside the finalized container body. These values
 /// are known to the builder once it has laid out the inner image, so the table is fully
-/// reproducible (unlike the keyed digests).
+/// reproducible. The high-level package builder also derives the digest values from the completed
+/// CNT/FIH; only direct low-level XML construction may need them supplied explicitly.
 /// </summary>
 /// <param name="Name">CNT entry name, e.g. <c>imagedigs.dat</c>.</param>
 /// <param name="Offset">Byte offset of the entry inside the container body.</param>
@@ -97,10 +96,10 @@ public sealed class ProsperoChunkInfoModel
 }
 
 /// <summary>
-/// Structural inputs for the reproducible part of <c>common/etc/pfsimage.xml</c>. Every value here
-/// is known to the builder (content id, sizes, the inner-PFS seed, the directory entries);
-/// the keyed <see cref="ContentDigest"/>… fields and the inner-image digests are optional and are
-/// emitted verbatim when supplied, or as all-zero placeholders (and reported) when not.
+/// Inputs for <c>common/etc/pfsimage.xml</c>. The high-level package builder fills every value,
+/// including the digest rows, from the completed CNT, FIH and PFS image. The digest properties remain
+/// optional for callers that use this low-level model directly; a missing value is emitted as an
+/// all-zero placeholder and reported through the warning collection.
 /// </summary>
 public sealed class ProsperoPfsImageXmlOptions
 {
@@ -201,20 +200,20 @@ public sealed class ProsperoPfsImageXmlOptions
     /// </summary>
     public IReadOnlyList<ProsperoPfsImageEntry> Entries { get; set; } = [];
 
-    // ---- Keyed finalization products: supplied verbatim or left as zero placeholders. ----
+    // ---- Digest products: builder-derived, or supplied to the low-level XML API. ----
 
-    /// <summary>32-byte container <c>&lt;body-digest&gt;</c> (keyed).</summary>
+    /// <summary>32-byte container <c>&lt;body-digest&gt;</c>: SHA3-256 of the CNT body.</summary>
     public byte[]? BodyDigest { get; set; }
 
-    /// <summary>32-byte <c>&lt;content-digest&gt;</c> (keyed).</summary>
+    /// <summary>32-byte CNT GeneralDigests <c>&lt;content-digest&gt;</c>.</summary>
     public byte[]? ContentDigest { get; set; }
-    /// <summary>32-byte <c>&lt;game-digest&gt;</c> (keyed; == inner <c>sblock-digest</c>).</summary>
+    /// <summary>32-byte <c>&lt;game-digest&gt;</c>; equals the plaintext outer-superblock digest.</summary>
     public byte[]? GameDigest { get; set; }
-    /// <summary>32-byte <c>&lt;header-digest&gt;</c> (keyed).</summary>
+    /// <summary>32-byte CNT GeneralDigests <c>&lt;header-digest&gt;</c>.</summary>
     public byte[]? HeaderDigest { get; set; }
-    /// <summary>32-byte <c>&lt;system-digest&gt;</c> (keyed).</summary>
+    /// <summary>32-byte CNT GeneralDigests <c>&lt;system-digest&gt;</c>.</summary>
     public byte[]? SystemDigest { get; set; }
-    /// <summary>32-byte <c>&lt;param-digest&gt;</c> (keyed).</summary>
+    /// <summary>32-byte SHA3-256 <c>&lt;param-digest&gt;</c> of the CNT param.json payload.</summary>
     public byte[]? ParamDigest { get; set; }
     /// <summary>
     /// 32-byte <c>&lt;package-digest&gt;</c>. Reproducible: equals
@@ -222,9 +221,9 @@ public sealed class ProsperoPfsImageXmlOptions
     /// the produced CNT stores at +0xFE0. Pass it when the produced CNT bytes are available.
     /// </summary>
     public byte[]? PackageDigest { get; set; }
-    /// <summary>32-byte inner <c>&lt;sblock-digest&gt;</c> (keyed; equals the game-digest).</summary>
+    /// <summary>32-byte inner <c>&lt;sblock-digest&gt;</c>; equals <see cref="GameDigest"/>.</summary>
     public byte[]? SblockDigest { get; set; }
-    /// <summary>32-byte inner <c>&lt;fixed-info-digest&gt;</c> (keyed).</summary>
+    /// <summary>32-byte SHA3-256 <c>&lt;fixed-info-digest&gt;</c> of the completed FIH block.</summary>
     public byte[]? FixedInfoDigest { get; set; }
 
     // ---- Inode-tree introspection (self-consistent; describes the built image). ----
@@ -609,31 +608,33 @@ public static class ProsperoSiArchive
     /// <summary>
     /// Builds <c>common/etc/pfsimage.xml</c> in the reference format, reproduced byte-for-byte through its
     /// <c>&lt;config&gt;</c>, <c>&lt;digests&gt;</c>, <c>&lt;params&gt;</c>, <c>&lt;container&gt;</c>,
-    /// <c>&lt;mount-image&gt;</c> and <c>&lt;entries&gt;</c> sections. Keyed
-    /// digest fields are emitted verbatim when present on <paramref name="options"/>, otherwise as
-    /// all-zero placeholders; every placeholder is appended to <paramref name="warnings"/> so the
-    /// caller can surface that the file is structurally valid but not finalization-exact.
+    /// <c>&lt;mount-image&gt;</c> and <c>&lt;entries&gt;</c> sections. Digest fields are emitted verbatim
+    /// when present on <paramref name="options"/>, otherwise as all-zero placeholders; every placeholder
+    /// is appended to <paramref name="warnings"/>. Normal high-level package construction fills these
+    /// values from its completed CNT/FIH; placeholders apply only to incomplete low-level input.
     /// </summary>
     public static string BuildPfsImageXml(ProsperoPfsImageXmlOptions options, ICollection<string>? warnings = null)
     {
         ArgumentNullException.ThrowIfNull(options);
         ArgumentException.ThrowIfNullOrEmpty(options.ContentId);
 
-        void NoteIfPlaceholder(byte[]? value, string field, bool reproducible = false)
+        void NoteIfPlaceholder(byte[]? value, string field)
         {
             if (value is null || value.Length == 0)
-                warnings?.Add(reproducible
-                    ? $"pfsimage.xml <{field}> emitted as all-zero placeholder (reproducible — supply it from the builder/produced CNT)."
-                    : $"pfsimage.xml <{field}> emitted as all-zero placeholder (keyed finalization product, not reproducible off-console).");
+                warnings?.Add(
+                    $"pfsimage.xml <{field}> emitted as all-zero placeholder " +
+                    "(supply the digest explicitly when using the low-level XML API).");
         }
 
-        NoteIfPlaceholder(options.ContentDigest, "content-digest", reproducible: true);
-        NoteIfPlaceholder(options.GameDigest, "game-digest", reproducible: true);
-        NoteIfPlaceholder(options.HeaderDigest, "header-digest", reproducible: true);
-        NoteIfPlaceholder(options.SystemDigest, "system-digest", reproducible: true);
-        NoteIfPlaceholder(options.ParamDigest, "param-digest", reproducible: true);
-        NoteIfPlaceholder(options.PackageDigest, "package-digest", reproducible: true);
-        NoteIfPlaceholder(options.BodyDigest, "body-digest", reproducible: true);
+        NoteIfPlaceholder(options.ContentDigest, "content-digest");
+        NoteIfPlaceholder(options.GameDigest, "game-digest");
+        NoteIfPlaceholder(options.HeaderDigest, "header-digest");
+        NoteIfPlaceholder(options.SystemDigest, "system-digest");
+        NoteIfPlaceholder(options.ParamDigest, "param-digest");
+        NoteIfPlaceholder(options.PackageDigest, "package-digest");
+        NoteIfPlaceholder(options.BodyDigest, "body-digest");
+        NoteIfPlaceholder(options.SblockDigest ?? options.GameDigest, "sblock-digest");
+        NoteIfPlaceholder(options.FixedInfoDigest, "fixed-info-digest");
 
         // The inner superblock seed is emitted as a 16-byte 0xNN block, exactly like the digests.
         string seedBlock = Indent(FormatDigest(options.PfsImageSeed is { Length: > 0 } s ? s : default), "      ");

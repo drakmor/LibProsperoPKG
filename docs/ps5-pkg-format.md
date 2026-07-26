@@ -455,4 +455,10 @@ signature slots are zero-filled. A generated module round-trips through the pars
 segment layout of the reference module. Package builds embed a fixed `right.sprx` asset when the source
 provides none (§6); the generator is a standalone capability for arbitrary ELF input.
 
-> **Reproducibility boundary.** The keyed digests (`content/game/header/system/param/package/body/sblock/fixed-info` digests, the superblock `icv`, the FIH finalization table) require console finalization material the library does not have. LibProsperoPkg computes the SHA3-256 CNT-region and entry digests and derives `imagedigs.dat` from its own finalized outer image; the remaining console-only finalization fields are emitted as structurally valid placeholders (reported as warnings). Byte-identity to a specific reference `.pkg` additionally requires the Kraken inner encoder to produce identical compressed output.
+> **Reproducibility boundary.** The `pfsimage.xml` `content/game/header/system/param/package/body/sblock/fixed-info`
+> rows are ordinary SHA3-256 products of the completed CNT, FIH, entries and plaintext superblock; the high-level
+> builder computes all of them. They are not separate keyed console secrets. A direct low-level
+> `BuildPfsImageXml` call can omit them, in which case zero placeholders and explicit warnings are produced.
+> Console/backend material is still required for the protected Retail FIH/CNT authentication areas and trusted
+> metadata signatures. Byte-identity to a specific reference `.pkg` additionally requires the Kraken inner
+> encoder to produce identical compressed output.
