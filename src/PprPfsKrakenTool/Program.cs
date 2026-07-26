@@ -6,6 +6,7 @@ using LibProsperoPkg.PFS;
 using LibProsperoPkg.PFS.Compression;
 using LibProsperoPkg.PKG;
 using LibProsperoPkg.Util;
+using Microsoft.Win32.SafeHandles;
 using System;
 using System.Buffers.Binary;
 using System.Collections.Generic;
@@ -22,6 +23,20 @@ namespace PprPfsKrakenTool;
 
 internal static class Program
 {
+    private const uint FsctlSetSparse = 0x000900C4;
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool DeviceIoControl(
+        SafeFileHandle device,
+        uint controlCode,
+        IntPtr inputBuffer,
+        uint inputBufferSize,
+        IntPtr outputBuffer,
+        uint outputBufferSize,
+        out uint bytesReturned,
+        IntPtr overlapped);
+
     private sealed class PhucReadProfile
     {
         public required string Name { get; init; }
@@ -2963,8 +2978,17 @@ internal static class Program
 
     private static int SelfTestLargeOuter(string[] args)
     {
-        if (args.Length != 1)
-            throw new ArgumentException("selftest-large-outer takes no arguments.");
+        string? fullTestDirectory = null;
+        if (args.Length == 3 &&
+            string.Equals(args[1], "--full", StringComparison.OrdinalIgnoreCase))
+        {
+            fullTestDirectory = args[2];
+        }
+        else if (args.Length != 1)
+        {
+            throw new ArgumentException(
+                "Usage: selftest-large-outer [--full <scratch-directory>]");
+        }
 
         const int directBlocks = 12;
         int indirectEntries = ProsperoOuterPfsBuilder.BlockSize / 36;
@@ -3027,6 +3051,9 @@ internal static class Program
                 "Serialized ib[2] root/middle/leaf pointer or digest chain is incorrect.");
         }
 
+        if (fullTestDirectory is not null)
+            return SelfTestFullLargeOuter(fullTestDirectory, firstTripleBlockCount);
+
         int largeFileBlocks = directBlocks + indirectEntries + 1;
         long largeFileLength = checked((long)largeFileBlocks * ProsperoOuterPfsBuilder.BlockSize);
         string root = Path.Combine(
@@ -3069,6 +3096,29 @@ internal static class Program
 
             var (tweakKey, dataKey) =
                 ProsperoPfsKeys.DeriveImageEncryptionKeys(ekpfs, seed);
+            using (var encrypted = new FileStream(
+                       encryptedPath, FileMode.Open, FileAccess.Read, FileShare.Read,
+                       bufferSize: 1 << 20, FileOptions.RandomAccess))
+            using (var plaintextView = new ProsperoOuterPfsDecryptReader(
+                       encrypted, result.PfsSize, tweakKey, dataKey,
+                       result.BlockKinds, ProsperoOuterPfsBuilder.BlockSize))
+            {
+                var randomAccessReader = new PfsReader(
+                    plaintextView,
+                    superblockOffset: checked(
+                        (long)result.SuperblockIndex * ProsperoOuterPfsBuilder.BlockSize),
+                    encryptedDataAlreadyDecrypted: true);
+                PfsReader.File randomAccessFile =
+                    randomAccessReader.GetFile("large.bin")
+                    ?? throw new InvalidDataException(
+                        "Cached encrypted outer-PFS view did not expose large.bin.");
+                byte[] lastByte = new byte[1];
+                randomAccessFile.GetView().Read(
+                    largeFileLength - 1, lastByte, 0, lastByte.Length);
+                if (lastByte[0] != 0)
+                    throw new InvalidDataException(
+                        "Cached encrypted outer-PFS view returned incorrect data.");
+            }
             using (var encrypted = new FileStream(
                        encryptedPath, FileMode.Open, FileAccess.Read, FileShare.Read,
                        bufferSize: 1 << 20, FileOptions.SequentialScan))
@@ -3130,6 +3180,216 @@ internal static class Program
             {
                 // Best-effort cleanup must not hide the regression result.
             }
+        }
+    }
+
+    private static int SelfTestFullLargeOuter(
+        string scratchDirectory, long firstTripleBlockCount)
+    {
+        string root = Path.GetFullPath(scratchDirectory);
+        if (Directory.Exists(root) && Directory.EnumerateFileSystemEntries(root).Any())
+            throw new IOException($"Full large-outer test directory is not empty: {root}");
+        Directory.CreateDirectory(root);
+
+        string payloadPath = Path.Combine(root, "payload-ib2-zero.bin");
+        string encryptedPath = Path.Combine(root, "outer-ib2.pfs");
+        string resultPath = Path.Combine(root, "result.txt");
+        if (File.Exists(payloadPath) || File.Exists(encryptedPath) || File.Exists(resultPath))
+            throw new IOException($"Full large-outer test output already exists under {root}.");
+
+        long payloadLength = checked(
+            (firstTripleBlockCount - 1) * ProsperoOuterPfsBuilder.BlockSize + 1);
+        Console.WriteLine(
+            $"selftest-large-outer full: creating {payloadLength:N0}-byte sparse source at " +
+            $"{payloadPath}");
+        using (var payload = new FileStream(
+                   payloadPath, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None))
+        {
+            bool sparse = !OperatingSystem.IsWindows() ||
+                DeviceIoControl(
+                    payload.SafeFileHandle,
+                    FsctlSetSparse,
+                    IntPtr.Zero,
+                    0,
+                    IntPtr.Zero,
+                    0,
+                    out _,
+                    IntPtr.Zero);
+            if (!sparse)
+                Console.WriteLine(
+                    $"selftest-large-outer full: FSCTL_SET_SPARSE failed with " +
+                    $"{Marshal.GetLastWin32Error()}; continuing with a regular source file");
+            payload.SetLength(payloadLength);
+        }
+
+        byte[] seed = Enumerable.Range(0, 16).Select(i => (byte)(0xA0 + i)).ToArray();
+        byte[] ekpfs = Enumerable.Range(0, 32).Select(i => (byte)(0x20 + i)).ToArray();
+        ProsperoOuterPackageFileResult? result = null;
+        try
+        {
+            Console.WriteLine(
+                "selftest-large-outer full: building and encrypting the complete outer PFS");
+            result = ProsperoOuterPfsBuilder.BuildForPackageToFile(
+                [
+                    new ProsperoOuterFileSource
+                    {
+                        Name = "large.bin",
+                        Path = payloadPath,
+                        SizeCompressed = payloadLength,
+                        Signed = false,
+                    },
+                ],
+                new ProsperoOuterPfsBuildParameters
+                {
+                    TimestampSeconds = 0,
+                    TimestampNanoseconds = 0,
+                    Seed = seed,
+                },
+                ekpfs,
+                encryptedPath);
+
+            if (result.FileBlockCount.Length != 1 ||
+                result.FileBlockCount[0] != firstTripleBlockCount ||
+                result.PfsSize != new FileInfo(encryptedPath).Length)
+            {
+                throw new InvalidDataException(
+                    "Full ib[2] image has incorrect file or outer-image geometry.");
+            }
+
+            var (tweakKey, dataKey) =
+                ProsperoPfsKeys.DeriveImageEncryptionKeys(ekpfs, seed);
+            using var encrypted = new FileStream(
+                encryptedPath, FileMode.Open, FileAccess.Read, FileShare.Read,
+                bufferSize: 1 << 20, FileOptions.RandomAccess);
+            using var plaintextView = new ProsperoOuterPfsDecryptReader(
+                encrypted,
+                result.PfsSize,
+                tweakKey,
+                dataKey,
+                result.BlockKinds,
+                ProsperoOuterPfsBuilder.BlockSize);
+
+            long inodeOffset = checked(
+                (long)result.InodeTableIndex * ProsperoOuterPfsBuilder.BlockSize +
+                3 * DinodeS32.SizeOf);
+            byte[] inodeBytes = new byte[DinodeS32.SizeOf];
+            plaintextView.Read(inodeOffset, inodeBytes, 0, inodeBytes.Length);
+            DinodeS32 inode;
+            using (var inodeStream = new MemoryStream(inodeBytes, writable: false))
+                inode = DinodeS32.ReadFromStream(inodeStream);
+            if (inode.Blocks != firstTripleBlockCount ||
+                inode.ib[0].block <= 0 ||
+                inode.ib[1].block <= 0 ||
+                inode.ib[2].block <= 0 ||
+                inode.ib[3].block != 0 ||
+                inode.ib[4].block != 0)
+            {
+                throw new InvalidDataException(
+                    "Full ib[2] inode does not contain the expected indirect roots.");
+            }
+
+            byte[] ReadPlainBlock(int blockIndex)
+            {
+                var block = new byte[ProsperoOuterPfsBuilder.BlockSize];
+                plaintextView.Read(
+                    checked((long)blockIndex * ProsperoOuterPfsBuilder.BlockSize),
+                    block,
+                    0,
+                    block.Length);
+                byte[] actualDigest =
+                    ProsperoOuterPfsSignature.ComputeBlockHash(block);
+                if (!actualDigest.AsSpan().SequenceEqual(
+                        result.ImageDigests.AsSpan(blockIndex * 32, 32)))
+                {
+                    throw new InvalidDataException(
+                        $"Plaintext digest mismatch at outer block {blockIndex}.");
+                }
+                return block;
+            }
+
+            byte[] rootBlock = ReadPlainBlock(inode.ib[2].block);
+            if (!ProsperoOuterPfsSignature.ComputeBlockHash(rootBlock)
+                    .AsSpan().SequenceEqual(inode.ib[2].sig))
+            {
+                throw new InvalidDataException("ib[2] inode root digest is incorrect.");
+            }
+            int middleIndex = BinaryPrimitives.ReadInt32LittleEndian(
+                rootBlock.AsSpan(32, 4));
+            byte[] middleBlock = ReadPlainBlock(middleIndex);
+            if (!ProsperoOuterPfsSignature.ComputeBlockHash(middleBlock)
+                    .AsSpan().SequenceEqual(rootBlock.AsSpan(0, 32)))
+            {
+                throw new InvalidDataException("ib[2] middle digest is incorrect.");
+            }
+            int leafIndex = BinaryPrimitives.ReadInt32LittleEndian(
+                middleBlock.AsSpan(32, 4));
+            byte[] leafBlock = ReadPlainBlock(leafIndex);
+            if (!ProsperoOuterPfsSignature.ComputeBlockHash(leafBlock)
+                    .AsSpan().SequenceEqual(middleBlock.AsSpan(0, 32)))
+            {
+                throw new InvalidDataException("ib[2] leaf digest is incorrect.");
+            }
+            int finalDataBlock = BinaryPrimitives.ReadInt32LittleEndian(
+                leafBlock.AsSpan(32, 4));
+            if (finalDataBlock != firstTripleBlockCount - 1 ||
+                !leafBlock.AsSpan(0, 32).SequenceEqual(
+                    result.ImageDigests.AsSpan(finalDataBlock * 32, 32)))
+            {
+                throw new InvalidDataException(
+                    "ib[2] leaf does not reference the final data block.");
+            }
+            byte[] finalData = ReadPlainBlock(finalDataBlock);
+            if (finalData.AsSpan().IndexOfAnyExcept((byte)0) >= 0)
+                throw new InvalidDataException("Final sparse data block is not zero-filled.");
+
+            byte[] superblock = ReadPlainBlock(result.SuperblockIndex);
+            if (!ProsperoOuterPfsSignature.ComputeSuperblockIcv(superblock)
+                    .AsSpan().SequenceEqual(result.SuperblockIcv))
+            {
+                throw new InvalidDataException("Full outer-PFS superblock ICV is incorrect.");
+            }
+
+            Console.WriteLine(
+                "selftest-large-outer full: opening encrypted image through PfsReader and " +
+                $"traversing {firstTripleBlockCount:N0} mappings");
+            var reader = new PfsReader(
+                plaintextView,
+                superblockOffset: checked(
+                    (long)result.SuperblockIndex * ProsperoOuterPfsBuilder.BlockSize),
+                encryptedDataAlreadyDecrypted: true);
+            PfsReader.File file = reader.GetFile("large.bin")
+                ?? throw new InvalidDataException(
+                    "large.bin is absent from the full ib[2] outer PFS.");
+            if (file.size != payloadLength)
+                throw new InvalidDataException("Full ib[2] file size is incorrect.");
+            byte[] edge = new byte[1];
+            file.GetView().Read(0, edge, 0, 1);
+            if (edge[0] != 0)
+                throw new InvalidDataException("First large-file byte is not zero.");
+            file.GetView().Read(payloadLength - 1, edge, 0, 1);
+            if (edge[0] != 0)
+                throw new InvalidDataException("Last large-file byte is not zero.");
+
+            string summary =
+                $"status=passed{Environment.NewLine}" +
+                $"payload_length={payloadLength}{Environment.NewLine}" +
+                $"payload_blocks={firstTripleBlockCount}{Environment.NewLine}" +
+                $"outer_length={result.PfsSize}{Environment.NewLine}" +
+                $"ib2_root={inode.ib[2].block}{Environment.NewLine}" +
+                $"ib2_middle={middleIndex}{Environment.NewLine}" +
+                $"ib2_leaf={leafIndex}{Environment.NewLine}" +
+                $"final_data_block={finalDataBlock}{Environment.NewLine}" +
+                $"superblock={result.SuperblockIndex}{Environment.NewLine}";
+            File.WriteAllText(resultPath, summary, Encoding.UTF8);
+            Console.WriteLine(
+                $"selftest-large-outer full: PASSED; image={encryptedPath}; " +
+                $"summary={resultPath}");
+            return 0;
+        }
+        finally
+        {
+            if (File.Exists(payloadPath))
+                File.Delete(payloadPath);
         }
     }
 
@@ -4310,7 +4570,7 @@ internal static class Program
         Console.WriteLine("  probe-publisher-key-wrap <package.pkg> <passcode> [primary-id]");
         Console.WriteLine("  probe-entry-crypto <package.pkg> <entry-id-hex> <passcode>");
         Console.WriteLine("  selftest");
-        Console.WriteLine("  selftest-large-outer");
+        Console.WriteLine("  selftest-large-outer [--full <scratch-directory>]");
         Console.WriteLine("  Levels: Kraken -4..9 (default 8), zlib 0..9 (default 9).");
         Console.WriteLine("  Valid builds: ppr+kraken/none; classic+zlib/kraken/none.");
     }
