@@ -60,7 +60,7 @@
 
   <ItemGroup>
     <!-- AnyCPU image libraries used by the sce_sys DDS (BC7) re-encoder. -->
-    <PackageReference Include="Magick.NET-Q8-AnyCPU" Version="14.14.0" />
+    <PackageReference Include="Magick.NET-Q8-AnyCPU" Version="14.15.0" />
     <PackageReference Include="BCnEncoder.Net" Version="2.3.0" />
   </ItemGroup>
 
