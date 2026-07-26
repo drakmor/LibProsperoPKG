@@ -736,12 +736,153 @@ internal static class Program
                 cnt.Slice(0, ProsperoImageDigests.HeaderDigestPrefixSize),
                 cnt.Slice(0x400, ProsperoImageDigests.HeaderDigestMountDescriptorSize));
             byte[] actualGeneralDigest = ProsperoImageDigests.ComputeEntryDigest(general);
+            bool retailPrefinalizedHeaderFormula = false;
+            var retailHeaderMatches = new List<string>();
+            if (fih[ProsperoPkgLayout.FihSignedByteOffset] == 0x80)
+            {
+                // Test the narrow hypothesis that Retail retains the GeneralDigests HeaderDigest
+                // created before the trusted 0x300-byte FIH material is inserted. Keep this as a
+                // diagnostic only: the known Retail samples currently disprove that hypothesis.
+                byte[] prefinalizedFih = (byte[])fih.Clone();
+                prefinalizedFih.AsSpan(
+                    ProsperoPkgLayout.FihRetailFinalizationOffset,
+                    ProsperoPkgLayout.FihRetailFinalizationSize).Clear();
+                byte[] prefinalizedMount =
+                    cnt.Slice(
+                        0x400,
+                        ProsperoImageDigests.HeaderDigestMountDescriptorSize).ToArray();
+                ProsperoImageDigests.ComputeFixedInfoDigest(prefinalizedFih).CopyTo(
+                    prefinalizedMount,
+                    0x460 - 0x400);
+                byte[] prefinalizedHeaderDigest =
+                    ProsperoImageDigests.ComputeHeaderDigest(
+                        cnt.Slice(0, ProsperoImageDigests.HeaderDigestPrefixSize),
+                        prefinalizedMount);
+                retailPrefinalizedHeaderFormula =
+                    prefinalizedHeaderDigest.AsSpan().SequenceEqual(
+                        general.AsSpan(0x60, 32));
+
+                // Probe the finite set of fields known to change between the standalone CNT,
+                // preliminary FIH and finalized Retail package. This is deliberately diagnostic:
+                // it does not mutate the package or accept an unproven formula.
+                var fihCandidates = new List<(string Name, byte[] Bytes)>();
+                foreach (byte signedByte in new byte[] { 0x80, 0x00 })
+                {
+                    foreach (bool preliminaryGameSlots in new[] { false, true })
+                    {
+                        byte[] candidate = (byte[])prefinalizedFih.Clone();
+                        candidate[ProsperoPkgLayout.FihSignedByteOffset] =
+                            signedByte;
+                        if (preliminaryGameSlots)
+                        {
+                            candidate.AsSpan(0x30, 32).CopyTo(
+                                candidate.AsSpan(0x70, 32));
+                            candidate.AsSpan(0x30, 32).CopyTo(
+                                candidate.AsSpan(0xD0, 32));
+                        }
+                        fihCandidates.Add((
+                            $"fih-signed-{signedByte:X2}-" +
+                            (preliminaryGameSlots ? "game-slots" : "retail-slots"),
+                            candidate));
+                    }
+                }
+
+                ulong cntRegionSize = BinaryPrimitives.ReadUInt64BigEndian(
+                    cnt.Slice(0x4B8, 8));
+                ulong finalPackageSize = BinaryPrimitives.ReadUInt64BigEndian(
+                    cnt.Slice(0x430, 8));
+                var descriptorCandidates =
+                    new List<(string Name, byte[] Bytes)>();
+                foreach (bool standaloneOffset in new[] { false, true })
+                {
+                    foreach (bool standaloneSize in new[] { false, true })
+                    {
+                        byte[] descriptor = cnt.Slice(
+                            0x400,
+                            ProsperoImageDigests.HeaderDigestMountDescriptorSize)
+                            .ToArray();
+                        if (standaloneOffset)
+                        {
+                            BinaryPrimitives.WriteUInt64BigEndian(
+                                descriptor.AsSpan(0x10, 8),
+                                cntRegionSize);
+                        }
+                        if (standaloneSize &&
+                            finalPackageSize >=
+                                (ulong)ProsperoPkgLayout.FihHeaderRegionSize)
+                        {
+                            ulong standalonePackageSize =
+                                finalPackageSize -
+                                (ulong)ProsperoPkgLayout.FihHeaderRegionSize;
+                            BinaryPrimitives.WriteUInt64BigEndian(
+                                descriptor.AsSpan(0x28, 8),
+                                standalonePackageSize);
+                            BinaryPrimitives.WriteUInt64BigEndian(
+                                descriptor.AsSpan(0x30, 8),
+                                standalonePackageSize);
+                        }
+                        descriptorCandidates.Add((
+                            $"descriptor-" +
+                            (standaloneOffset ? "standalone-offset" : "final-offset") +
+                            "-" +
+                            (standaloneSize ? "standalone-size" : "final-size"),
+                            descriptor));
+                    }
+                }
+
+                byte[] actualHeaderDigest = general.AsSpan(0x60, 32).ToArray();
+                foreach ((string fihName, byte[] fihBytes) in fihCandidates)
+                {
+                    byte[] preliminaryFixed =
+                        ProsperoImageDigests.ComputeFixedInfoDigest(fihBytes);
+                    foreach ((string descriptorName, byte[] descriptorBase) in
+                             descriptorCandidates)
+                    {
+                        foreach (string pfsDigestMode in
+                                 new[] { "final", "zero" })
+                        {
+                            foreach ((string fixedName, byte[] fixedDigest) in
+                                     new[]
+                                     {
+                                         ("prefinalized", preliminaryFixed),
+                                         ("final", cnt.Slice(0x460, 32).ToArray()),
+                                         ("zero", new byte[32]),
+                                     })
+                            {
+                                byte[] descriptor =
+                                    (byte[])descriptorBase.Clone();
+                                if (pfsDigestMode == "zero")
+                                    descriptor.AsSpan(0x40, 32).Clear();
+                                fixedDigest.CopyTo(descriptor, 0x60);
+                                byte[] candidateDigest =
+                                    ProsperoImageDigests.ComputeHeaderDigest(
+                                        cnt.Slice(
+                                            0,
+                                            ProsperoImageDigests
+                                                .HeaderDigestPrefixSize),
+                                        descriptor);
+                                if (candidateDigest.AsSpan().SequenceEqual(
+                                        actualHeaderDigest))
+                                {
+                                    retailHeaderMatches.Add(
+                                        $"{fihName}/{descriptorName}/" +
+                                        $"pfs-{pfsDigestMode}/fixed-{fixedName}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             Console.WriteLine(
                 $"fih-game-slot70={fih.AsSpan(0x70, 32).SequenceEqual(general.AsSpan(0x40, 32))} " +
                 $"fih-target-slotd0={fih.AsSpan(0xd0, 32).SequenceEqual(general.AsSpan(0x180, 32))} " +
                 $"debug-header-formula={expectedHeaderDigest.AsSpan().SequenceEqual(general.AsSpan(0x60, 32))} " +
+                $"retail-prefinalized-header-formula={retailPrefinalizedHeaderFormula} " +
+                $"retail-header-probe-matches={retailHeaderMatches.Count} " +
                 $"general-entry-digest={actualGeneralDigest.AsSpan().SequenceEqual(
                     digestTable.AsSpan(generalIndex * 32, 32))}");
+            foreach (string match in retailHeaderMatches)
+                Console.WriteLine($"retail-header-probe={match}");
         }
 
         if (quick)
@@ -2846,6 +2987,46 @@ internal static class Program
                 "Triple-indirect outer-PFS addressing geometry is incorrect.");
         }
 
+        ProsperoOuterAddressingSerializationProbe tripleProbe =
+            ProsperoOuterPfsBuilder.BuildAddressingSerializationProbe(
+                firstTripleBlockCount, inodeLevel: 2);
+        if (tripleProbe.DataBlockCount != 1 ||
+            tripleProbe.FirstDataOffset != firstTripleBlockCount - 1 ||
+            tripleProbe.MetadataBlocks.Count != 3)
+        {
+            throw new InvalidDataException(
+                "Triple-indirect outer-PFS serialization probe has incorrect geometry.");
+        }
+        byte[] tripleRoot = tripleProbe.MetadataBlocks[tripleProbe.RootBlockIndex];
+        int middleBlock = BinaryPrimitives.ReadInt32LittleEndian(
+            tripleRoot.AsSpan(32, 4));
+        byte[] tripleMiddle = tripleProbe.MetadataBlocks[middleBlock];
+        int leafBlock = BinaryPrimitives.ReadInt32LittleEndian(
+            tripleMiddle.AsSpan(32, 4));
+        byte[] tripleLeaf = tripleProbe.MetadataBlocks[leafBlock];
+        int finalDataBlock = BinaryPrimitives.ReadInt32LittleEndian(
+            tripleLeaf.AsSpan(32, 4));
+        Span<byte> expectedSyntheticDigest = stackalloc byte[32];
+        expectedSyntheticDigest.Clear();
+        BinaryPrimitives.WriteInt32LittleEndian(
+            expectedSyntheticDigest, finalDataBlock);
+        BinaryPrimitives.WriteInt32LittleEndian(
+            expectedSyntheticDigest.Slice(28, 4), ~finalDataBlock);
+        if (middleBlock != tripleProbe.RootBlockIndex + 1 ||
+            leafBlock != middleBlock + 1 ||
+            finalDataBlock != firstTripleBlockCount - 1 ||
+            !tripleLeaf.AsSpan(0, 32).SequenceEqual(expectedSyntheticDigest) ||
+            !tripleRoot.AsSpan(0, 32).SequenceEqual(
+                ProsperoOuterPfsSignature.ComputeBlockHash(tripleMiddle)) ||
+            !tripleMiddle.AsSpan(0, 32).SequenceEqual(
+                ProsperoOuterPfsSignature.ComputeBlockHash(tripleLeaf)) ||
+            !tripleProbe.RootHash.AsSpan().SequenceEqual(
+                ProsperoOuterPfsSignature.ComputeBlockHash(tripleRoot)))
+        {
+            throw new InvalidDataException(
+                "Serialized ib[2] root/middle/leaf pointer or digest chain is incorrect.");
+        }
+
         int largeFileBlocks = directBlocks + indirectEntries + 1;
         long largeFileLength = checked((long)largeFileBlocks * ProsperoOuterPfsBuilder.BlockSize);
         string root = Path.Combine(
@@ -2933,7 +3114,7 @@ internal static class Program
             }
 
             Console.WriteLine(
-                "selftest-large-outer: serialized single/double maps and planned triple map passed " +
+                "selftest-large-outer: serialized single/double maps and triple-map chain passed " +
                 $"({largeFileBlocks:N0} serialized blocks; ib[2] starts at " +
                 $"{firstTripleBlockCount:N0} data blocks)");
             return 0;

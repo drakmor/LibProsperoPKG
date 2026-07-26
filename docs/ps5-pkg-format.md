@@ -218,6 +218,14 @@ protected material at FIH `0xF000..0xF2FF`, zeroes through `0xFFFF`, and no byte
 embedded CNT. Their CNT `fixed-info-digest` is SHA3-256 of the completed FIH, including this
 `0x300` block.
 
+The Retail GeneralDigests HeaderDigest is not the ordinary debug HeaderDigest recomputed after
+finalization. A finite probe over both references also ruled out the simple "pre-finalized FIH"
+variant: clearing the trusted `0x300` bytes, toggling the signed byte, restoring preliminary
+Game/Target slots, using standalone/final descriptor offsets and sizes, and substituting
+zero/preliminary/final PFS and fixed-info digests produced no match. The exact publisher-stage
+preimage remains external; a Retail-preserving rewrite must retain the original field unless its
+trusted finalization provider explicitly supplies a replacement.
+
 FGC/Flexible Content is a separate finalization protocol. `fa.exe` writes `0xA00` bytes at
 FIH `0xF000`: `cert0[0x380] || RSA3072-signature[0x180] || cert1[0x380] ||
 RSA3072-signature[0x180]`. It also updates/signs the PFS superblock and CNT, consumes FGC token

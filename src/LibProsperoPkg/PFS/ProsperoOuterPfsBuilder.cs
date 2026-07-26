@@ -200,6 +200,20 @@ public sealed class ProsperoOuterAddressingGeometry
 }
 
 /// <summary>
+/// Internal byte-level probe produced by the real indirect-map serializer. The companion
+/// regression tool uses it to exercise a selected inode level without materializing file data.
+/// </summary>
+internal sealed class ProsperoOuterAddressingSerializationProbe
+{
+    public required int InodeLevel { get; init; }
+    public required int RootBlockIndex { get; init; }
+    public required int FirstDataOffset { get; init; }
+    public required int DataBlockCount { get; init; }
+    public required byte[] RootHash { get; init; }
+    public required IReadOnlyDictionary<int, byte[]> MetadataBlocks { get; init; }
+}
+
+/// <summary>
 /// Assembles, signs, and encrypts the plaintext outer-PFS image of a PS5 nwonly finalized package.
 /// See the file header for the full byte layout.
 /// </summary>
@@ -310,6 +324,61 @@ public static class ProsperoOuterPfsBuilder
             DataBlocksByIndirectLevel = dataByLevel,
             MetadataBlocksByIndirectLevel = metadataByLevel,
             HighestIndirectLevel = highest,
+        };
+    }
+
+    /// <summary>
+    /// Runs the production indirect-tree planner and serializer for one inode level using
+    /// deterministic synthetic data digests. This is intentionally internal: it validates
+    /// metadata bytes and pointer geometry but does not produce a usable filesystem image.
+    /// </summary>
+    internal static ProsperoOuterAddressingSerializationProbe
+        BuildAddressingSerializationProbe(long dataBlockCount, int inodeLevel)
+    {
+        if (dataBlockCount < 0 || dataBlockCount > int.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(dataBlockCount));
+        if ((uint)inodeLevel >= IndirectLevelCount)
+            throw new ArgumentOutOfRangeException(nameof(inodeLevel));
+
+        int blockCount = checked((int)dataBlockCount);
+        int firstMetadataBlock = checked(blockCount + 4);
+        IndirectTreePlan[][] plans = PlanIndirectTrees(
+            [blockCount], firstMetadataBlock, out _);
+        IndirectTreePlan? selected = null;
+        foreach (IndirectTreePlan tree in plans[0])
+        {
+            if (tree.InodeLevel == inodeLevel)
+            {
+                selected = tree;
+                break;
+            }
+        }
+        if (selected is null)
+            throw new ArgumentException(
+                $"A {dataBlockCount}-block inode does not use ib[{inodeLevel}].",
+                nameof(inodeLevel));
+
+        var serialized = new Dictionary<int, byte[]>();
+        byte[] rootHash = WriteIndirectTree(
+            selected.Root,
+            fileFirstBlock: 0,
+            copyDataDigest: static (dataBlock, destination) =>
+            {
+                destination.Clear();
+                BinaryPrimitives.WriteInt32LittleEndian(destination, dataBlock);
+                BinaryPrimitives.WriteInt32LittleEndian(
+                    destination.Slice(28, 4), ~dataBlock);
+            },
+            writeBlock: (blockIndex, block) =>
+                serialized.Add(blockIndex, (byte[])block.Clone()));
+        return new ProsperoOuterAddressingSerializationProbe
+        {
+            InodeLevel = selected.InodeLevel,
+            RootBlockIndex = selected.Root.BlockIndex,
+            FirstDataOffset = selected.Root.FirstDataOffset,
+            DataBlockCount = selected.Root.DataBlockCount,
+            RootHash = rootHash,
+            MetadataBlocks = serialized,
         };
     }
 

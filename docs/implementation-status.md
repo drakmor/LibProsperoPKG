@@ -52,6 +52,12 @@ This document describes the current LibProsperoPkg package-building and reading 
   0x180-byte CNT-header authentication result; the library refuses a structural-only `0x80` image.
   It then writes FIH `0x70`/`0xD0` from GeneralDigests Game/Target, updates CNT fixed-info/package
   digests and installs the returned authentication block.
+- `check-pkg-fih --quick` probes the known preliminary/finalized inputs to the Retail
+  GeneralDigests HeaderDigest. Neither checked Retail reference matches the debug formula, nor
+  any combination of cleared/final FIH material, signed byte, preliminary/final Game/Target slots,
+  standalone/final descriptor geometry, and zero/preliminary/final descriptor digests. Retail
+  round-trip therefore preserves this publisher-stage value instead of applying an unproved
+  recomputation.
 - FIH/CNT assembly and SI CRC generation are file-backed. The outer PFS is copied in bounded
   buffers, so finalized images larger than 2 GiB are no longer materialized in a managed array.
 
@@ -157,7 +163,7 @@ This document describes the current LibProsperoPkg package-building and reading 
 - The specialized publisher `ProsperoPs5InnerImageAssembler` now has `BuildToFile` and `BuildFromFsTreeToFile`. The normal package path writes each Kraken/stored payload to its final physical offset immediately, releases the compressed buffer, then appends block-info and metadata. NAPS CMAC, `obdg`, outer-PFS input, and optional integrity providers consume that file. The in-memory compatibility methods remain byte-identical. Per-file plaintext arrays are still retained because `ihsh/rhsh` construction consumes them.
 - Inner extraction removes the PFS implementation-only `uroot/` component so paths round-trip to the source tree. `PfsReader.File.Save` creates/truncates destinations instead of leaving stale tails from an older longer file.
 - The July 2026 `origin/main` validation/robustness audit was selectively ported without merging its incompatible API refactor. AES-XTS objects now reuse their AES transforms and are deterministically disposed; PFS inode-table offsets account for records that cross a block boundary; zero-length PFSC reads stop before block lookup; NAPS U2C padding points at the terminal CblockInfo; duplicate media entry ids are ignored; malformed `ENTRY_KEYS` sizes and unrepresentable FSELF layouts are rejected.
-- `PprPfsKrakenTool selftest-large-outer` exercises the first double-indirect data block: it builds a 1,833-block (120,127,488-byte) sparse file, decrypts the result, checks `ib[0]` and `ib[1]`, and traverses the complete file through `PfsReader`. The same test checks the concrete planner at the first `ib[2]` block (3,314,233 data blocks) without materializing a 202-GiB payload.
+- `PprPfsKrakenTool selftest-large-outer` exercises the first double-indirect data block: it builds a 1,833-block (120,127,488-byte) sparse file, decrypts the result, checks `ib[0]` and `ib[1]`, and traverses the complete file through `PfsReader`. At the first `ib[2]` block (3,314,233 data blocks), the same test invokes the production serializer without materializing the 202-GiB payload and verifies the actual root/middle/leaf pointers plus their SHA3 digest chain.
 - AC/AL builds require existing backend-issued `license.dat` and `license.info`. They may be
   supplied as loose `sce_sys` sidecars or through `IProsperoLicenseProvider`, which is the
   integration point for an authorized backend/SDK/console bridge. Both paths check the exact
