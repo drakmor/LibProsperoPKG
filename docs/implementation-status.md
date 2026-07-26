@@ -52,6 +52,11 @@ This document describes the current LibProsperoPkg package-building and reading 
   0x180-byte CNT-header authentication result; the library refuses a structural-only `0x80` image.
   It then writes FIH `0x70`/`0xD0` from GeneralDigests Game/Target, updates CNT fixed-info/package
   digests and installs the returned authentication block.
+- `ProsperoDirectoryRetailFinalizationProvider` preserves those two trusted results for an exact
+  deterministic rebuild. `export-publisher-inputs` writes the 0x300/0x180 artifacts plus independent
+  SHA3-256 hashes of the zero-finalization FIH request and finalized 0x1000-byte CNT request. Replay
+  fails closed if either request differs by one byte; this prevents a captured signature from being
+  attached to another package revision. It is an artifact importer, not a Retail signature producer.
 - `check-pkg-fih --quick` probes the known preliminary/finalized inputs to the Retail
   GeneralDigests HeaderDigest. Neither checked Retail reference matches the debug formula, nor
   any combination of cleared/final FIH material, signed byte, preliminary/final Game/Target slots,
@@ -119,7 +124,11 @@ This document describes the current LibProsperoPkg package-building and reading 
 
 - Implements `ProsperoNapsLayout` as a parser and byte-exact serializer for `naps_pkg_layout.dat`.
 - Implements `ProsperoNapsImage.BuildPlan` as the managed equivalent of the span/ublock/file-view construction used by `ric.exe`: fidx terminal boundaries, U2C base-plus-delta lookup, run-base records, terminal records, 18-bit wrapped compressed and uncompressed lengths, tweak/key propagation, and physical `pfs_image.dat` offsets.
-- Implements `ProsperoNapsImage.Decompress`, including raw spans, two-chunk Kraken spans, newLZ/bare-entropy mode selection, strict coverage checks, and the publisher singleton-Huffman representation used for constant blocks.
+- Implements `ProsperoNapsImage.Decompress`, including raw spans, two-chunk Kraken spans, mixed
+  stored/newLZ halves, newLZ/bare-entropy mode selection, strict coverage checks, and the publisher
+  singleton-Huffman representation used for constant blocks. CBI mode bit 2 selects newLZ and bit 1
+  selects sub/delta literals independently for each half: publisher modes `5/4` are raw-literal
+  newLZ and `7/6` are sub-literal newLZ; mode `1` is a directly stored half.
 - Implements `ProsperoNapsImage.Pack`, the inverse baseline writer: arbitrary fidx boundaries, 256-KiB span splitting, Kraken/stored selection, monotonic run construction, U2C generation, terminal records, 64-KiB physical padding, optional publisher outer-block CMAC tags, and mandatory decode/compare verification. Its stream overload keeps one 256-KiB logical block plus mapping metadata in memory and writes the packed image directly to a seekable stream.
 - Implements `ProsperoPublisherPprBuilder.Build` and `BuildFileBacked`: source folder to direct-offset PPR-PFS, relocation below the publisher 4-MiB logical prefix, NAPS packing, data-first outer PFS generation, AES-XTS encryption, and reverse validation of every layer. The file-backed form does not materialize the logical PPR stream, packed NAPS image, or encrypted outer PFS in managed arrays.
 - The publisher artifact pipeline is wired into the normal `ProsperoPackageBuilder.Build` path and is enabled by default through `UsePublisherPprNaps`. It writes the encrypted data-first outer image into CNT, threads the NAPS-layout digest to FIH 0xB0, writes the exact unpadded NAPS layout size at FIH 0xA8, and carries the packed-image size into SI/NAPS metadata. Set the option to false only for the legacy superblock-first/PFSC profile.
@@ -127,6 +136,11 @@ This document describes the current LibProsperoPkg package-building and reading 
 - Implements the high-level `ProsperoPackageArchive` read path for finalized debug images: decrypt and verify the outer PFS, extract `naps_pkg_layout.dat` and `pfs_image.dat`, reconstruct the logical inner image, and extract its files.
 - Reads the publisher PPR direct-offset inode profile (`superblock.mode & 0x10`, 0xA8-byte inode). In this profile the value at inode `+0x60` is an absolute logical byte offset rather than the classic block-pointer array.
 - The complete PKG -> outer PFS -> NAPS -> inner PPR-PFS -> files path has been exercised successfully on publisher-produced `dlc_baseline.pkg`, `dlc.pkg`, `sftest.pkg`, `PPSX40000.pkg`, `forza_premium_1.0.pkg`, and `horizon_west.pkg`. The baseline also passes `prospero-pub-cmd img_verify --format_check on --integrity_check on`.
+- A large Publishing Tools v1.2.1 corpus (`cocon.pkg`) is also decoded completely. Its
+  1,265,631,232-byte physical `pfs_image.dat` expands to a 2,720,268,288-byte PPR-PFS with 474 AFID
+  slots (472 files and two holes). Its 10,627 normal CBI records exercise `7/6`, `5/4`, `1/1`,
+  `7/4`, `5/6`, `5/1`, `1/4`, `1/6` and tail variants. This corpus exposed and now covers the
+  stored/newLZ mixed-half and sub-literal mapping that the smaller corpus did not exercise.
 - The layout serializer round-trips the tested 544-byte sample: 533 bytes of section content plus 11 trailing zero pad bytes.
 - Implements the 16-byte layout header bit packing: file count, compression type, key count, shuffle-pattern count, uncompressed-block count, outer-block count, and compressed-block-info count.
 - Implements the section order and strides: outer block digest (8 bytes), shuffle pattern (8 bytes), uncompressed offset by file index (6 bytes), compressed-info offset by uncompressed-block index (10 bytes), and compressed-block info (9 bytes).
@@ -215,7 +229,9 @@ This document describes the current LibProsperoPkg package-building and reading 
 - The standard Retail finalization transformations remain an external trusted input. The managed
   builder now has the complete provider contract and correct post-finalization CNT resealing, but
   the embedded sc2 key banks are public wrapping/verification material and cannot manufacture the
-  provider's 0x300 FIH or 0x180 CNT authentication results.
+  provider's 0x300 FIH or 0x180 CNT authentication results. Exact captured artifacts can now be
+  exported and replayed through `ProsperoDirectoryRetailFinalizationProvider`; SHA3 request binding
+  rejects reuse after any FIH/CNT change.
 - FGC/Flexible Content finalization is implemented locally by
   `ProsperoFlexibleContentFinalizer` and exposed by the `finalize-fgc` CLI command. It parses
   token formats 0 and 1, decrypts the version-1 direct-key JWE, validates the passcode and
@@ -234,6 +250,12 @@ This document describes the current LibProsperoPkg package-building and reading 
   `naps_meta_18`. `ProsperoAfidMap` exports/imports a stable TSV map, and `export-afid-map` reads it
   from a decrypted reference image. Automatic reconstruction of an unavailable global publisher
   manifest, KDE-predictor selection, and update/base reuse remain.
+- The available v1.1.4a/v1.2.1/v1.5.0 Publishing Tools metrics contain no previous/referenced outer
+  blocks and no shuffled blocks. The large v1.2.1 sample does confirm ordinary write deduplication
+  (124 referenced compression blocks, 2,461,770 bytes) and the reader follows those backward/shared
+  physical references correctly. Its `alignment adjustment/update block count` is 18, but
+  `previous outer blocks = referenced outer blocks = 0`; that counter is not evidence of base/update
+  cross-image reuse.
 - Publishing Tools 2.79 debug/AC does not enable keyed NAPS `OuterBlockDigest` generation: the config flag at `+0x70` remains zero, `PackageNAPSMetadataInsertCMAC` is skipped, and all stored eight-byte tags are zero. The separate 16-byte input at `+0x74` is used only when another caller explicitly enables that mode; it is not derived from EKPFS, the outer XTS pair, or the PFS sign key. Callers can still provide it through `OuterBlockCmacKey`.
 - The NAPS decoder resolves the compact zero-based `ShuffleIdx` through the serialized 8-byte
   shuffle-pattern table and reverses all 12 known non-identity field-width transforms after either a stored

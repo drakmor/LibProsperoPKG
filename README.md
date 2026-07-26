@@ -256,6 +256,10 @@ uses a different 0xA00 certificate/signature protocol. It is implemented locally
 inputs. This does not replace the standard-Retail provider. Without a Retail provider, a console
 running in **debug mode** is the intended target; acceptance still depends on console mode and
 firmware.
+For a byte-identical deterministic rebuild, `export-publisher-inputs` also preserves the two
+standard-Retail results and their exact FIH/CNT SHA3-256 request bindings.
+`ProsperoDirectoryRetailFinalizationProvider` replays them only when both requests match; it rejects
+changed package content and does not replace an authorized producer for a fresh Retail package.
 See [docs/implementation-status.md](docs/implementation-status.md) for the precise breakdown.
 
 ---

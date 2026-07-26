@@ -2170,9 +2170,71 @@ internal static class Program
                     throw new InvalidDataException(
                         "Provider-backed Retail FIH/CNT resealing regression failed.");
                 }
+
+                string retailArtifacts = Path.Combine(
+                    regressionRoot, "retail-finalization-artifacts");
+                IReadOnlyList<string> exported =
+                    ProsperoPublishingSidecar.ExportReusableInputs(
+                        retailResult.OutputPath, retailArtifacts);
+                if (exported.Count(path =>
+                        Path.GetFileName(path).StartsWith(
+                            "retail_", StringComparison.Ordinal)) != 4)
+                {
+                    throw new InvalidDataException(
+                        "Standard-Retail export did not preserve all four bound artifacts.");
+                }
+
+                var directoryProvider =
+                    new ProsperoDirectoryRetailFinalizationProvider(retailArtifacts);
+                byte[] unsignedFih = (byte[])retailFih.Clone();
+                unsignedFih.AsSpan(
+                    ProsperoPkgLayout.FihRetailFinalizationOffset,
+                    ProsperoPkgLayout.FihRetailFinalizationSize).Clear();
+                ProsperoRetailFinalizationResult replayedFih =
+                    directoryProvider.FinalizeFih(
+                        new ProsperoRetailFinalizationRequest
+                        {
+                            FihHeader = unsignedFih,
+                        });
+                byte[] replayedCnt = directoryProvider.FinalizeCntHeader(
+                    new ProsperoRetailCntFinalizationRequest
+                    {
+                        CntHeader = retailCnt,
+                    });
+                byte[] storedCntAuthentication = ReadPackageRange(
+                    retailStream,
+                    checked(retailMap.CntOffset + 0x1000),
+                    ProsperoPublisherRsa.ModulusSize);
+                if (!replayedFih.FihFinalizationMaterial.AsSpan().SequenceEqual(
+                        retailFih.AsSpan(
+                            ProsperoPkgLayout.FihRetailFinalizationOffset,
+                            ProsperoPkgLayout.FihRetailFinalizationSize)) ||
+                    !replayedCnt.AsSpan().SequenceEqual(storedCntAuthentication))
+                {
+                    throw new InvalidDataException(
+                        "The directory Retail provider changed exported trusted material.");
+                }
+
+                unsignedFih[0x100] ^= 1;
+                try
+                {
+                    directoryProvider.FinalizeFih(
+                        new ProsperoRetailFinalizationRequest
+                        {
+                            FihHeader = unsignedFih,
+                        });
+                    throw new InvalidDataException(
+                        "The directory Retail provider accepted material for another FIH.");
+                }
+                catch (InvalidDataException ex) when (
+                    ex.Message.Contains("bound to another request", StringComparison.Ordinal))
+                {
+                    // Expected: captured material is usable only for the exact request.
+                }
             }
             Console.WriteLine(
-                "selftest: provider-backed standard Retail FIH/CNT resealing passed");
+                "selftest: provider-backed standard Retail FIH/CNT resealing and " +
+                "request-bound artifact replay passed");
 
             string artifactOutput = Path.Combine(regressionRoot, "publisher-artifacts");
             ProsperoPublisherPprFileBuildResult artifacts =

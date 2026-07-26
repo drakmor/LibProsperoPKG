@@ -131,11 +131,12 @@ public readonly record struct ProsperoPs5SparseAfidHole(
 /// <summary>Compression geometry for one 256 KiB logical block of an inner payload file.</summary>
 public readonly record struct ProsperoInnerDataBlockChunk(
     int CompressedSize, int UncompressedSize, bool IsStored,
-    bool IsMultiChunk, int FirstChunkCompressedSize);
+    bool IsMultiChunk, int FirstChunkCompressedSize, int BoundaryFlags = 0);
 
 /// <summary>One compressed-metadata 256KiB block's chunk sizes (for naps generation).</summary>
 public readonly record struct ProsperoInnerMetaBlockChunk(
-    int CompressedSize, int UncompressedSize, bool IsMultiChunk, int FirstChunkCompressedSize);
+    int CompressedSize, int UncompressedSize, bool IsMultiChunk,
+    int FirstChunkCompressedSize, int BoundaryFlags = 0);
 
 /// <summary>
 /// Builds a PS5 nwonly inner <c>pfs_image.dat</c> from a flat list of files. Handles the two flat-path
@@ -448,7 +449,7 @@ public sealed class ProsperoPs5InnerImageAssembler
                     if (compressedFile is not null)
                         f.CompressionBlocks = compressedFile.Blocks.Select(b => new ProsperoInnerDataBlockChunk(
                             b.CompressedSize, b.UncompressedSize, b.IsStored,
-                            b.IsMultiChunk, b.FirstChunkCompressedSize)).ToList();
+                            b.IsMultiChunk, b.FirstChunkCompressedSize, b.Flags)).ToList();
                 }
                 f.SceSys = f.FullPath.StartsWith("/sce_sys/", StringComparison.Ordinal);
                 // Publisher places every forced-raw bootstrap payload in a complete physical extent.
@@ -1002,7 +1003,8 @@ public sealed class ProsperoPs5InnerImageAssembler
         metaBlocks = metaPf is null
             ? Array.Empty<ProsperoInnerMetaBlockChunk>()
             : metaPf.Blocks.Select(b => new ProsperoInnerMetaBlockChunk(
-                b.CompressedSize, b.UncompressedSize, b.IsMultiChunk, b.FirstChunkCompressedSize)).ToList();
+                b.CompressedSize, b.UncompressedSize, b.IsMultiChunk,
+                b.FirstChunkCompressedSize, b.Flags)).ToList();
         pos = AlignUp(pos, BLK);
         metadataOnDisk = pos;
         if (outputPath is null)

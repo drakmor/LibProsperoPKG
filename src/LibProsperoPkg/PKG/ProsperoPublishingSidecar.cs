@@ -196,6 +196,9 @@ public static class ProsperoPublishingSidecar
         byte[] entryKeys = ReadPublisherEntryKeys(packagePath);
         byte[]? napsMeta18 = TryReadNapsMeta18(packagePath);
         string directory = Path.GetFullPath(outputDirectory);
+        bool exportRetail;
+        using (var input = File.OpenRead(packagePath))
+            exportRetail = ProsperoPkgReader.Read(input).Fih?.IsOfficial == true;
         var outputs = new List<(string Path, byte[] Data)>
         {
             (Path.Combine(directory, PublisherEntryKeysFileName), entryKeys),
@@ -206,7 +209,22 @@ public static class ProsperoPublishingSidecar
 
         if (!overwrite)
         {
-            string? existing = outputs.Select(output => output.Path).FirstOrDefault(File.Exists);
+            IEnumerable<string> candidatePaths = outputs.Select(output => output.Path);
+            if (exportRetail)
+            {
+                candidatePaths = candidatePaths.Concat(
+                [
+                    Path.Combine(directory,
+                        ProsperoDirectoryRetailFinalizationProvider.FihRequestDigestFileName),
+                    Path.Combine(directory,
+                        ProsperoDirectoryRetailFinalizationProvider.FihFinalizationFileName),
+                    Path.Combine(directory,
+                        ProsperoDirectoryRetailFinalizationProvider.CntRequestDigestFileName),
+                    Path.Combine(directory,
+                        ProsperoDirectoryRetailFinalizationProvider.CntAuthenticationFileName),
+                ]);
+            }
+            string? existing = candidatePaths.FirstOrDefault(File.Exists);
             if (existing is not null)
                 throw new IOException($"Refusing to overwrite existing publisher sidecar: {existing}");
         }
@@ -214,7 +232,17 @@ public static class ProsperoPublishingSidecar
         Directory.CreateDirectory(directory);
         foreach ((string path, byte[] data) in outputs)
             File.WriteAllBytes(path, data);
-        return outputs.Select(output => output.Path).ToArray();
+
+        var paths = outputs.Select(output => output.Path).ToList();
+        if (exportRetail)
+        {
+            // Standard-Retail FIH/CNT material is reusable only for the exact
+            // same deterministic request. Preserve it with SHA3 request bindings.
+            paths.AddRange(
+                ProsperoDirectoryRetailFinalizationProvider.ExportFromPackage(
+                    packagePath, directory, overwrite));
+        }
+        return paths;
     }
 
     private static byte[]? TryLoadRawSidecar(string fileName, int expectedLength, string? directory)

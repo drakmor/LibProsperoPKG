@@ -846,7 +846,8 @@ public static class ProsperoNapsMeta
                 LibProsperoPkg.PFS.Compression.ProsperoCompressedPfsImage.Pack(
                     inner.MetadataPlaintext, 7, (int)Meta18UBlock));
             metaChunks = mf.Blocks.Select(b => new LibProsperoPkg.PFS.ProsperoInnerMetaBlockChunk(
-                b.CompressedSize, b.UncompressedSize, b.IsMultiChunk, b.FirstChunkCompressedSize)).ToList();
+                b.CompressedSize, b.UncompressedSize, b.IsMultiChunk,
+                b.FirstChunkCompressedSize, b.Flags)).ToList();
         }
         ulong metaCursor = (ulong)inner.MetadataOnDiskOffset;
         int metaPlainOffset = 0;

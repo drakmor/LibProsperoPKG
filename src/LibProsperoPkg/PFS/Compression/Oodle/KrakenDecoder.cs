@@ -103,7 +103,7 @@ internal static class KrakenDecoder
         {
             st = chunk0NewLz
                 ? DecodeChunk(src, 0, src.Length, outBuf, 0, dst.Length, withSeed: true, litMode0)
-                : DecodeBareEntropyBlock(src, 0, src.Length, outBuf, 0, dst.Length);
+                : DecodeStoredOrBareEntropyBlock(src, 0, src.Length, outBuf, 0, dst.Length);
         }
         else
         {
@@ -118,7 +118,7 @@ internal static class KrakenDecoder
             // Sub-chunk 0 -> [0:ChunkMax].
             st = chunk0NewLz
                 ? DecodeChunk(src, 0, firstChunkComp, outBuf, 0, ChunkMax, withSeed: true, litMode0)
-                : DecodeBareEntropyBlock(src, 0, firstChunkComp, outBuf, 0, ChunkMax);
+                : DecodeStoredOrBareEntropyBlock(src, 0, firstChunkComp, outBuf, 0, ChunkMax);
             if (st != KrakenDecodeStatus.Success)
                 return st;
 
@@ -126,12 +126,28 @@ internal static class KrakenDecoder
             // regardless of how chunk0 was decoded (they share the destination buffer).
             st = chunk1NewLz
                 ? DecodeChunk(src, firstChunkComp, chunk1Comp, outBuf, ChunkMax, chunk1Dst, withSeed: false, litMode1)
-                : DecodeBareEntropyBlock(src, firstChunkComp, chunk1Comp, outBuf, ChunkMax, chunk1Dst);
+                : DecodeStoredOrBareEntropyBlock(src, firstChunkComp, chunk1Comp, outBuf, ChunkMax, chunk1Dst);
         }
 
         if (st == KrakenDecodeStatus.Success)
             outBuf.AsSpan(0, dst.Length).CopyTo(dst);
         return st;
+    }
+
+    private static KrakenDecodeStatus DecodeStoredOrBareEntropyBlock(
+        byte[] src, int srcStart, int srcLen, byte[] outBuf, int dstStart, int dstLen)
+    {
+        // NAPS half mode 1 is a byte-for-byte stored 128-KiB half. It shares the
+        // "not newLZ" boundary bit with bare-entropy modes, so length is the
+        // unambiguous discriminator used by the publisher reader: a complete
+        // source-sized half is copied directly; a shorter half has DecodeBytes
+        // framing and is passed to the entropy decoder.
+        if (srcLen == dstLen)
+        {
+            Array.Copy(src, srcStart, outBuf, dstStart, dstLen);
+            return KrakenDecodeStatus.Success;
+        }
+        return DecodeBareEntropyBlock(src, srcStart, srcLen, outBuf, dstStart, dstLen);
     }
 
     /// <summary>

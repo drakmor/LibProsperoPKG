@@ -908,10 +908,17 @@ public static class ProsperoNapsImage
     private static void DecodeKrakenSpan(
         byte[] payload, byte[] output, int firstChunk, ProsperoNapsSpan span)
     {
-        // NAPS uses bit 2 of each three-bit even/odd value for the newLZ-vs-bare-entropy choice.
-        // Literal prediction is carried separately by KdePredictor; predictor zero is raw literals.
+        // The three-bit NAPS half modes carry two independent Kraken choices:
+        //   bit 2 = newLZ rather than the stored/bare-entropy path;
+        //   bit 1 = sub/delta literals rather than raw literals.
+        // They map to the decoder's per-half flags (0x02/0x01 for even and
+        // 0x20/0x10 for odd). Publishing Tools emits both 5/4 (raw literals)
+        // and 7/6 (sub literals) while KdePredictor remains zero, so the KDE
+        // field must not be used as the Kraken literal-model selector.
         int flags = ((span.Even & 4) != 0 ? 0x02 : 0)
-            | ((span.Odd & 4) != 0 ? 0x20 : 0);
+            | ((span.Even & 2) != 0 ? 0x01 : 0)
+            | ((span.Odd & 4) != 0 ? 0x20 : 0)
+            | ((span.Odd & 2) != 0 ? 0x10 : 0);
         KrakenDecodeStatus status = KrakenDecoder.DecodeBlock(payload, flags, firstChunk, output);
         if (status != KrakenDecodeStatus.Success)
             throw new InvalidDataException(

@@ -218,6 +218,21 @@ protected material at FIH `0xF000..0xF2FF`, zeroes through `0xFFFF`, and no byte
 embedded CNT. Their CNT `fixed-info-digest` is SHA3-256 of the completed FIH, including this
 `0x300` block.
 
+The library can preserve this boundary without treating captured bytes as a general signing key.
+`export-publisher-inputs` exports:
+
+```text
+retail_fih_request.sha3       SHA3-256(FIH[0:0x10000] with 0xF000..0xF2FF cleared)
+retail_fih_finalization.bin   FIH[0xF000..0xF2FF] (0x300 bytes)
+retail_cnt_request.sha3       SHA3-256(final CNT[0:0x1000])
+retail_cnt_authentication.bin CNT[0x1000..0x117F] (0x180 bytes)
+```
+
+`ProsperoDirectoryRetailFinalizationProvider` compares both request hashes in constant time before
+returning either artifact. The files therefore support an exact deterministic rebuild of their
+source package but cannot finalize changed content. Fresh Retail content still requires an
+authorized implementation of `IProsperoRetailFinalizationProvider`.
+
 The Retail GeneralDigests HeaderDigest is not the ordinary debug HeaderDigest recomputed after
 finalization. A finite probe over both references also ruled out the simple "pre-finalized FIH"
 variant: clearing the trusted `0x300` bytes, toggling the signed byte, restoring preliminary

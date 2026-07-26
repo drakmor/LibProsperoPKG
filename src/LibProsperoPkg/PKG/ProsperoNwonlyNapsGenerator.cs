@@ -122,7 +122,8 @@ public static class ProsperoNwonlyNapsGenerator
             var metaFile = ProsperoCompressedPfsFile.Parse(
                 ProsperoCompressedPfsImage.Pack(result.MetadataPlaintext, 7, (int)Ublock256K));
             metaChunks = metaFile.Blocks.Select(b => new ProsperoInnerMetaBlockChunk(
-                b.CompressedSize, b.UncompressedSize, b.IsMultiChunk, b.FirstChunkCompressedSize)).ToList();
+                b.CompressedSize, b.UncompressedSize, b.IsMultiChunk,
+                b.FirstChunkCompressedSize, b.Flags)).ToList();
         }
         long metaOnDisk = result.MetadataOnDiskOffset;
         long metaCursor = metaOnDisk;
@@ -144,10 +145,14 @@ public static class ProsperoNwonlyNapsGenerator
                 LogicalOffset = metaBase + (long)i * Ublock256K,
                 EvenChunkCompressedLength = even,
                 StreamLength = blk.CompressedSize,
-                Even = stored ? (byte)1 : (byte)5,
+                Even = stored
+                    ? (byte)1
+                    : ToNapsHalfMode(blk.BoundaryFlags, firstHalf: true),
                 Odd = stored
                     ? (byte)(blk.CompressedSize > 0x20000 ? 1 : 0)
-                    : (byte)(blk.IsMultiChunk ? 4 : 0),
+                    : (byte)(blk.IsMultiChunk
+                        ? ToNapsHalfMode(blk.BoundaryFlags, firstHalf: false)
+                        : 0),
                 KdePredictor = 0,
                 ShuffleIndex = 0,
             });
@@ -219,5 +224,19 @@ public static class ProsperoNwonlyNapsGenerator
             });
 
         return ProsperoNapsLayout.BuildLayout(doc);
+    }
+
+    private static byte ToNapsHalfMode(int boundaryFlags, bool firstHalf)
+    {
+        int newLzMask = firstHalf ? 0x02 : 0x20;
+        int subLiteralMask = firstHalf ? 0x01 : 0x10;
+        if (boundaryFlags == 0)
+            return (byte)(4 | (firstHalf ? 1 : 0));
+        int mode = (boundaryFlags & newLzMask) != 0 ? 4 : 0;
+        if ((boundaryFlags & subLiteralMask) != 0)
+            mode |= 2;
+        if (firstHalf)
+            mode |= 1;
+        return checked((byte)mode);
     }
 }
