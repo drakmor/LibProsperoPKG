@@ -86,9 +86,16 @@ This document describes the current LibProsperoPkg package-building and reading 
 ### SELF container
 
 - Parses the SELF (Signed ELF) container through `Content.ProsperoFself`: header, segment table, embedded ELF header and program headers, and the extended-info block (authority id, program type, app and firmware version, digest).
-- Generates a fake-self from any 64-bit ELF with `MakeFself`. A digest/data segment pair is emitted for each program header whose file size is non-zero and whose type is `PT_LOAD`, module-data (`0x61000000`), relro (`0x61000010`), or comment (`0x6FFFFF00`), in program-header index order. Header size, metadata size, segment layout, and 16-byte data padding reproduce the reference module's field layout.
+- Generates a fake-self from any 64-bit ELF with `MakeFself`. A digest/data segment pair is emitted
+  for each program header whose file size is non-zero and whose type is `PT_LOAD`, module-data
+  (`0x61000000`), relro (`0x61000010`), or comment (`0x6FFFFF00`), in program-header index order.
+  Header size, metadata size, per-0x4000 digest sizing, segment alignment and the unaligned final
+  length reproduce the reference layout.
 - Sets the extended-info digest to `SHA-256` of the input ELF and derives the authority id and program type from the ELF type and the byte at file offset `0x3f00`. Digest and signature slots on the fake path are zero-filled.
 - Round-trips through the container parser. Validated against a set of decrypted reference modules: the type-based segment selection reproduces each module's content-segment set and every data segment matches the source program-header payload.
+- `.sceversion` is appended after the size recorded in the SELF header, matching publisher output.
+  `TryGetSdkVersion` and `TryGetSceVersionRecord` read either the ELF section or SELF trailer;
+  stripped PRX inputs can receive a synthesized `library-name:` record through `FselfOptions`.
 - `IsSelf`, `IsElf`, `Parse`, `Validate`, and `MakeFself` form the public API. Package builds continue to embed a fixed `right.sprx` asset when the source provides none; the generator is a standalone capability for arbitrary ELF input.
 
 ### Keystone
@@ -165,7 +172,29 @@ This document describes the current LibProsperoPkg package-building and reading 
   `license.info`, while AC/AL use key index 4; the other covered protected records use key index 3.
   Nested `uds/npbind.dat` (0x2020) and `trophy2/npbind.dat` (0x2021) retain their names and use
   key index 3. The corresponding UCP ids 0x14A0/0x1480 are mapped as ordinary data records.
-- `ProsperoBuildOptions.RequirePublisherCompatibility` (CLI trailing mode `strict`) turns the remaining external-input warnings into pre-build errors. It now requires only a caller/sidecar metadata signer. The PFS-image key, the complete 0x800-byte `IMAGE_KEY`, all seven `ENTRY_KEYS` wraps, `ihsh`, `rhsh`, and `obcc` are generated locally. `pfs_image_seed.bin` can fix the publisher seed, while `pfs_image_key.bin`, `pkg_image_key.bin`, and `pkg_entry_keys.bin` remain optional known-answer/preservation inputs. A NAPS CMAC key is not required for the verified Publishing Tools 2.79 debug/AC profile: its config constructor leaves CMAC mode disabled and real packages contain zero eight-byte outer-block tags. `NapsOuterBlockCmacKey` remains an optional input for another profile that explicitly enables keyed CMAC. Only `img_info`/`img_verify` can establish that the supplied signer belongs to the correct trust profile.
+- `ProsperoBuildOptions.RequirePublisherCompatibility` (CLI trailing mode `strict`) turns missing
+  required source/provider inputs into pre-build errors. The verified 2.79 debug profile needs no
+  private metadata signer: CNT/FIH uses the recovered public RSA-3072 wrapping profile. The
+  PFS-image key, complete 0x800-byte `IMAGE_KEY`, all seven `ENTRY_KEYS` wraps, `ihsh`, `rhsh`, and
+  `obcc` are generated locally. `pfs_image_seed.bin` can fix the publisher seed, while
+  `pfs_image_key.bin`, `pkg_image_key.bin`, and `pkg_entry_keys.bin` remain optional
+  known-answer/preservation inputs. A NAPS CMAC key is not required for the verified Publishing
+  Tools 2.79 debug/AC profile: real packages contain zero eight-byte outer-block tags.
+  `NapsOuterBlockCmacKey` remains an optional input for another profile that explicitly enables it.
+
+- The publisher PPR audit now covers both minimal and large APP/AC images. Metadata-only AC keeps
+  the real empty `/uroot/data` directory, while APP omits it when no data payload exists.
+  Non-`sce_sys` AFIDs use directory post-order; `sce_sys/pic2.png`, like the other package media,
+  remains CNT-only. The AFID region is rounded to 256 KiB before the fixed 60-block superblock gap,
+  metadata is padded to an even number of 64-KiB blocks, and the last block-info value uses
+  `afidDataEnd mod 0x10000`. NAPS emits and decodes both the full 16-byte shared-zero token and the
+  final even-only eight-byte token.
+
+- Loose APP ELF files are converted to the Prospero fake-SELF profile before AFID/FIDX placement.
+  The generator reproduces the PS5 header, digest/data segment sizes and metadata footer, keeps the
+  publisher `Header.FileSize` boundary, and appends `.sceversion` outside that boundary. Stripped
+  PRX inputs receive a synthesized library record using the main executable's real SDK tuple.
+  `param.json` receives the matching SDK/required-system values and mandatory neutral 2.79 fields.
 
 - The native protected-key producers are implemented. Dynamic tracing and static analysis of `sc2` show that `ENTRY_KEYS` contains seven deterministic RSA-3072 PKCS#1-v1_5 wraps. The padding seed is `SHA256(SHA256(modulus || message))`; it seeds MT19937, whose groups of twelve big-endian words are SHA-256-hashed to supply nonzero padding bytes. `KeysEntry` reproduces all seven reference ciphertexts byte-for-byte. `IMAGE_KEY` is not eight independent 0x100-byte records and is not ordinary CNT entry encryption through `dk3`: it is `RSA3072(mount modulus, pfs-image-key)[0x180] || SHAKE128(SHA3-256(pfs-image-key), 0x680)`. The generated 0x800-byte value matches a Publishing Tools 2.79 reference known-answer hash exactly. `PublisherImageKey` and `PublisherEntryKeys` remain verbatim override/preservation inputs, not required derivation inputs.
 
@@ -201,10 +230,9 @@ This document describes the current LibProsperoPkg package-building and reading 
   `KdePredictor` remains unsupported because the tested publisher packages use predictor zero
   and no predictor reference vector is available.
 - PPR direct-offset inodes are decoded as a single contiguous extent. Additional tail fields or fragmented/extents profiles, if emitted for large/base/patch packages, still require corpus coverage.
-- The inner-PFS filter treats `sce_sys/param.json` as CNT entry 0x2000 explicitly. Unlike most
-  outer system entries, it has no `EntryNames` enum mapping, so the earlier generic filter could
-  duplicate an auto-generated `param.json` in both CNT and nested PPR-PFS. The integration
-  regression now verifies that only the two application payload files remain in the inner image.
+- The inner-PFS filter treats `sce_sys/param.json` and `sce_sys/pic2.png` as CNT entries explicitly.
+  Neither is present in the older generic `EntryNames` table. The integration regression verifies
+  that system media is not duplicated in the nested PPR-PFS.
 - The signed 32-bit inode hierarchy is implemented as depth-1 through depth-5 trees in `ib[0..4]`; file-backed outer creation and `PfsReader` share that model. A real publisher image crossing from `ib[1]` to `ib[2]` is still needed for byte-order corpus confirmation, but the former 202.3-GiB writer limit is removed.
 - `naps_meta_300/301/302/308.dat` (the 48-byte records) are reproduced byte-exact by `ProsperoNapsMeta` from the build's own inner-image size and emitted in the SI segment automatically. `naps_meta_18.dat` is also built and AES-XTS encrypted automatically. Its geometry, file table, SHA3/checksum `ihsh`, rolling `rhsh`, and protected `obcc` are generated locally. The high-level builder derives the separate `sc2 estimate` PFS image key from primary id, passcode, and the effective image seed, so exact `obcc` no longer needs an external key pair. The low-level `ProsperoNapsMeta` API still zero-fills `obcc` when invoked without a key/seed/provider, while a supplied publisher-authored blob remains verbatim.
 - The legacy profile emits `<chunkinfo>`, `<pfs-image>`, and `<nested-image>` from captured inode trees. Verified Publishing Tools 2.79 APP/AC `nwonly` SI archives omit `pfsimage.xml` entirely and therefore do not require synthetic XML inode trees for the relocated direct-offset/NAPS view.
@@ -213,7 +241,17 @@ This document describes the current LibProsperoPkg package-building and reading 
   products, not separate keyed console secrets. Only direct use of the low-level `BuildPfsImageXml`
   API without completed CNT/FIH inputs can leave an all-zero placeholder, which is reported as a warning.
 - Byte-identical reproduction of a specific `nwonly` package remains limited by exact Kraken encoder choices at compression level 7. The generated package is valid and internally consistent, but downstream NAPS layout values and digests that depend on exact compressed bytes can differ.
-- External cross-testing is explicit. Publisher-produced `dlc_baseline.pkg` and `dlc_plain_cmpr.pkg` pass C# inspection, outer extraction, byte-exact NAPS serialization, `prospero-pub-cmd 2.79 img_info`, and `img_verify --format_check on --integrity_check on` (zero errors, one expected submission warning). A from-scratch C# AC rebuilt with the same decrypted license sidecars reproduces the reference 15-entry ids, flags, offsets and sizes, and decrypts both licenses back to their original SHA-256 values. It is still rejected at the first Publishing Tools format gate because its caller-independent research RSA-3072 CNT signature is not in the tool's trust profile; the isolated reference-package signature replacement test proved this gate independently of PFS/NAPS/SI content. A caller-supplied trusted `IProsperoMetadataSigner` is therefore mandatory for external acceptance. The recovered `obcc` pipeline was separately validated 3/3 against a fresh 2.79 build, and the preceding `sc2 estimate` PFS-image-key KDF now matches a captured 2.79 known-answer vector exactly. The verified 2.79 debug/AC profile intentionally stores zero NAPS outer-block CMAC tags. Internal round-trip success is not reported as RIC success.
+- External cross-testing is explicit. A fresh C# matrix consisting of empty, small and multi-block
+  AC, a complete SDK APP (ELF-to-SELF, two PRX, NP title, licenses and all required media), and PSAL
+  was checked by Publishing Tools 2.79. APP and all AC cases pass
+  `img_verify --format_check on --integrity_check on` with zero errors and only the expected
+  non-submission warning; PSAL passes format checking with zero errors and zero warnings (integrity
+  checking is not defined for PSAL). C# inspection, CNT/FIH RSA verification, every
+  `imagedigs.dat` block, nested-layout digest, inner extraction and payload hashes pass as well.
+  Thus the debug path does not require `IProsperoMetadataSigner`. Backend-issued license artifacts
+  remain inputs for profiles that require them, and trusted provider results remain mandatory for
+  standard Retail finalization. The recovered `obcc` pipeline was separately validated 3/3 against
+  a fresh 2.79 build; the verified profile intentionally stores zero NAPS outer-block CMAC tags.
 
 ## Summary table
 
@@ -232,7 +270,7 @@ This document describes the current LibProsperoPkg package-building and reading 
 | PS5 outer-image AES-XTS encryption | Implemented, byte-exact for the tested reference image |
 | PS5 outer-PFS signing hashes and `icv` | Implemented, byte-exact for the tested reference image |
 | PS5 outer-PFS data-first structure generator | Implemented, byte-exact for the tested reference image |
-| Metadata signing | PKCS#1 v1.5/SHA-256 and provider API implemented; Publishing Tools trust requires a caller-supplied compatible RSA-3072 signer |
+| Metadata signing | Debug public RSA-3072 wrapping is implemented and accepted by Publishing Tools 2.79; standard Retail authentication remains provider-backed |
 | Finalized debug image (`\\x7FFIH`) | Implemented |
 | Finalized digest table: `game-digest` / superblock digest | Implemented, byte-exact for tested debug packages |
 | CNT per-entry, body, fixed-info, param, package, and header-rollup digests | Implemented, byte-exact for tested debug packages |
@@ -249,7 +287,7 @@ This document describes the current LibProsperoPkg package-building and reading 
 | Keystone (`sce_sys/keystone`) | Implemented, byte-exact from passcode for version 2 and version 3 |
 | DDS BC7 texture generation | Implemented |
 | GP5 project model | Implemented, including AL, PlayGo languages/scenarios, content configs, implicit sources, and recursive rootdir overlays |
-| PSAL direct CNT+SI profile | Implemented structurally; a new backend-signed license and trusted metadata signer remain external inputs |
+| PSAL direct CNT+SI profile | Implemented and accepted by Publishing Tools 2.79; backend-issued license artifacts remain inputs when required |
 | Deterministic package build | Implemented for PSAL and APP/PPR-NAPS; independently repeated builds are byte-identical |
 | File-backed APP/PPR-NAPS extraction | Implemented; bounded outer-XTS memory and stream-to-file NAPS decode |
 | NAPS layout parser and serializer | Implemented; confirmed field semantics and strict validation |

@@ -950,6 +950,13 @@ public static class ProsperoPkgBuilder
             }
         }
 
+        // img_create converts loose ELF executables to debug FSELF before assigning AFIDs and
+        // calculating PPR/NAPS geometry.  Keeping the original ELF bytes changes both the logical
+        // file size and every following FIDX boundary (a 4.51 eboot sample is 0x33F40 as ELF and
+        // 0x28248 after the publisher conversion).
+        if (volumeType == ProsperoVolumeType.Application)
+            ConvertLooseElfExecutables(root);
+
         var sceSys = root.Dirs.FirstOrDefault(d => d.name == "sce_sys");
         if (sceSys != null)
         {
@@ -1021,6 +1028,70 @@ public static class ProsperoPkgBuilder
                     name.EndsWith(".gp5", StringComparison.OrdinalIgnoreCase))
                     continue;
                 node.Files.Add(new FSFile(file) { name = name, Parent = node });
+            }
+        }
+
+        static void ConvertLooseElfExecutables(FSDir rootDir)
+        {
+            byte[]? applicationSceVersion = null;
+            FSFile? executable = rootDir.GetAllChildrenFiles().FirstOrDefault(
+                file => file.FullPath().Replace('\\', '/')
+                    .Equals("/eboot.bin", StringComparison.Ordinal));
+            if (executable is not null)
+            {
+                byte[] executableBytes = ReadNode(executable);
+                ProsperoFself.TryGetSceVersionRecord(
+                    executableBytes, out applicationSceVersion);
+                if (applicationSceVersion.Length == 0)
+                    applicationSceVersion = null;
+            }
+            ConvertDirectory(rootDir);
+
+            void ConvertDirectory(FSDir directory)
+            {
+                for (int i = 0; i < directory.Files.Count; i++)
+                {
+                    FSFile file = directory.Files[i];
+                    string path = file.FullPath().Replace('\\', '/');
+                    bool executableDestination =
+                        path.Equals("/eboot.bin", StringComparison.Ordinal) ||
+                        path.StartsWith("/sce_module/", StringComparison.Ordinal) ||
+                        path.StartsWith("/sce_sys/about/", StringComparison.Ordinal);
+                    if (!executableDestination)
+                        continue;
+
+                    byte[] bytes = ReadNode(file);
+                    if (!ProsperoFself.IsElf(bytes))
+                        continue;
+                    FselfOptions? fselfOptions = null;
+                    bool isLibrary = !path.Equals(
+                        "/eboot.bin", StringComparison.Ordinal);
+                    if (isLibrary &&
+                        applicationSceVersion is not null &&
+                        !ProsperoFself.TryGetSceVersionRecord(
+                            bytes, out _))
+                    {
+                        fselfOptions = new FselfOptions
+                        {
+                            SceVersionName =
+                                Path.GetFileNameWithoutExtension(file.name),
+                            SceVersionRecord = applicationSceVersion,
+                        };
+                    }
+                    byte[] fself = ProsperoFself.MakeFself(
+                        bytes, fselfOptions);
+                    directory.Files[i] = new FSFile(
+                        output => output.Write(fself, 0, fself.Length),
+                        file.name,
+                        fself.Length)
+                    {
+                        Parent = directory,
+                        LayoutPriority = file.LayoutPriority,
+                    };
+                }
+
+                foreach (FSDir child in directory.Dirs)
+                    ConvertDirectory(child);
             }
         }
     }
@@ -1870,7 +1941,63 @@ public static class ProsperoPkgBuilder
         }
         else if (props.VolumeType == ProsperoVolumeType.Application)
         {
-            root["sdkVersion"] ??= "0x0000000000000000";
+            // Native img_create stamps the executable's .sceversion SDK into param.json and raises
+            // the required-system floor to the same value. The bundled debug profile falls back to
+            // 4.51 only for stripped ELF inputs that carry no version trailer. Leaving sdkVersion
+            // at zero makes img_verify reject an otherwise mountable package.
+            const ulong FallbackPublisherSdkVersion = 0x0451000000000000;
+            static ulong HexVersion(JsonNode? value)
+            {
+                string? text = value?.GetValue<string>();
+                return text is not null &&
+                       text.StartsWith("0x", StringComparison.OrdinalIgnoreCase) &&
+                       ulong.TryParse(
+                           text.AsSpan(2),
+                           System.Globalization.NumberStyles.AllowHexSpecifier,
+                           System.Globalization.CultureInfo.InvariantCulture,
+                           out ulong parsed)
+                    ? parsed
+                    : 0;
+            }
+            static string VersionText(ulong value) =>
+                $"0x{value:X16}".ToLowerInvariant();
+
+            ulong executableSdkVersion = 0;
+            string? executablePath = ResolveSourceFile(sourceFolder, "eboot.bin");
+            if (executablePath is not null)
+            {
+                byte[] executable = File.ReadAllBytes(executablePath);
+                ProsperoFself.TryGetSdkVersion(
+                    executable, out executableSdkVersion);
+            }
+            if (executableSdkVersion == 0)
+                executableSdkVersion = FallbackPublisherSdkVersion;
+
+            ulong sdkVersion = Math.Max(
+                HexVersion(root["sdkVersion"]), executableSdkVersion);
+            root["sdkVersion"] = VersionText(sdkVersion);
+            ulong requiredSystemVersion = Math.Max(
+                HexVersion(root["requiredSystemSoftwareVersion"]), sdkVersion);
+            root["requiredSystemSoftwareVersion"] =
+                VersionText(requiredSystemVersion);
+
+            // These fields are mandatory in the 2.79 application schema even when their neutral
+            // values were omitted by an older SDK sample.  img_create supplies the same defaults
+            // while canonicalizing param.json.
+            root["applicationDrmType"] ??= "standard";
+            root["attribute"] ??= 0;
+            root["attribute2"] ??= 0;
+            root["attribute3"] ??= 0;
+            root["conceptId"] ??= "10000000";
+            root["masterVersion"] ??= "01.00";
+            root["contentVersion"] ??= "01.000.000";
+            root["ageLevel"] ??= new JsonObject
+            {
+                ["JP"] = 0,
+                ["US"] = 0,
+                ["default"] = 0,
+            };
+            root["contentBadgeType"] ??= 1;
             root["addcont"] ??= new JsonObject
             {
                 ["serviceIdForSharing"] = new JsonArray(

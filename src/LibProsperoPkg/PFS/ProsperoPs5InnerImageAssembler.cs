@@ -253,7 +253,10 @@ public sealed class ProsperoPs5InnerImageAssembler
         const string prefix = "/sce_sys/";
         if (!fullPath.StartsWith(prefix, StringComparison.Ordinal)) return false;
         string rel = fullPath.Substring(prefix.Length);
-        return rel == "param.json" || PKG.EntryNames.NameToId.ContainsKey(rel);
+        // pic2.png uses the late 0x2040 media id and is intentionally outside the older
+        // EntryNames table, but it follows the same CNT-only policy as pic0/pic1.
+        return rel is "param.json" or "pic2.png" ||
+               PKG.EntryNames.NameToId.ContainsKey(rel);
     }
 
     /// <summary>Assembles the inner image from the supplied files.</summary>
@@ -322,12 +325,14 @@ public sealed class ProsperoPs5InnerImageAssembler
                 .OrderBy(SystemAfidRank)
                 .ThenBy(f => f.FullPath, StringComparer.Ordinal));
         }
-        foreach (var d in dirsPreOrder)
+        // Publisher AFIDs use directory post-order outside sce_sys: descendants first, then files
+        // directly in uroot.  For an APP this places data/* before the root eboot.bin.  Inode
+        // numbering remains the independent post-order rule above.
+        foreach (var d in dirsPostOrder)
             if (d != sceSys && !IsUnder(d, sceSys))
                 foreach (var f in d.Files.OrderBy(f => f.Name, StringComparer.Ordinal))
                     afidOrder.Add(f);
-        // Any files directly in uroot come after the sce_sys subtree, ordinal (already covered by the
-        // loop above because uroot is in dirsPreOrder and is not under sce_sys).
+        // Files directly in uroot are covered last because uroot is the last post-order directory.
         List<FileNode?> afidSlots;
         if (_explicitAfids is null)
         {
@@ -485,7 +490,17 @@ public sealed class ProsperoPs5InnerImageAssembler
         // uncompressed file extent; deriving it from the much smaller packed on-disk stream can place
         // fidx/inode offsets beyond Ndblock for compressible content. Physical packed placement is
         // calculated independently by BuildImage below.
-        long logicalDataBlocks = RoundUp(cursor, BlockSize) / BlockSize;
+        // The AFID data region ends on a complete 256-KiB NAPS unit and contains at least one such
+        // unit.  The superblock follows a fixed 60-block (0x3C0000) metadata gap:
+        //
+        //   superblock = alignUp(max(afidDataEnd, 1), 0x40000) + 0x3C0000
+        //
+        // A minimal AC image therefore places it at 0x400000.  Merely rounding to the 64-KiB PFS
+        // block size also breaks larger images (for example, a 0x95000 payload put the superblock
+        // at 0x460000 instead of the required 0x480000), which the publisher PFS reader rejects.
+        const long NapsLogicalBlockSize = 0x40000;
+        long logicalDataBlocks =
+            RoundUp(Math.Max(cursor, 1), NapsLogicalBlockSize) / BlockSize;
 
         // ---- 4. Dirents (with byte offsets). -------------------------------------------------------
         BuildDirents(uroot);
@@ -498,10 +513,11 @@ public sealed class ProsperoPs5InnerImageAssembler
         // ---- 6. Build the metadata nodes in inode order. ------------------------------------------
         var nodes = BuildNodes(uroot, dirsPreOrder, fileNodes, logicalDataBlocks,
             superRootInode, inodeFltInode, aprFltInode, afidTableInode,
-            metadataPayloads, out long ndblock);
+            metadataPayloads, out long ndblock, out int trailingMetadataBlocks);
 
         // ---- 7. Build metadata plaintext. ----------------------------------------------------------
-        byte[] metaPlain = BuildMetadataPlaintext(nodes, metadataPayloads, ndblock);
+        byte[] metaPlain = BuildMetadataPlaintext(
+            nodes, metadataPayloads, ndblock, trailingMetadataBlocks);
 
         // ---- 8. Assemble the data-first image. ----------------------------------------------------
         byte[] image = BuildImage(
@@ -561,6 +577,15 @@ public sealed class ProsperoPs5InnerImageAssembler
             dirLookup[fullPath] = dir;
             return dir;
         }
+
+        // A metadata-only AC always contains /uroot/data.  APP images, however, omit the directory
+        // when they have no data payload; a root eboot.bin distinguishes that profile.  A non-empty
+        // APP data directory is created naturally by the file loop below.
+        bool isApplication = files.Any(file =>
+            file.Path.Replace('\\', '/').TrimStart('/')
+                .Equals("eboot.bin", StringComparison.Ordinal));
+        if (!isApplication)
+            _ = GetDir("data");
 
         foreach (var f in files.OrderBy(f => f.Path, StringComparer.Ordinal))
         {
@@ -667,7 +692,8 @@ public sealed class ProsperoPs5InnerImageAssembler
     private List<ProsperoPs5MetaNode> BuildNodes(
         Dir uroot, List<Dir> dirsPreOrder, List<FileNode> fileNodes, long logicalDataBlocks,
         uint superRootInode, uint inodeFltInode, uint aprFltInode, uint afidTableInode,
-        IReadOnlyList<byte[]> metadataPayloads, out long ndblock)
+        IReadOnlyList<byte[]> metadataPayloads, out long ndblock,
+        out int trailingMetadataBlocks)
     {
         if (metadataPayloads.Count != 4 + dirsPreOrder.Count)
             throw new InvalidDataException("Inner metadata payload count does not match the filesystem tree.");
@@ -681,11 +707,14 @@ public sealed class ProsperoPs5InnerImageAssembler
             ProsperoPs5InnerMetadata.InodesPerBlock);
         // The reference data-first image keeps 60 logical blocks between the aligned end of the
         // AFID file extents and the superblock. Metadata consists of the superblock, the block-packed
-        // inode table, the variable payload extents, and one trailing reserved block.
+        // inode table and the variable payload extents, padded to an even count of 64-KiB blocks.
+        // Thus a minimal AC base of nine blocks gets one reserved block, while an APP with four
+        // directories already occupies ten and gets none.
         const long MetadataReserveBlocks = 60;
-        const int TrailingMetadataBlocks = 1;
-        int metadataTotalBlocks = checked(
-            1 /* superblock */ + inodeBlocks + metadataDataBlocks + TrailingMetadataBlocks);
+        int metadataBaseBlocks = checked(
+            1 /* superblock */ + inodeBlocks + metadataDataBlocks);
+        int metadataTotalBlocks = checked((metadataBaseBlocks + 1) & ~1);
+        trailingMetadataBlocks = metadataTotalBlocks - metadataBaseBlocks;
         long metadataStartBlock = logicalDataBlocks + MetadataReserveBlocks;
         long metadataPayloadStartBlock = metadataStartBlock + 1 + inodeBlocks;
         long metaBase = metadataPayloadStartBlock * BlockSize;
@@ -858,10 +887,14 @@ public sealed class ProsperoPs5InnerImageAssembler
     }
 
     private byte[] BuildMetadataPlaintext(
-        List<ProsperoPs5MetaNode> nodes, List<byte[]> metadataPayloads, long ndblock)
+        List<ProsperoPs5MetaNode> nodes, List<byte[]> metadataPayloads, long ndblock,
+        int trailingMetadataBlocks)
     {
-        // One final zero extent follows all variable metadata payloads in the reference image.
-        var extents = new List<byte[]>(metadataPayloads) { Array.Empty<byte>() };
+        if (trailingMetadataBlocks is < 0 or > 1)
+            throw new InvalidDataException("Publisher metadata padding must be zero or one block.");
+        var extents = new List<byte[]>(metadataPayloads);
+        if (trailingMetadataBlocks != 0)
+            extents.Add(Array.Empty<byte>());
         var meta = new ProsperoPs5InnerMetadata(_timeSec, _timeNsec);
         return meta.Build(nodes, ndblock, extents);
     }
@@ -1027,15 +1060,16 @@ public sealed class ProsperoPs5InnerImageAssembler
     /// entries carry <see cref="BlockInfoTemplate"/>; the final entry is derived from the
     /// logical end of all afid files.
     /// <para>The final entry, read as the three displayed bytes, equals
-    /// <c>0x27FFFC − 4·(afidDataEnd mod 0x40000)</c>. For the publisher baseline
+    /// <c>0x27FFFC − 4·(afidDataEnd mod 0x10000)</c>. For the publisher baseline
     /// <c>afidDataEnd=0xA</c> this produces <c>27 FF D4</c>; for the compressed AC sample
-    /// <c>afidDataEnd mod 0x40000=0x8C</c> it produces <c>27 FD CC</c>.</para>
+    /// <c>afidDataEnd mod 0x10000=0x8C</c> it produces <c>27 FD CC</c>. A larger
+    /// <c>0x2B482</c> tail uses <c>0xB482</c> and produces <c>25 2D F4</c>.</para>
     /// </summary>
     /// <param name="afidDataEnd">Logical end of all afid file data, including sce_sys files.</param>
     private static byte[] BuildBlockInfoTable(long afidDataEnd)
     {
-        // Four times the sub-256-KiB logical tail; the base always exceeds this, so no borrow.
-        uint sub = checked((uint)((afidDataEnd & 0x3FFFF) * 4));
+        // Four times the sub-64-KiB logical tail; higher AFID offset bits do not participate.
+        uint sub = checked((uint)((afidDataEnd & 0xFFFF) * 4));
         uint bigEndian = (BlockInfoBase - sub) & 0xFFFFFF;
         uint value = ((bigEndian & 0xFF) << 16) | (bigEndian & 0xFF00) | ((bigEndian >> 16) & 0xFF);
 

@@ -1383,6 +1383,44 @@ internal static class Program
             // Expected structural rejection before reading the record body.
         }
 
+        byte[] minimalElf = new byte[0xA0];
+        "\u007fELF"u8.CopyTo(minimalElf);
+        minimalElf[4] = 2;
+        BinaryPrimitives.WriteUInt16LittleEndian(
+            minimalElf.AsSpan(0x10), 2);
+        BinaryPrimitives.WriteUInt64LittleEndian(
+            minimalElf.AsSpan(0x20), 0x40);
+        BinaryPrimitives.WriteUInt16LittleEndian(
+            minimalElf.AsSpan(0x36), 0x38);
+        BinaryPrimitives.WriteUInt16LittleEndian(
+            minimalElf.AsSpan(0x38), 1);
+        BinaryPrimitives.WriteUInt32LittleEndian(
+            minimalElf.AsSpan(0x40), 1);
+        BinaryPrimitives.WriteUInt64LittleEndian(
+            minimalElf.AsSpan(0x48), 0x80);
+        BinaryPrimitives.WriteUInt64LittleEndian(
+            minimalElf.AsSpan(0x60), 0x20);
+        byte[] sdkRecord = [4, 0, 0, 0x31, 0, 0, 2, 0x11];
+        byte[] versionedFself = ProsperoFself.MakeFself(
+            minimalElf,
+            new FselfOptions
+            {
+                SceVersionName = "libSelfTest",
+                SceVersionRecord = sdkRecord,
+            });
+        ulong recordedSelfSize = BinaryPrimitives.ReadUInt64LittleEndian(
+            versionedFself.AsSpan(0x10));
+        if (recordedSelfSize >= (ulong)versionedFself.LongLength ||
+            versionedFself.AsSpan((int)recordedSelfSize)
+                .IndexOf("libSelfTest:"u8) < 0 ||
+            !ProsperoFself.TryGetSdkVersion(
+                versionedFself, out ulong fselfSdkVersion) ||
+            fselfSdkVersion != 0x0400000000000000)
+        {
+            throw new InvalidDataException(
+                "Publisher FSELF .sceversion trailer was not preserved outside Header.FileSize.");
+        }
+
         byte[] displacedPhdrElf = new byte[0x40];
         "\u007fELF"u8.CopyTo(displacedPhdrElf);
         displacedPhdrElf[4] = 2;
@@ -1398,7 +1436,7 @@ internal static class Program
             // Expected: the FSELF header embeds ELF+PHDR as one contiguous region.
         }
         Console.WriteLine(
-            "selftest: sc2 RSA banks, CNT public wrap, ENTRY_KEYS and FSELF validation passed");
+            "selftest: sc2 RSA banks, CNT public wrap, ENTRY_KEYS and FSELF/.sceversion validation passed");
 
         string regressionRoot = Path.Combine(
             Path.GetTempPath(), "LibProsperoPkg-selftest-" + Guid.NewGuid().ToString("N"));
@@ -1467,12 +1505,18 @@ internal static class Program
             ];
             var innerAssembler = new ProsperoPs5InnerImageAssembler(0, 0);
             ProsperoPs5InnerImageResult memoryInner = innerAssembler.Build(innerFiles);
+            if (!memoryInner.Nodes.Any(node =>
+                    node.IsDirectory &&
+                    node.FullPath.Equals("data", StringComparison.Ordinal)))
+            {
+                throw new InvalidDataException(
+                    "Specialized inner image omitted the mandatory /uroot/data directory.");
+            }
             int specializedInodeBlocks = checked(
                 (memoryInner.Nodes.Count + ProsperoPs5InnerMetadata.InodesPerBlock - 1) /
                 ProsperoPs5InnerMetadata.InodesPerBlock);
             long specializedDataEndBlocks = checked(
-                (memoryInner.DataEndLogical + ProsperoPs5InnerMetadata.BlockSize - 1) /
-                ProsperoPs5InnerMetadata.BlockSize);
+                (memoryInner.DataEndLogical + 0x40000 - 1) / 0x40000 * 4);
             int trailingMetadataOffset = checked(
                 memoryInner.MetadataPlaintext.Length -
                 ProsperoPs5InnerMetadata.BlockSize);
@@ -1503,6 +1547,33 @@ internal static class Program
             {
                 throw new InvalidDataException(
                     "File-backed and in-memory specialized inner-image assemblers differ.");
+            }
+
+            ProsperoPs5InnerImageResult minimalInner = innerAssembler.Build(
+            [
+                new ProsperoPs5InnerFile
+                {
+                    Path = "/sce_sys/pfs-version.dat",
+                    Data = "01.000.000"u8.ToArray(),
+                },
+            ]);
+            ProsperoPs5MetaNode minimalSuperRoot = minimalInner.Nodes.Single(
+                node => node.Inode == 0);
+            if (minimalInner.Nodes.Count != 8 ||
+                minimalInner.Ndblock != 74 ||
+                minimalInner.MetaBaseLogical != 0x400000 ||
+                minimalSuperRoot.LogicalOffset != 0x420000 ||
+                minimalInner.MetadataPlaintext.LongLength != 10L * 0x10000 ||
+                !minimalInner.Nodes.Any(node =>
+                    node.IsDirectory &&
+                    node.FullPath.Equals("data", StringComparison.Ordinal)) ||
+                !minimalInner.Nodes.Any(node =>
+                    node.IsDirectory &&
+                    node.FullPath.Equals("sce_sys", StringComparison.Ordinal)))
+            {
+                throw new InvalidDataException(
+                    "Minimal publisher PPR-PFS geometry differs from the reference 0x400000 " +
+                    "superblock / eight-inode layout.");
             }
 
             IReadOnlyList<ProsperoPs5InnerFile> sparseInnerFiles =
@@ -1653,6 +1724,67 @@ internal static class Program
             }
             Console.WriteLine(
                 "selftest: sparse AFID/FIDX, NAPS/meta18 zero extents and TSV round trip passed");
+
+            // Publisher nwonly uses an eight-byte shared-zero token when the alignment gap before
+            // metadata occupies only the even half of the final 256-KiB unit.  This is not an
+            // eight-byte Kraken stream and must reconstruct as zeroes.
+            byte[] partialTailData = new byte[0x28001];
+            new Random(0x4E415053).NextBytes(partialTailData);
+            ProsperoPs5InnerImageResult partialTailInner =
+                new ProsperoPs5InnerImageAssembler(0, 0).Build(
+                [
+                    new ProsperoPs5InnerFile
+                    {
+                        Path = "/data/partial-tail.bin",
+                        Data = partialTailData,
+                    },
+                ]);
+            if (partialTailInner.DataEndLogical != partialTailData.LongLength)
+                throw new InvalidDataException(
+                    "Partial-tail fixture was unexpectedly compressed or repositioned.");
+            byte[] partialTailNapsBytes =
+                ProsperoNwonlyNapsGenerator.Generate(partialTailInner);
+            NapsLayoutDocument partialTailNaps =
+                ProsperoNapsLayout.Parse(partialTailNapsBytes);
+            ProsperoNapsSpan partialZeroSpan =
+                ProsperoNapsImage.BuildPlan(partialTailNaps).Spans.Single(span =>
+                    span.UncompressedOffset >= partialTailInner.DataEndLogical &&
+                    span.UncompressedOffset < partialTailInner.MetaBaseLogical &&
+                    span.Even == 1 &&
+                    span.Odd == 0 &&
+                    span.CompressedLength == 8);
+            if (partialZeroSpan.Even != 1 ||
+                partialZeroSpan.Odd != 0 ||
+                partialZeroSpan.CompressedLength != 8 ||
+                partialZeroSpan.UncompressedLength !=
+                    partialTailInner.MetaBaseLogical - partialZeroSpan.UncompressedOffset)
+            {
+                throw new InvalidDataException(
+                    $"Publisher partial NAPS zero-tail geometry was not emitted: " +
+                    $"dataEnd=0x{partialTailInner.DataEndLogical:X}, " +
+                    $"metaBase=0x{partialTailInner.MetaBaseLogical:X}, " +
+                    $"even={partialZeroSpan.Even}, odd={partialZeroSpan.Odd}, " +
+                    $"compressed=0x{partialZeroSpan.CompressedLength:X}, " +
+                    $"logical=0x{partialZeroSpan.UncompressedLength:X}.");
+            }
+            using var partialTailPhysical =
+                new MemoryStream(partialTailInner.Image, writable: false);
+            using var partialTailLogical = new MemoryStream();
+            ProsperoNapsImage.Decompress(
+                partialTailPhysical, partialTailNaps, partialTailLogical);
+            byte[] partialTailMount = partialTailLogical.ToArray();
+            if (!partialTailMount.AsSpan(0, partialTailData.Length)
+                    .SequenceEqual(partialTailData) ||
+                partialTailMount.AsSpan(
+                    partialTailData.Length,
+                    checked((int)(partialTailInner.MetaBaseLogical -
+                        partialTailData.LongLength))).IndexOfAnyExcept((byte)0) >= 0)
+            {
+                throw new InvalidDataException(
+                    "The partial NAPS zero tail did not reconstruct the logical image.");
+            }
+            Console.WriteLine(
+                "selftest: partial even-only NAPS zero tail passed");
 
             const string deterministicContentId = "IV9999-PPSA00000_00-DETERMINISTIC000";
             const string deterministicPasscode = "00000000000000000000000000000000";

@@ -89,6 +89,11 @@ public static class ProsperoNwonlyNapsGenerator
         long paddingBytes = metaBase - dataEnd;
         int paddingBlocks = paddingBytes > 0 ? (int)((paddingBytes + Ublock256K - 1) / Ublock256K) : 0;
         for (int k = 0; k < paddingBlocks; k++)
+        {
+            long logicalLength = Math.Min(
+                Ublock256K,
+                paddingBytes - (long)k * Ublock256K);
+            bool hasOddHalf = logicalLength > 0x20000;
             tail.Add(new NapsCblockPlanEntry
             {
                 // The first padding block re-anchors to the block-info record. Subsequent window RUNs are
@@ -97,12 +102,16 @@ public static class ProsperoNwonlyNapsGenerator
                 OnDiskOffset = result.BlockInfoOnDiskOffset,
                 LogicalOffset = dataEnd + (long)k * Ublock256K,
                 EvenChunkCompressedLength = 8,
-                StreamLength = 0x10,
+                // A complete zero ublock reuses two eight-byte compressed-zero chunks.  When the
+                // final logical gap contains only its even 128-KiB half, the publisher emits one
+                // chunk and clears Odd; declaring the absent odd half overlaps the metadata range.
+                StreamLength = hasOddHalf ? 0x10 : 0x08,
                 Even = 1,
-                Odd = 1,
+                Odd = hasOddHalf ? (byte)1 : (byte)0,
                 KdePredictor = 0,
                 ShuffleIndex = 0,
             });
+        }
 
         // Metadata blocks: the assembler already captured the compressed metadata's per-256K-block chunk
         // table (ProsperoInnerMetaBlockChunk), so reuse it instead of Kraken-packing the metadata again.

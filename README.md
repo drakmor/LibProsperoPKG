@@ -212,9 +212,11 @@ See **[docs/](docs/)** for the full feature status and the PS5 package technical
 ## Limitations
 
 LibProsperoPkg produces a complete, self-consistent package whose CNT/FIH digests, outer PFS,
-NAPS mapping, inner PPR-PFS, and debug install metadata round-trip through the reader. Exact
-publisher acceptance still depends on a trusted RSA-3072 metadata signer and (for AC/AL) a
-backend-authored license.
+NAPS mapping, inner PPR-PFS, and debug install metadata round-trip through the reader. The built-in
+public RSA-3072 profile is sufficient for the verified Publishing Tools 2.79 debug FIH/CNT path:
+fresh APP and AC packages pass its format and integrity checks. Backend-issued licenses remain
+external inputs when the selected APP/AC/AL profile requires them; trusted finalization material is
+still required for standard Retail output.
 The `obcc` transform itself is implemented exactly as the recovered HMAC-SHA256 +
 AES-128-XTS-encrypt + CRC32C pipeline. The builder derives the `sc2 estimate`
 `pfs-image-key` locally as

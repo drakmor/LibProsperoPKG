@@ -658,15 +658,23 @@ public static class ProsperoNapsImage
 
     private static bool IsDeduplicatedZeroSpan(ProsperoNapsSpan span)
     {
-        // naps_meta_300 describes this form as flag 0x40110000, cs=0x10,
-        // c0=c1=8.  In CblockInfo that becomes modes 1/1 with no
-        // predictor/shuffle.  Requiring a logical size larger than the token keeps a legitimate
-        // 16-byte raw span from being mistaken for a hole.
-        return span.CompressedLength == 0x10
+        // naps_meta_300 describes a complete 256-KiB hole as flag 0x40110000,
+        // cs=0x10 and c0=c1=8.  A final hole that occupies only the even
+        // 128-KiB half uses the same shared token with odd=0 and cs=0x8.
+        // The bytes at the physical offset are a CblockInfo/deduplication token,
+        // not a Kraken stream.  Requiring a logical extent larger than the token
+        // keeps a legitimate eight- or sixteen-byte raw span from being treated
+        // as a hole.
+        bool completeUnit = span.Odd == 1
+            && span.CompressedLength == 0x10
+            && span.UncompressedLength > 0x10;
+        bool evenHalfOnly = span.Odd == 0
+            && span.CompressedLength == 0x8
+            && span.UncompressedLength > 0x8
+            && span.UncompressedLength <= 0x20000;
+        return (completeUnit || evenHalfOnly)
             && span.FirstChunkCompressedLength == 8
-            && span.UncompressedLength > 0x10
             && span.Even == 1
-            && span.Odd == 1
             && span.KdePredictor == 0
             && span.ShuffleIndex == 0;
     }

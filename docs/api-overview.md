@@ -181,6 +181,8 @@ The PS5 compression-file (`PFSC` v3) codec used by the `nwonly` path.
   `VerifyDigest`, and `WithRepairedDigest`.
 - **`ProsperoFself`** — parses SELF containers and generates a fake-self from a 64-bit ELF.
   `IsSelf`, `IsElf`, `Parse`, `Validate`, and `MakeFself` (with `FselfOptions` for app and firmware
-  version and an optional authority id). `MakeFself` requires the program-header table at ELF
-  offset `0x40` and rejects header/metadata sizes that cannot be represented by the 16-bit SCE
-  fields. The read model exposes `SelfImage`, `SelfSegment`, and `SelfExtInfo`.
+  version, an optional authority id, and optional synthesized PRX `.sceversion` data).
+  `TryGetSdkVersion` and `TryGetSceVersionRecord` inspect either an ELF section or the publisher
+  trailer after SELF `FileSize`. `MakeFself` requires the program-header table at ELF offset `0x40`
+  and rejects header/metadata sizes that cannot be represented by the 16-bit SCE fields. The read
+  model exposes `SelfImage`, `SelfSegment`, and `SelfExtInfo`.

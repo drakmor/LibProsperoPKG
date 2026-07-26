@@ -391,9 +391,11 @@ stream. CNT-entry placement for each file is described below.
 | `playgo-chunk.crc` | `config/<content-id>/` (SI) | CRC-32C over each 64 KiB block of the finalized mount image. `ProsperoPlayGo.BuildChunkCrc`. |
 | `naps_meta_18.dat` | `sce_suppl/common/etc` (SI) | Per-package AES-XTS TLV metric blob; built by `ProsperoNapsMeta.BuildMeta18`. Exact `obcc` uses the locally derived `sc2 estimate` PFS image key and effective seed, with an optional provider override. |
 | `naps_meta_300/301/302/308.dat` | `sce_suppl/common/etc` (SI) | 48-byte NAPS records; `301/302/308` are byte-identical to `300`. Reproduced byte-exact (`ProsperoNapsMeta`). |
-| `pfsimage.xml` | `sce_suppl/common/etc` (SI) | Machine-readable image descriptor; reproduced through `<entries>` plus the `<chunkinfo>`/`<pfs-image>`/`<nested-image>` introspection trees (self-consistent; see §5.4). |
+| `pfsimage.xml` | legacy/alternate SI profiles | Machine-readable image descriptor reproduced through `<entries>` plus the `<chunkinfo>`/`<pfs-image>`/`<nested-image>` introspection trees. Verified Publishing Tools 2.79 APP/AC `nwonly` SI omits this member. |
 
-> **`naps_pkg_layout.dat` is NOT present in `nwonly` debug packages.** LibProsperoPkg includes a round-trip serializer/parser (`ProsperoNapsLayout`) for completeness but never fabricates the file.
+> **`naps_pkg_layout.dat` is an outer-PFS file, not an SI member.** The publisher PPR/NAPS builder
+> generates it for every `nwonly` APP/AC package; FIH `+0xA8/+0xB0` stores its exact length and
+> SHA3-256 digest. It is absent only from the `sce_suppl` ZIP view, not from the package.
 
 ### 8.1 Supplied system files
 
@@ -447,13 +449,16 @@ build with a descriptive error rather than producing an invalid package.
 header, segment table, embedded ELF header and program headers, and the extended-info block, and can
 generate a fake-self from any 64-bit ELF with `MakeFself`.
 
-The generator emits a digest/data segment pair for each program header whose file size is non-zero and
+The generator emits the Prospero magic/version header and a digest/data segment pair for each program header whose file size is non-zero and
 whose type is `PT_LOAD`, module-data (`0x61000000`), relro (`0x61000010`), or comment (`0x6FFFFF00`),
 in program-header index order. The extended-info digest is `SHA-256` of the input ELF; the authority id
 and program type are derived from the ELF type and the byte at file offset `0x3f00`; digest and
-signature slots are zero-filled. A generated module round-trips through the parser and reproduces the
-segment layout of the reference module. Package builds embed a fixed `right.sprx` asset when the source
-provides none (§6); the generator is a standalone capability for arbitrary ELF input.
+signature slots are zero-filled. Publishing Tools append the non-allocated `.sceversion` bytes after
+the total size recorded in the SELF header; the generator preserves that exact boundary. For a
+stripped PRX, the package path synthesizes one `library-name:` record from the main executable's SDK
+tuple. A generated SDK executable is byte-exact with the tested Publishing Tools 2.79 fake-SELF,
+including the trailer. Package builds embed a fixed `right.sprx` asset when the source provides none
+(§6); the generator is also a standalone capability for arbitrary ELF input.
 
 > **Reproducibility boundary.** The `pfsimage.xml` `content/game/header/system/param/package/body/sblock/fixed-info`
 > rows are ordinary SHA3-256 products of the completed CNT, FIH, entries and plaintext superblock; the high-level
