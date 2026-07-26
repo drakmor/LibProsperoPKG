@@ -422,7 +422,11 @@ public static class PprPfsKraken
             EncodedBlock? encoded = groupSize == 0 || forceRaw
                 ? null
                 : OodleKrakenEncoder.EncodeBlock(
-                    inputGroup, useHuffmanArrays: true, compressionLevel: options.Level);
+                    inputGroup,
+                    useHuffmanArrays: true,
+                    compressionLevel: options.Level,
+                    allowSubLiterals: false,
+                    allowStoredHalves: false);
             int requiredSavings = checked(
                 (groupSize * options.MinimumSavingsPercent + 99) / 100);
             int encodedSize = encoded?.Payload.Length ?? int.MaxValue;
@@ -448,7 +452,12 @@ public static class PprPfsKraken
                 }
 
                 if (options.VerifyBlocks)
-                    VerifyEncodedBlock(payload, inputGroup, block.FirstChunkCompSize, decodedBuffer!);
+                    VerifyEncodedBlock(
+                        payload,
+                        inputGroup,
+                        block.FirstChunkCompSize,
+                        block.BoundaryFlags,
+                        decodedBuffer!);
 
                 AddOffset(offsets, destination.Position, GroupBoundaryFlag | CompressedFlag);
                 if (twoChunks)
@@ -602,14 +611,14 @@ public static class PprPfsKraken
         byte[] payload,
         ReadOnlySpan<byte> expected,
         int firstChunkCompSize,
+        int boundaryFlags,
         byte[] decodedBuffer)
     {
         Span<byte> decoded = decodedBuffer.AsSpan(0, expected.Length);
         bool multiChunk = expected.Length > BlockSize;
-        int flags = multiChunk ? 0x02 | 0x20 : 0x02;
         KrakenDecodeStatus status = KrakenDecoder.DecodeBlock(
             payload,
-            flags,
+            boundaryFlags,
             firstChunkComp: multiChunk ? firstChunkCompSize : 0,
             decoded);
         if (status != KrakenDecodeStatus.Success || !decoded.SequenceEqual(expected))

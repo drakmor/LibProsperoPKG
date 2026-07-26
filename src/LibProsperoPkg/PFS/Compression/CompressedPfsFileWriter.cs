@@ -225,6 +225,7 @@ public static class CompressedPfsFileWriter
         var blockIsCompressed = new bool[blockCount];
         var blockMultiChunk = new bool[blockCount];
         var blockFirstChunkComp = new int[blockCount];
+        var blockBoundaryFlags = new int[blockCount];
         var blockUncompSize = new int[blockCount];
         long cumulativeUncomp = 0;
         long totalCompressed = 0;
@@ -241,6 +242,7 @@ public static class CompressedPfsFileWriter
                 blockIsCompressed[i] = true;
                 blockMultiChunk[i] = eb.MultiChunk;
                 blockFirstChunkComp[i] = eb.FirstChunkCompSize;
+                blockBoundaryFlags[i] = eb.BoundaryFlags;
             }
             else
             {
@@ -309,9 +311,7 @@ public static class CompressedPfsFileWriter
             ulong sizeHint;
             if (blockIsCompressed[i])
             {
-                // Single chunk -> 0x06, hint = whole compressed size - 1. Two chunks -> 0x26, hint =
-                // first chunk's compressed size - 1 (the rebuilder splits the block on that value).
-                flags = blockMultiChunk[i] ? CompressedFlag | MultiChunkFlag : CompressedFlag;
+                flags = checked((ulong)blockBoundaryFlags[i]);
                 int hintBase = blockMultiChunk[i] ? blockFirstChunkComp[i] : csize;
                 sizeHint = (ulong)Math.Min(Math.Max(hintBase - 1, 0), (long)SizeHintMax);
             }

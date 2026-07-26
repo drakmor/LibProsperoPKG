@@ -9,10 +9,11 @@
 //
 // A PFS block (up to blockSize, default 256 KiB) is encoded as ONE or TWO headerless newLZ chunks,
 // because a single newLZ chunk decodes at most 128 KiB (0x20000). blockSize 0x40000 is therefore
-// exactly two chunks; the block-boundary table flags a two-chunk block with the 0x20 bit (flag 0x26
-// instead of 0x06) and stores the first chunk's compressed size in its saturating size hint, exactly
-// as the frame rebuilder expects when it splits the block
-// back into per-chunk OodleLZ frames.
+// exactly two chunks. The block-boundary byte describes each half independently: bits 0x02/0x20
+// select newLZ and 0x01/0x10 select sub/delta literals for the first/second half. A half for which
+// compression is not beneficial is stored directly while the other half may remain newLZ. The size
+// hint stores the first half's physical size, exactly as the frame rebuilder expects when it splits
+// the block back into per-chunk OodleLZ frames.
 //
 // CHUNK FORMAT ("excess mode", post-seed control byte high bit set):
 //
@@ -62,17 +63,37 @@ internal readonly struct EncodedBlock
     /// <summary>The bytes that land in section 7 for this block (one or two concatenated chunks).</summary>
     public readonly byte[] Payload;
 
-    /// <summary>True when the block is two chunks (boundary flag 0x26); false for a single chunk (0x06).</summary>
+    /// <summary>True when the block has two independently encoded 128-KiB halves.</summary>
     public readonly bool MultiChunk;
 
     /// <summary>The compressed size of the first chunk (the value stored, minus one, in the size hint).</summary>
     public readonly int FirstChunkCompSize;
 
-    public EncodedBlock(byte[] payload, bool multiChunk, int firstChunkCompSize)
+    /// <summary>The authoritative PFSC boundary flag byte for both halves.</summary>
+    public readonly int BoundaryFlags;
+
+    /// <summary>The corresponding NAPS mode for the even half.</summary>
+    public byte NapsEvenMode =>
+        (byte)(1
+            | ((BoundaryFlags & 0x02) != 0 ? 4 : 0)
+            | ((BoundaryFlags & 0x01) != 0 ? 2 : 0));
+
+    /// <summary>The corresponding NAPS mode for the odd half, or zero when absent.</summary>
+    public byte NapsOddMode => !MultiChunk
+        ? (byte)0
+        : (byte)(((BoundaryFlags & 0x20) != 0 ? 4 : 1)
+            | ((BoundaryFlags & 0x10) != 0 ? 2 : 0));
+
+    public EncodedBlock(
+        byte[] payload,
+        bool multiChunk,
+        int firstChunkCompSize,
+        int boundaryFlags)
     {
         Payload = payload;
         MultiChunk = multiChunk;
         FirstChunkCompSize = firstChunkCompSize;
+        BoundaryFlags = boundaryFlags;
     }
 }
 
@@ -166,7 +187,26 @@ internal static class OodleKrakenEncoder
     /// levels reduce match-search effort and skip Huffman arrays; non-negative levels retain
     /// entropy coding when requested.
     /// </summary>
-    public static EncodedBlock? EncodeBlock(ReadOnlySpan<byte> data, bool useHuffmanArrays, int compressionLevel)
+    public static EncodedBlock? EncodeBlock(
+        ReadOnlySpan<byte> data,
+        bool useHuffmanArrays,
+        int compressionLevel)
+        => EncodeBlock(
+            data,
+            useHuffmanArrays,
+            compressionLevel,
+            allowSubLiterals: true,
+            allowStoredHalves: true);
+
+    /// <summary>
+    /// Compresses a block with explicit control over publisher half-block modes.
+    /// </summary>
+    public static EncodedBlock? EncodeBlock(
+        ReadOnlySpan<byte> data,
+        bool useHuffmanArrays,
+        int compressionLevel,
+        bool allowSubLiterals,
+        bool allowStoredHalves)
     {
         if (compressionLevel is < -4 or > 9)
             throw new ArgumentOutOfRangeException(nameof(compressionLevel));
@@ -176,7 +216,11 @@ internal static class OodleKrakenEncoder
         HasActiveCompressionLevel = true;
         try
         {
-            return EncodeBlock(data, useHuffmanArrays && compressionLevel >= 0);
+            return EncodeBlockCore(
+                data,
+                useHuffmanArrays && compressionLevel >= 0,
+                allowSubLiterals,
+                allowStoredHalves);
         }
         finally
         {
@@ -184,6 +228,8 @@ internal static class OodleKrakenEncoder
             HasActiveCompressionLevel = savedHasLevel;
         }
     }
+
+    private readonly record struct EncodedChunk(byte[] Payload, int LiteralMode);
 
     /// <summary>
     /// Compresses <paramref name="data"/> (one PFS block) into a section-7 payload of one or two
@@ -195,7 +241,20 @@ internal static class OodleKrakenEncoder
     /// reader inspects its first byte (the 0x80 bit selects two-table mode), which an entropy header
     /// would corrupt.
     /// </summary>
-    public static EncodedBlock? EncodeBlock(ReadOnlySpan<byte> data, bool useHuffmanArrays)
+    public static EncodedBlock? EncodeBlock(
+        ReadOnlySpan<byte> data,
+        bool useHuffmanArrays)
+        => EncodeBlockCore(
+            data,
+            useHuffmanArrays,
+            allowSubLiterals: true,
+            allowStoredHalves: true);
+
+    private static EncodedBlock? EncodeBlockCore(
+        ReadOnlySpan<byte> data,
+        bool useHuffmanArrays,
+        bool allowSubLiterals,
+        bool allowStoredHalves)
     {
         int n = data.Length;
         if (n < MinChunk)
@@ -207,10 +266,17 @@ internal static class OodleKrakenEncoder
 
         if (n <= ChunkMax)
         {
-            byte[]? single = EncodeChunk(data, head, prev, 0, n, withSeed: true, useHuffmanArrays, allowOptimal: true);
-            if (single is null || single.Length >= n)
+            EncodedChunk? single = EncodeChunk(
+                data, head, prev, 0, n, withSeed: true, useHuffmanArrays,
+                allowSubLiterals, allowOptimal: true);
+            if (single is not EncodedChunk encoded || encoded.Payload.Length >= n)
                 return null;
-            return new EncodedBlock(single, multiChunk: false, single.Length);
+            int flags = 0x04 | 0x02 | (encoded.LiteralMode == 0 ? 0x01 : 0);
+            return new EncodedBlock(
+                encoded.Payload,
+                multiChunk: false,
+                encoded.Payload.Length,
+                flags);
         }
 
         // blockSize is at most 0x40000 (two chunks). A larger block cannot be described by the single
@@ -218,23 +284,54 @@ internal static class OodleKrakenEncoder
         if (n > 2 * ChunkMax)
             return null;
 
-        byte[]? chunk0 = EncodeChunk(data, head, prev, 0, ChunkMax, withSeed: true, useHuffmanArrays);
-        if (chunk0 is null || chunk0.Length > MaxFirstChunkComp || chunk0.Length >= ChunkMax)
+        EncodedChunk? chunk0 = EncodeChunk(
+            data, head, prev, 0, ChunkMax, withSeed: true, useHuffmanArrays,
+            allowSubLiterals);
+        int chunk1PlainSize = n - ChunkMax;
+        EncodedChunk? chunk1 = EncodeChunk(
+            data, head, prev, ChunkMax, n, withSeed: false, useHuffmanArrays,
+            allowSubLiterals);
+        bool compressed0 = chunk0 is EncodedChunk c0
+            && c0.Payload.Length <= MaxFirstChunkComp
+            && c0.Payload.Length < ChunkMax;
+        bool compressed1 = chunk1 is EncodedChunk c1
+            && c1.Payload.Length < chunk1PlainSize;
+        if (!allowStoredHalves && (!compressed0 || !compressed1))
             return null;
 
-        byte[]? chunk1 = EncodeChunk(data, head, prev, ChunkMax, n, withSeed: false, useHuffmanArrays);
-        // A second chunk that does not compress below its own size (e.g. an incompressible tail) would be
-        // emitted as a degenerate all-literal chunk. Store the whole block instead, matching the
-        // single-chunk path's `single.Length >= n` decision.
-        if (chunk1 is null || chunk1.Length >= n - ChunkMax)
+        if (!compressed0 && !compressed1)
             return null;
 
-        var payload = new byte[chunk0.Length + chunk1.Length];
-        Buffer.BlockCopy(chunk0, 0, payload, 0, chunk0.Length);
-        Buffer.BlockCopy(chunk1, 0, payload, chunk0.Length, chunk1.Length);
+        byte[] first = compressed0
+            ? chunk0!.Value.Payload
+            : data[..ChunkMax].ToArray();
+        byte[] second = compressed1
+            ? chunk1!.Value.Payload
+            : data[ChunkMax..].ToArray();
+        var payload = new byte[first.Length + second.Length];
+        Buffer.BlockCopy(first, 0, payload, 0, first.Length);
+        Buffer.BlockCopy(second, 0, payload, first.Length, second.Length);
         if (payload.Length >= n)
             return null;
-        return new EncodedBlock(payload, multiChunk: true, chunk0.Length);
+
+        int boundaryFlags = 0x04;
+        if (compressed0)
+        {
+            boundaryFlags |= 0x02;
+            if (chunk0!.Value.LiteralMode == 0)
+                boundaryFlags |= 0x01;
+        }
+        if (compressed1)
+        {
+            boundaryFlags |= 0x20;
+            if (chunk1!.Value.LiteralMode == 0)
+                boundaryFlags |= 0x10;
+        }
+        return new EncodedBlock(
+            payload,
+            multiChunk: true,
+            first.Length,
+            boundaryFlags);
     }
 
     /// <summary>
@@ -244,8 +341,16 @@ internal static class OodleKrakenEncoder
     /// <paramref name="withSeed"/> is false the chunk omits the 8-byte COPY_64 seed (used for any
     /// chunk decoded at a non-zero output offset).
     /// </summary>
-    private static byte[]? EncodeChunk(ReadOnlySpan<byte> data, int[] head, int[] prev,
-        int chunkStart, int chunkEnd, bool withSeed, bool useHuffmanArrays, bool allowOptimal = false)
+    private static EncodedChunk? EncodeChunk(
+        ReadOnlySpan<byte> data,
+        int[] head,
+        int[] prev,
+        int chunkStart,
+        int chunkEnd,
+        bool withSeed,
+        bool useHuffmanArrays,
+        bool allowSubLiterals,
+        bool allowOptimal = false)
     {
         int matchLimit = chunkEnd - LiteralTail; // a match may EXTEND up to here, so >= LiteralTail trailing literals remain
         // The newLZ decoder forbids a match from STARTING in the last 16 bytes of a chunk. Its release
@@ -301,13 +406,18 @@ internal static class OodleKrakenEncoder
         if (commands.Count == 0)
             return null;
 
-        // Shipping validity path: raw literals (litMode 1). The literal mode is signaled OUT-OF-BAND
-        // by the PFS boundary-table flag bit (KrakenDecoder.DecodeBlock reads chunk0 0x01 /
-        // chunk1 0x10: set = sub, clear = raw), so the emitted literal-array content and that flag must
-        // agree. Emitting the cheaper SUB array (ChooseLitMode) requires also setting that flag in
-        // the block builder; that end-to-end sub plumbing belongs to the byte-identity (UseOptimalParse)
-        // path, so the validity deliverable stays raw and round-trips green.
-        return EmitChunkFromCommands(data, commands, chunkStart, chunkEnd, withSeed, useHuffmanArrays, litMode: 1);
+        int literalMode = allowSubLiterals
+            ? LitModeForParse(data, commands, chunkEnd, useHuffmanArrays)
+            : 1;
+        byte[]? payload = EmitChunkFromCommands(
+            data,
+            commands,
+            chunkStart,
+            chunkEnd,
+            withSeed,
+            useHuffmanArrays,
+            literalMode);
+        return payload is null ? null : new EncodedChunk(payload, literalMode);
     }
 
     /// <summary>

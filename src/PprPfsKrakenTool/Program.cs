@@ -4,6 +4,7 @@ using LibProsperoPkg.GP5;
 using LibProsperoPkg.Keys;
 using LibProsperoPkg.PFS;
 using LibProsperoPkg.PFS.Compression;
+using LibProsperoPkg.PFS.Compression.Oodle;
 using LibProsperoPkg.PKG;
 using LibProsperoPkg.Util;
 using Microsoft.Win32.SafeHandles;
@@ -1253,6 +1254,8 @@ internal static class Program
         if (ProsperoCrc32C.Compute("123456789"u8) != 0xE3069283u)
             throw new InvalidDataException("CRC32C known-answer test failed.");
         Console.WriteLine("selftest: NAPS ihsh/rhsh and CRC32C primitive known-answer tests passed");
+
+        SelfTestPublisherCbiHalfModes();
 
         var obccKatContext = new ProsperoNapsIntegrityContext
         {
@@ -3473,6 +3476,155 @@ internal static class Program
             pos = checked(pos + 16 + (int)length);
         }
         throw new InvalidDataException($"naps_meta_18 self-test record '{wantedTag}' was not found.");
+    }
+
+    private static void SelfTestPublisherCbiHalfModes()
+    {
+        const int halfSize = 0x20000;
+        byte[] rawNewLzHalf = new byte[halfSize];
+        byte[] subNewLzHalf0 = BuildSubLiteralFixture(halfSize, variant: 0);
+        byte[] subNewLzHalf1 = BuildSubLiteralFixture(halfSize, variant: 1);
+        byte[] storedHalf = new byte[halfSize];
+        new Random(0x504653).NextBytes(storedHalf);
+        byte[] storedBlock = new byte[2 * halfSize];
+        new Random(0x434249).NextBytes(storedBlock);
+
+        var cases = new (byte[] Data, byte Even, byte Odd, string Label)[]
+        {
+            (CombineHalves(rawNewLzHalf, rawNewLzHalf), 5, 4, "raw-newLZ/raw-newLZ"),
+            (CombineHalves(subNewLzHalf0, subNewLzHalf1), 7, 6, "sub-newLZ/sub-newLZ"),
+            (CombineHalves(subNewLzHalf0, rawNewLzHalf), 7, 4, "sub-newLZ/raw-newLZ"),
+            (CombineHalves(rawNewLzHalf, subNewLzHalf1), 5, 6, "raw-newLZ/sub-newLZ"),
+            (CombineHalves(storedHalf, rawNewLzHalf), 1, 4, "stored/raw-newLZ"),
+            (CombineHalves(storedHalf, subNewLzHalf1), 1, 6, "stored/sub-newLZ"),
+            (CombineHalves(rawNewLzHalf, storedHalf), 5, 1, "raw-newLZ/stored"),
+            (CombineHalves(subNewLzHalf0, storedHalf), 7, 1, "sub-newLZ/stored"),
+            (storedBlock, 1, 1, "stored/stored"),
+            (rawNewLzHalf, 5, 0, "raw-newLZ/tail"),
+            (subNewLzHalf0, 7, 0, "sub-newLZ/tail"),
+            (storedHalf, 1, 0, "stored/tail"),
+        };
+
+        foreach ((byte[] data, byte even, byte odd, string label) in cases[..8])
+            VerifyEncodedCbiModePair(data, even, odd, label);
+
+        var boundaries = new List<long> { 0 };
+        using var logical = new MemoryStream();
+        foreach ((byte[] data, _, _, _) in cases)
+        {
+            logical.Write(data);
+            boundaries.Add(logical.Length);
+        }
+        byte[] logicalBytes = logical.ToArray();
+        ProsperoNapsBuildResult naps = ProsperoNapsImage.Pack(
+            logicalBytes,
+            new ProsperoNapsBuildOptions
+            {
+                CompressionLevel = 7,
+                Compress = true,
+                VerifyRoundTrip = true,
+                FileBoundaries = boundaries,
+            });
+        using var logicalInput = new MemoryStream(logicalBytes, writable: false);
+        using var packedOutput = new MemoryStream();
+        ProsperoNapsFileBuildResult streamedNaps = ProsperoNapsImage.Pack(
+            logicalInput,
+            logicalBytes.Length,
+            packedOutput,
+            new ProsperoNapsBuildOptions
+            {
+                CompressionLevel = 7,
+                Compress = true,
+                VerifyRoundTrip = true,
+                FileBoundaries = boundaries,
+            });
+        if (!streamedNaps.LayoutBytes.AsSpan().SequenceEqual(naps.LayoutBytes) ||
+            !packedOutput.ToArray().AsSpan().SequenceEqual(naps.PackedImage))
+        {
+            throw new InvalidDataException(
+                "Streaming NAPS writer did not preserve the publisher CBI half-mode choices.");
+        }
+        NapsCblockInfoEntry[] normalEntries = naps.Layout.CblockInfos
+            .Where(entry => !entry.IsRunBase && !entry.IsTerminal)
+            .ToArray();
+        if (normalEntries.Length != cases.Length)
+            throw new InvalidDataException(
+                $"Publisher NAPS CBI self-test emitted {normalEntries.Length} normal records, " +
+                $"expected {cases.Length}.");
+        for (int i = 0; i < cases.Length; i++)
+        {
+            if (normalEntries[i].Even != cases[i].Even ||
+                normalEntries[i].Odd != cases[i].Odd)
+            {
+                throw new InvalidDataException(
+                    $"Publisher NAPS CBI {cases[i].Label} serialized modes " +
+                    $"{normalEntries[i].Even}/{normalEntries[i].Odd}, expected " +
+                    $"{cases[i].Even}/{cases[i].Odd}.");
+            }
+        }
+
+        Console.WriteLine(
+            "selftest: all observed publisher CBI stored/raw-newLZ/sub-newLZ modes passed");
+    }
+
+    private static byte[] BuildSubLiteralFixture(int length, int variant)
+    {
+        const int period = 0x1000;
+        byte[] pattern = new byte[period];
+        for (int i = 0; i < pattern.Length; i++)
+        {
+            int x = i + variant * 37;
+            pattern[i] = variant == 0
+                ? (byte)x
+                : (byte)((x * x + 17 * x + 53) & 0xFF);
+        }
+
+        byte[] result = new byte[length];
+        for (int i = 0; i < result.Length; i++)
+            result[i] = pattern[i % pattern.Length];
+        return result;
+    }
+
+    private static byte[] CombineHalves(byte[] first, byte[] second)
+    {
+        byte[] result = new byte[checked(first.Length + second.Length)];
+        first.CopyTo(result, 0);
+        second.CopyTo(result, first.Length);
+        return result;
+    }
+
+    private static void VerifyEncodedCbiModePair(
+        byte[] plain,
+        byte expectedEvenMode,
+        byte expectedOddMode,
+        string label)
+    {
+        EncodedBlock encoded = OodleKrakenEncoder.EncodeBlock(
+            plain,
+            useHuffmanArrays: true,
+            compressionLevel: 7,
+            allowSubLiterals: true,
+            allowStoredHalves: true)
+            ?? throw new InvalidDataException(
+                $"Publisher CBI {label} fixture was unexpectedly stored as one raw block.");
+        if (encoded.NapsEvenMode != expectedEvenMode ||
+            encoded.NapsOddMode != expectedOddMode)
+        {
+            throw new InvalidDataException(
+                $"Publisher CBI {label} emitted modes " +
+                $"{encoded.NapsEvenMode}/{encoded.NapsOddMode}, expected " +
+                $"{expectedEvenMode}/{expectedOddMode} (flags=0x{encoded.BoundaryFlags:X2}).");
+        }
+
+        byte[] decoded = new byte[plain.Length];
+        KrakenDecodeStatus status = KrakenDecoder.DecodeBlock(
+            encoded.Payload,
+            encoded.BoundaryFlags,
+            encoded.FirstChunkCompSize,
+            decoded);
+        if (status != KrakenDecodeStatus.Success || !decoded.AsSpan().SequenceEqual(plain))
+            throw new InvalidDataException(
+                $"Publisher CBI {label} round-trip failed ({status}).");
     }
 
     private sealed class SelfTestNapsIntegrityProvider : IProsperoNapsIntegrityProvider

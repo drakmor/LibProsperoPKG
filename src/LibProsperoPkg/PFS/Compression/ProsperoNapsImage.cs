@@ -159,8 +159,8 @@ public static class ProsperoNapsImage
                 CoffsetStartMod256K = checked((uint)(compressedOffset & (UBlockSize - 1))),
                 UoffsetStart = checked((uint)(logicalOffset & (UBlockSize - 1))),
                 ClenEvenMinus1 = checked((uint)(firstChunkLength - 1)),
-                Even = compressed ? (byte)5 : (byte)1,
-                Odd = compressed && uncompressedLength > 0x20000 ? (byte)4
+                Even = compressed ? encoded!.Value.NapsEvenMode : (byte)1,
+                Odd = compressed ? encoded!.Value.NapsOddMode
                     : !compressed && uncompressedLength > 0x20000 ? (byte)1 : (byte)0,
                 KdePredictor = 0,
                 ShuffleIdx = 0,
@@ -322,8 +322,8 @@ public static class ProsperoNapsImage
                 CoffsetStartMod256K = checked((uint)(compressedOffset & (UBlockSize - 1))),
                 UoffsetStart = checked((uint)(logicalOffset & (UBlockSize - 1))),
                 ClenEvenMinus1 = checked((uint)(firstChunkLength - 1)),
-                Even = compressed ? (byte)5 : (byte)1,
-                Odd = compressed && uncompressedLength > 0x20000 ? (byte)4
+                Even = compressed ? encoded!.Value.NapsEvenMode : (byte)1,
+                Odd = compressed ? encoded!.Value.NapsOddMode
                     : !compressed && uncompressedLength > 0x20000 ? (byte)1 : (byte)0,
                 KdePredictor = 0,
                 ShuffleIdx = 0,
