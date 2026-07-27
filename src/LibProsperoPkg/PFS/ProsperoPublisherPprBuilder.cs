@@ -30,6 +30,12 @@ public sealed class ProsperoPublisherPprBuildOptions
     /// <summary>Derive a stable content-specific outer seed when <see cref="OuterSeed"/> is omitted.</summary>
     public bool DeterministicBuild { get; init; }
 
+    /// <summary>
+    /// Encrypt the outer PFS with AES-XTS. Disable only for standalone analysis or a plaintext
+    /// NAPS carrier; a normal publisher PKG requires the encrypted representation.
+    /// </summary>
+    public bool EncryptOuterPfs { get; init; } = true;
+
     public DateTime TimeStamp { get; init; } = DateTime.UnixEpoch;
 }
 
@@ -54,6 +60,7 @@ public sealed class ProsperoPublisherPprBuildResult
     /// <summary>SHA3-256 of the complete uncompressed logical PPR-PFS stream (artifact diagnostic).</summary>
     public required byte[] LogicalImageDigest { get; init; }
     public required ProsperoNapsBuildResult Naps { get; init; }
+    public required bool OuterPfsEncrypted { get; init; }
 }
 
 /// <summary>
@@ -75,6 +82,7 @@ public sealed class ProsperoPublisherPprFileBuildResult
     public required byte[] LogicalImageDigest { get; init; }
     public required ProsperoNapsFileBuildResult Naps { get; init; }
     public required ProsperoPfsImageTreeInfo OuterTree { get; init; }
+    public required bool OuterPfsEncrypted { get; init; }
 }
 
 /// <summary>
@@ -166,7 +174,9 @@ public static class ProsperoPublisherPprBuilder
                 : RandomNumberGenerator.GetBytes(16));
         long unixSeconds = new DateTimeOffset(options.TimeStamp.ToUniversalTime()).ToUnixTimeSeconds();
         byte[] ekpfs = ProsperoPfsKeys.DeriveEkpfs(options.ContentId, options.Passcode);
-        log("Building and encrypting the data-first outer PFS...");
+        log(options.EncryptOuterPfs
+            ? "Building and encrypting the data-first outer PFS..."
+            : "Building the plaintext data-first outer PFS (AES-XTS disabled)...");
         ProsperoOuterPackageFileResult outer = ProsperoOuterPfsBuilder.BuildForPackageToFile(
             [
                 new ProsperoOuterFileSource
@@ -190,7 +200,8 @@ public static class ProsperoPublisherPprBuilder
                 TimestampNanoseconds = 0,
             },
             ekpfs,
-            outerPath);
+            outerPath,
+            encryptOutput: options.EncryptOuterPfs);
 
         int innerFileCount = ValidateInner(logicalPath);
         byte[] logicalDigest;
@@ -211,6 +222,7 @@ public static class ProsperoPublisherPprBuilder
             LogicalImageDigest = logicalDigest,
             Naps = naps,
             OuterTree = outer.Tree,
+            OuterPfsEncrypted = options.EncryptOuterPfs,
         };
     }
 
@@ -309,22 +321,29 @@ public static class ProsperoPublisherPprBuilder
             },
         };
 
-        log("Building and encrypting the data-first outer PFS...");
+        log(options.EncryptOuterPfs
+            ? "Building and encrypting the data-first outer PFS..."
+            : "Building the plaintext data-first outer PFS (AES-XTS disabled)...");
         ProsperoOuterPfsBuildResult outer = ProsperoOuterPfsBuilder.BuildPlaintext(outerFiles, parameters);
         byte[] plaintext = outer.Plaintext.AsSpan().ToArray();
         byte[] imageDigests = BuildImageDigests(plaintext);
-        byte[] ekpfs = ProsperoPfsKeys.DeriveEkpfs(options.ContentId, options.Passcode);
-        var keys = ProsperoPfsKeys.DeriveImageEncryptionKeys(ekpfs, seed);
-        ProsperoOuterPfsBuilder.Encrypt(outer, keys.TweakKey, keys.DataKey);
+        if (options.EncryptOuterPfs)
+        {
+            byte[] ekpfs = ProsperoPfsKeys.DeriveEkpfs(options.ContentId, options.Passcode);
+            var keys = ProsperoPfsKeys.DeriveImageEncryptionKeys(ekpfs, seed);
+            ProsperoOuterPfsBuilder.Encrypt(outer, keys.TweakKey, keys.DataKey);
+
+            // Verify the reversible transform before returning the encrypted artifact.
+            byte[] decrypted = outer.Plaintext.AsSpan().ToArray();
+            ProsperoOuterPfsImage.Transform(
+                decrypted, keys.TweakKey, keys.DataKey, ProsperoOuterPfsBuilder.BlockSize,
+                outer.BlockKinds, encrypt: false);
+            if (!decrypted.AsSpan().SequenceEqual(plaintext))
+                throw new InvalidDataException("Outer PFS AES-XTS round-trip failed.");
+        }
         File.WriteAllBytes(outerPath, outer.Plaintext);
 
-        // Verify both reversible transforms and the inner filesystem view before returning artifacts.
-        byte[] decrypted = outer.Plaintext.AsSpan().ToArray();
-        ProsperoOuterPfsImage.Transform(
-            decrypted, keys.TweakKey, keys.DataKey, ProsperoOuterPfsBuilder.BlockSize,
-            outer.BlockKinds, encrypt: false);
-        if (!decrypted.AsSpan().SequenceEqual(plaintext))
-            throw new InvalidDataException("Outer PFS AES-XTS round-trip failed.");
+        // Verify the inner filesystem view before returning artifacts.
         int innerFileCount = ValidateInner(logical);
 
         return new ProsperoPublisherPprBuildResult
@@ -341,6 +360,7 @@ public static class ProsperoPublisherPprBuilder
             ImageDigests = imageDigests,
             LogicalImageDigest = ProsperoImageDigests.Sha3_256(logical),
             Naps = naps,
+            OuterPfsEncrypted = options.EncryptOuterPfs,
         };
     }
 

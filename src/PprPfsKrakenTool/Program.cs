@@ -95,6 +95,7 @@ internal static class Program
                 "dump-pkg-inner" => DumpPackageInner(args),
                 "check-pkg-fih" => CheckPackageFih(args),
                 "check-pkg-imagedigs" => CheckPackageImageDigests(args),
+                "check-pkg-entry-digests" => CheckPackageEntryDigests(args),
                 "check-pkg-signature" => CheckPackageSignature(args),
                 "resign-pkg" => ResignPackage(args),
                 "finalize-fgc" => FinalizeFlexibleContent(args),
@@ -459,6 +460,9 @@ internal static class Program
         int normal = document.CblockInfos.Count(entry => !entry.IsRunBase && !entry.IsTerminal);
         int run = document.CblockInfos.Count(entry => entry.IsRunBase);
         int terminal = document.CblockInfos.Count(entry => entry.IsTerminal);
+        int zeroOuterCmac = document.OuterBlockDigests.Count(
+            digest => digest.AsSpan().IndexOfAnyExcept((byte)0) < 0);
+        int nonZeroOuterCmac = document.OuterBlockDigests.Count - zeroOuterCmac;
         int maxDelta = document.CblockInfoOffsetByUblock.Count == 0
             ? 0
             : document.CblockInfoOffsetByUblock.Max(entry =>
@@ -515,6 +519,8 @@ internal static class Program
         Console.WriteLine($"cbi-normal={normal}");
         Console.WriteLine($"cbi-run={run}");
         Console.WriteLine($"cbi-terminal={terminal}");
+        Console.WriteLine($"outer-cmac-zero={zeroOuterCmac}");
+        Console.WriteLine($"outer-cmac-nonzero={nonZeroOuterCmac}");
         Console.WriteLine($"u2c-max-delta={maxDelta}");
         Console.WriteLine($"physical-128k-transitions={physical128KTransitions}");
         Console.WriteLine(
@@ -1096,6 +1102,136 @@ internal static class Program
         return 0;
     }
 
+    private static int CheckPackageEntryDigests(string[] args)
+    {
+        if (args.Length is < 2 or > 3)
+            throw new ArgumentException(
+                "check-pkg-entry-digests requires <package.pkg> [passcode].");
+
+        string packagePath = Path.GetFullPath(args[1]);
+        string passcode = args.Length == 3
+            ? args[2]
+            : new string('0', 32);
+        ProsperoPkg package = ProsperoPkgReader.Read(packagePath);
+        long cntBase = package.Fih is null
+            ? 0
+            : checked((long)package.Fih.EmbeddedCntOffset);
+        int digestIndex = package.Entries.ToList().FindIndex(
+            entry => entry.RawId == (uint)ProsperoImageDigests.DigestTableEntryId);
+        if (digestIndex < 0)
+            throw new InvalidDataException("Package has no CNT per-entry digest table.");
+
+        string temp = Path.Combine(
+            Path.GetTempPath(), "libprospero-entry-digests-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(temp);
+        try
+        {
+            IReadOnlyList<string> names =
+                ProsperoPackageArchive.ExtractCntEntries(packagePath, temp, passcode);
+            if (names.Count != package.Entries.Count)
+                throw new InvalidDataException("CNT extraction did not preserve entry-table cardinality.");
+            byte[] table = File.ReadAllBytes(Path.Combine(temp, names[digestIndex]));
+            if (table.Length < checked(package.Entries.Count * ProsperoImageDigests.DigestSize))
+                throw new InvalidDataException("CNT per-entry digest table is truncated.");
+
+            int mismatchCount = 0;
+            using var source = File.OpenRead(packagePath);
+            byte[] cntHeader = ReadPackageRange(source, cntBase, 0x180);
+            byte[] body = ReadPackageRange(
+                source,
+                checked(cntBase + (long)package.Header!.BodyOffset),
+                checked((int)package.Header.BodySize));
+            byte[] bodyDigest = ProsperoImageDigests.Sha3_256(body);
+            ProsperoPkgEntry digestEntry = package.Entries[digestIndex];
+            byte[] rawDigestTable = ReadPackageRange(
+                source,
+                checked(cntBase + (long)digestEntry.DataOffset),
+                checked((int)digestEntry.DataSize));
+            byte[] digestTableDigest = ProsperoImageDigests.Sha3_256(rawDigestTable);
+
+            byte[] ComputeScEntriesDigest(IReadOnlyList<uint> ids, bool trimMetas)
+            {
+                using var concatenated = new MemoryStream();
+                foreach (uint id in ids)
+                {
+                    ProsperoPkgEntry selected = package.Entries.First(entry => entry.RawId == id);
+                    int size = checked((int)selected.DataSize);
+                    if (trimMetas && selected.RawId == (uint)ProsperoEntryId.Metas)
+                        size = checked(package.Header.ScEntryCount * ProsperoPkgLayout.EntryMetaSize);
+                    byte[] bytes = ReadPackageRange(
+                        source, checked(cntBase + (long)selected.DataOffset), size);
+                    concatenated.Write(bytes);
+                }
+                return ProsperoImageDigests.Sha3_256(concatenated.ToArray());
+            }
+
+            var scIds = new List<uint> { (uint)ProsperoEntryId.EntryKeys };
+            if (package.Entries.Any(entry => entry.RawId == (uint)ProsperoEntryId.ImageKey))
+                scIds.Add((uint)ProsperoEntryId.ImageKey);
+            scIds.Add((uint)ProsperoEntryId.GeneralDigests);
+            scIds.Add((uint)ProsperoEntryId.Metas);
+            scIds.Add((uint)ProsperoEntryId.Digests);
+            byte[] scEntries1 = ComputeScEntriesDigest(
+                scIds, trimMetas: false);
+            byte[] scEntries2 = ComputeScEntriesDigest(
+                scIds.Take(scIds.Count - 1).ToArray(), trimMetas: true);
+            bool sc1Match = cntHeader.AsSpan(0x100, 32).SequenceEqual(scEntries1);
+            bool sc2Match = cntHeader.AsSpan(0x120, 32).SequenceEqual(scEntries2);
+            bool digestTableMatch =
+                cntHeader.AsSpan(0x140, 32).SequenceEqual(digestTableDigest);
+            bool bodyMatch = cntHeader.AsSpan(0x160, 32).SequenceEqual(bodyDigest);
+            Console.WriteLine(
+                $"sc-entries1={sc1Match} sc-entries2={sc2Match} "
+                + $"digest-table={digestTableMatch} body={bodyMatch}");
+            if (!sc1Match || !sc2Match || !digestTableMatch || !bodyMatch)
+                mismatchCount++;
+
+            for (int index = 0; index < package.Entries.Count; index++)
+            {
+                ProsperoPkgEntry entry = package.Entries[index];
+                ReadOnlySpan<byte> stored = table.AsSpan(
+                    index * ProsperoImageDigests.DigestSize,
+                    ProsperoImageDigests.DigestSize);
+                bool selfSlot = entry.RawId == (uint)ProsperoImageDigests.DigestTableEntryId;
+                bool zero = stored.IndexOfAnyExcept((byte)0) < 0;
+
+                string extractedPath = Path.Combine(temp, names[index]);
+                byte[] plaintextDigest;
+                using (var extracted = File.OpenRead(extractedPath))
+                    plaintextDigest = LibProsperoPkg.Util.ProsperoSha3.HashData(extracted);
+
+                source.Position = checked(cntBase + (long)entry.DataOffset);
+                int rawSize = entry.Encrypted
+                    ? checked((int)((entry.DataSize + 15u) & ~15u))
+                    : checked((int)entry.DataSize);
+                byte[] raw = new byte[rawSize];
+                source.ReadExactly(raw);
+                byte[] rawDigest = ProsperoImageDigests.Sha3_256(raw);
+
+                bool plaintextMatch = stored.SequenceEqual(plaintextDigest);
+                bool rawMatch = stored.SequenceEqual(rawDigest);
+                bool valid = selfSlot ? zero : plaintextMatch || rawMatch;
+                if (!valid)
+                    mismatchCount++;
+                Console.WriteLine(
+                    $"index={index:D2} id=0x{entry.RawId:x4} size=0x{entry.DataSize:x} "
+                    + $"encrypted={entry.Encrypted} plaintext={plaintextMatch} raw={rawMatch} "
+                    + $"self-zero={selfSlot && zero}");
+            }
+            Console.WriteLine($"entry-digest-mismatches={mismatchCount}");
+            return mismatchCount == 0 ? 0 : 2;
+        }
+        finally
+        {
+            if (Directory.Exists(temp) &&
+                Path.GetFileName(temp).StartsWith(
+                    "libprospero-entry-digests-", StringComparison.Ordinal))
+            {
+                Directory.Delete(temp, recursive: true);
+            }
+        }
+    }
+
     private static int ExportPublisherInputs(string[] args)
     {
         if (args.Length is < 3 or > 4 ||
@@ -1188,9 +1324,11 @@ internal static class Program
                 plaintext, ciphertext, ciphertext.Length,
                 ivKey.Skip(16).Take(16).ToArray(), ivKey.Take(16).ToArray());
             ReadOnlySpan<byte> prefix = plaintext.AsSpan(0, Math.Min(64, plaintext.Length));
+            ReadOnlySpan<byte> tail = plaintext.AsSpan(Math.Max(0, plaintext.Length - 16));
             string ascii = new(prefix.ToArray().Select(b => b is >= 0x20 and < 0x7F ? (char)b : '.').ToArray());
             Console.WriteLine($"kdf={(sha3Kdf ? "sha3" : "sha256")} iv={(sha3Iv ? "sha3" : "sha256")} " +
-                              $"prefix={Convert.ToHexString(prefix)} ascii={ascii}");
+                              $"prefix={Convert.ToHexString(prefix)} tail={Convert.ToHexString(tail)} " +
+                              $"iv-key={Convert.ToHexString(ivKey)} ascii={ascii}");
         }
         return 0;
     }
@@ -1323,7 +1461,7 @@ internal static class Program
         byte[] expectedCbcCfb = Convert.FromHexString(
             "7649ABAC8119B246CEE98E9B12E9197D" +
             "5086CB9B507219EE95DB113A917678B2" +
-            "71016FE31A6390CAF77E");
+            "7697147F75EE87246DDB");
         if (!cbcCfbCiphertext.AsSpan().SequenceEqual(expectedCbcCfb))
             throw new InvalidDataException(
                 $"AES-CBC-CFB128 KAT failed: {Convert.ToHexString(cbcCfbCiphertext)}");
@@ -1333,9 +1471,13 @@ internal static class Program
             cbcCfbCiphertext.Length,
             Convert.FromHexString("2B7E151628AED2A6ABF7158809CF4F3C"),
             Convert.FromHexString("000102030405060708090A0B0C0D0E0F"));
-        if (!cbcCfbCiphertext.AsSpan().SequenceEqual(cbcCfbPlaintext))
-            throw new InvalidDataException("AES-CBC-CFB128 in-place decryption failed.");
-        Console.WriteLine("selftest: AES-CBC-CFB128 residual-block KAT passed");
+        if (!cbcCfbCiphertext.AsSpan(0, 32).SequenceEqual(cbcCfbPlaintext.AsSpan(0, 32)) ||
+            !cbcCfbCiphertext.AsSpan(32).SequenceEqual(new byte[cbcCfbCiphertext.Length - 32]))
+        {
+            throw new InvalidDataException(
+                "AES-CBC-CFB128 complete-block decryption or truncated-tail marker failed.");
+        }
+        Console.WriteLine("selftest: AES-CBC/truncated-residual publisher KAT passed");
 
         byte[] checksumKat = [1, 2, 3];
         ulong weak = ProsperoNapsMeta.ComputeInputChecksum(checksumKat);
@@ -1884,15 +2026,23 @@ internal static class Program
 
             byte[] sparseNapsBytes = ProsperoNwonlyNapsGenerator.Generate(sparseInner);
             NapsLayoutDocument sparseNaps = ProsperoNapsLayout.Parse(sparseNapsBytes);
+            int expectedSparseFidx = checked(
+                sparseInner.AfidLogicalOffsets.Count +
+                sparseInner.EmptyFileLogicalOffsets.Count +
+                2 + // metadata base + terminal mount boundary
+                (sparseInner.AfidLogicalOffsets.Count == 0 ||
+                 sparseInner.AfidLogicalOffsets[^1] != sparseInner.DataEndLogical
+                    ? 1 // distinct dataEnd boundary
+                    : 0));
             if (sparseNaps.FileOffsets.Count !=
-                    sparseInner.AfidLogicalOffsets.Count + 2 ||
+                    expectedSparseFidx ||
                 sparseNaps.FileOffsets[1].Type != 0x40 ||
                 sparseNaps.FileOffsets[3].Type != 0x40 ||
                 sparseNaps.FileOffsets[^2].Type != 0 ||
                 sparseNaps.FileOffsets[^1].Type != 0x40)
             {
                 throw new InvalidDataException(
-                    "Sparse AFID slots must use FIDX type 0x40 without a separate dataEnd entry.");
+                    "Sparse AFID slots or the final dataEnd FIDX boundary are inconsistent.");
             }
             using var sparsePhysical = new MemoryStream(sparseInner.Image, writable: false);
             using var sparseLogical = new MemoryStream();
@@ -2057,6 +2207,7 @@ internal static class Program
             string outerPackedSource = Path.Combine(regressionRoot, "outer-source-pfs-image.dat");
             string outerLayoutSource = Path.Combine(regressionRoot, ProsperoNapsLayout.FileName);
             string outerFileBackedPath = Path.Combine(regressionRoot, "outer-file-backed.pfs");
+            string outerPlaintextPath = Path.Combine(regressionRoot, "outer-file-backed-plaintext.pfs");
             File.WriteAllBytes(outerPackedSource, napsInMemory.PackedImage);
             File.WriteAllBytes(outerLayoutSource, napsInMemory.LayoutBytes);
             byte[] outerSeed = Enumerable.Range(0, 16).Select(i => (byte)i).ToArray();
@@ -2114,6 +2265,42 @@ internal static class Program
                 throw new InvalidDataException(
                     "File-backed and in-memory outer-PFS writers produced different artifacts.");
             }
+            ProsperoOuterPackageFileResult outerPlaintext =
+                ProsperoOuterPfsBuilder.BuildForPackageToFile(
+                    [
+                        new ProsperoOuterFileSource
+                        {
+                            Name = "pfs_image.dat",
+                            Path = outerPackedSource,
+                            SizeCompressed = napsStreamingInput.Length,
+                            Signed = false,
+                        },
+                        new ProsperoOuterFileSource
+                        {
+                            Name = ProsperoNapsLayout.FileName,
+                            Path = outerLayoutSource,
+                            Signed = true,
+                        },
+                    ],
+                    outerParameters,
+                    ekpfs: null,
+                    outputPath: outerPlaintextPath,
+                    encryptOutput: false);
+            byte[] expectedPlaintext = outerInMemory.Ciphertext.AsSpan().ToArray();
+            var outerKeys = ProsperoPfsKeys.DeriveImageEncryptionKeys(outerEkpfs, outerSeed);
+            ProsperoOuterPfsImage.Transform(
+                expectedPlaintext, outerKeys.TweakKey, outerKeys.DataKey,
+                ProsperoOuterPfsBuilder.BlockSize, outerPlaintext.BlockKinds,
+                encrypt: false);
+            if (!File.ReadAllBytes(outerPlaintextPath).AsSpan().SequenceEqual(expectedPlaintext) ||
+                !outerPlaintext.ImageDigests.AsSpan().SequenceEqual(outerInMemory.ImageDigests) ||
+                !outerPlaintext.SuperblockIcv.AsSpan().SequenceEqual(outerInMemory.SuperblockIcv))
+            {
+                throw new InvalidDataException(
+                    "Plaintext file-backed outer-PFS output differs before the AES-XTS stage.");
+            }
+            Console.WriteLine(
+                "selftest: encrypted and plaintext file-backed outer-PFS writers passed");
 
             byte[] deterministicPfsImageSeed =
                 Convert.FromHexString("000102030405060708090A0B0C0D0E0F");
@@ -2669,6 +2856,7 @@ internal static class Program
             BinaryPrimitives.WriteUInt16BigEndian(
                 npbind.AsSpan(0x82), checked((ushort)testCommId.Length));
             Encoding.ASCII.GetBytes(testCommId).CopyTo(npbind, 0x84);
+            SHA1.HashData(npbind.AsSpan(0, 0x200)).CopyTo(npbind.AsSpan(0x200));
             File.WriteAllBytes(Path.Combine(acSource, "sce_sys", "npbind.dat"), npbind);
 
             ProsperoBuildResult acBuild = ProsperoPackageBuilder.Build(
@@ -3931,10 +4119,21 @@ internal static class Program
 
     private static int BuildPublisherArtifacts(string[] args)
     {
-        if (args.Length is < 5 or > 6)
+        if (args.Length is < 5 or > 7)
             throw new ArgumentException(
-                "build-publisher-artifacts requires <source-folder> <output-dir> <content-id> <passcode> [cmac-key-hex].");
-        byte[]? cmac = args.Length == 6 ? Convert.FromHexString(args[5]) : null;
+                "build-publisher-artifacts requires <source-folder> <output-dir> <content-id> <passcode> [cmac-key-hex|-] [encrypted|plaintext].");
+        byte[]? cmac = args.Length >= 6 && args[5] != "-"
+            ? Convert.FromHexString(args[5])
+            : null;
+        bool encryptOuter = args.Length < 7 ||
+            string.Equals(args[6], "encrypted", StringComparison.OrdinalIgnoreCase);
+        if (args.Length == 7 &&
+            !encryptOuter &&
+            !string.Equals(args[6], "plaintext", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new ArgumentException(
+                "The outer-PFS mode must be either 'encrypted' or 'plaintext'.");
+        }
         ProsperoPublisherPprFileBuildResult result = ProsperoPublisherPprBuilder.BuildFileBacked(
             new ProsperoPublisherPprBuildOptions
             {
@@ -3948,11 +4147,13 @@ internal static class Program
                     CompressionLevel = PprPfsKraken.DefaultLevel,
                 },
                 NapsOptions = new ProsperoNapsBuildOptions { OuterBlockCmacKey = cmac },
+                EncryptOuterPfs = encryptOuter,
             },
             Console.WriteLine);
         Console.WriteLine(
             $"publisher artifacts: inner-files={result.InnerFileCount} "
-            + $"naps=0x{result.Naps.PackedSize:x} outer-superblock={result.OuterSuperblockIndex}");
+            + $"naps=0x{result.Naps.PackedSize:x} outer-superblock={result.OuterSuperblockIndex} "
+            + $"outer-encrypted={result.OuterPfsEncrypted}");
         return 0;
     }
 
@@ -5018,7 +5219,7 @@ internal static class Program
         Console.WriteLine("        [--compression none|zlib|kraken] [--level N] [--min-size 0]");
         Console.WriteLine("        [--exclude \"sce_sys/**;movies/*.mp4\"] [--only-if-smaller false]");
         Console.WriteLine("        [--classic true]   (alias for --layout classic)");
-        Console.WriteLine("  build-publisher-artifacts <source-folder> <output-dir> <content-id> <passcode> [cmac-key-hex]");
+        Console.WriteLine("  build-publisher-artifacts <source-folder> <output-dir> <content-id> <passcode> [cmac-key-hex|-] [encrypted|plaintext]");
         Console.WriteLine("  build-pkg <source-dir> <output-dir> <content-id> <app|ac|al> [passcode] [naps-cmac-key-hex|-] [naps-meta-18-file|-] [legacy-metadata-key-ignored|-] [outer-pfs-seed-hex|-] [deterministic] [strict] [afid=<map.tsv>]");
         Console.WriteLine("  pack  <input-file> <output.pfsc> [--compression zlib|kraken|none] [--level N]");
         Console.WriteLine("        [--min-savings-percent 0]");
@@ -5052,6 +5253,7 @@ internal static class Program
         Console.WriteLine("  dump-pkg-inner <package.pkg> <output.pfs> [passcode]");
         Console.WriteLine("  check-pkg-fih <package.pkg> [passcode] [--quick]");
         Console.WriteLine("  check-pkg-imagedigs <package.pkg> [passcode]");
+        Console.WriteLine("  check-pkg-entry-digests <package.pkg> [passcode]");
         Console.WriteLine("  check-pkg-signature <package.pkg>");
         Console.WriteLine("  resign-pkg <input.pkg> <output.pkg>");
         Console.WriteLine("  finalize-fgc <fih.dat> <pfsmeta.dat> <cnt.dat> <manifest.json> <fgc-token.json> <partner-private-key.pem> <passcode>");

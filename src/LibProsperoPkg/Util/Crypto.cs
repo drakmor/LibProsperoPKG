@@ -324,11 +324,12 @@ public static class Crypto
         return 0;
     }
 
-    // Sony's bnet_crypto_aes_cbc_cfb128 primitive is length preserving: complete
-    // 16-byte blocks use CBC, then a residual fragment uses CFB128 with the last
-    // CBC ciphertext (or the original IV when there is no complete block) as IV.
-    // Plain CBC/NoPadding rejected npbind.dat because its 0x214-byte logical size
-    // contains a four-byte residual fragment.
+    // Sony's historical bnet_crypto_aes_cbc_cfb128 entry primitive is length
+    // preserving, but its residual handling is not ordinary CFB. Complete blocks
+    // use CBC. A final partial plaintext block is zero-padded, CBC-encrypted, and
+    // only the original number of ciphertext bytes is retained. This is lossy in
+    // the decrypt direction; known formats such as npbind.dat reconstruct their
+    // residual authentication bytes at the Entry layer.
     private static void AesCbcCfb128Crypt(
         byte[] output, byte[] input, int size, byte[] key, byte[] iv, bool decrypt)
     {
@@ -381,9 +382,20 @@ public static class Crypto
         int residual = size - fullLength;
         if (residual == 0)
             return;
-        encryptor.TransformBlock(feedback, 0, 16, workBlock, 0);
-        for (int i = 0; i < residual; i++)
-            output[offset + i] = (byte)(input[offset + i] ^ workBlock[i]);
+        if (decrypt)
+        {
+            // The remaining bytes are a truncated CBC ciphertext block. AES
+            // decryption requires all 16 bytes, so no generic inverse exists.
+            Array.Clear(output, offset, residual);
+            return;
+        }
+
+        Array.Clear(sourceBlock);
+        Buffer.BlockCopy(input, offset, sourceBlock, 0, residual);
+        for (int i = 0; i < 16; i++)
+            workBlock[i] = (byte)(sourceBlock[i] ^ feedback[i]);
+        encryptor.TransformBlock(workBlock, 0, 16, sourceBlock, 0);
+        Buffer.BlockCopy(sourceBlock, 0, output, offset, residual);
     }
 
     /// <summary>

@@ -599,13 +599,12 @@ public static class ProsperoPkgBuilder
             .Select(n => n.FullPath)
             .ToList();
         uint playgoFileCount = checked((uint)playgoPaths.Count * 2u);
-        // NAPS FIDX contains every AFID slot, one unreferenced end boundary per empty file,
-        // the metadata boundary, and the terminal mount boundary. FIH +0x94 stores NumFiles-1
-        // and +0x98 stores NumFiles, so this count excludes only the final mount entry.
-        uint napsFileCount = checked(
-            (uint)inner.AfidLogicalOffsets.Count +
-            (uint)inner.EmptyFileLogicalOffsets.Count +
-            1u);
+        // FIH +0x94 stores the serialized NAPS NumFiles-1. Derive the value from the finished
+        // layout rather than duplicating FIDX boundary rules here:
+        // in particular, the final dataEnd boundary is omitted only when an existing empty-file
+        // boundary already has the same logical offset.
+        NapsLayoutDocument completedNaps = ProsperoNapsLayout.Parse(napsLayout);
+        uint napsFileCount = checked((uint)completedNaps.Counts.NumFiles - 1u);
         int appFileCount = inner.Nodes.Count(
             n => !n.IsDirectory && n.ParentInode >= 0 && n.Mode == 0x816D);
         uint contentVersionHigh = ContentVersionHigh(ReadParamJsonInfo(sourceFolder).ContentVersion);
@@ -2060,7 +2059,10 @@ public static class ProsperoPkgBuilder
         for (int i = 1; i < pkg.Metas.Metas.Count; i++)
         {
             var meta = pkg.Metas.Metas[i];
-            var hash = Crypto.Sha3_256(s, meta.DataOffset, meta.DataSize);
+            long digestSize = meta.Encrypted
+                ? checked((long)((meta.DataSize + 15u) & ~15u))
+                : meta.DataSize;
+            var hash = Crypto.Sha3_256(s, meta.DataOffset, digestSize);
             Buffer.BlockCopy(hash, 0, digests.FileData, 32 * i, 32);
             s.Position = digestsOffset + 32 * i;
             s.Write(hash, 0, 32);
@@ -2070,12 +2072,21 @@ public static class ProsperoPkgBuilder
         pkg.Header.digest_table_hash = Crypto.Sha3_256(pkg.Digests.FileData);
 
         using var ms = new MemoryStream();
-        foreach (var entry in pkg.Entries.Take(pkg.Header.sc_entry_count - 1))
+        // These header digests use the canonical SC semantic order, not the serialized
+        // entry-table order. The latter starts with DIGESTS, so Take(sc_entry_count - 1)
+        // silently produced a different preimage once sc2 began enforcing this field.
+        var scEntries = new List<Entry> { pkg.EntryKeys };
+        if (pkg.ImageKey is not null)
+            scEntries.Add(pkg.ImageKey);
+        scEntries.Add(pkg.GeneralDigests);
+        scEntries.Add(pkg.Metas);
+        scEntries.Add(pkg.Digests);
+        foreach (Entry entry in scEntries)
             new SubStream(s, entry.meta.DataOffset, entry.meta.DataSize).CopyTo(ms);
         pkg.Header.sc_entries1_hash = Crypto.Sha3_256(ms);
 
         ms.SetLength(0);
-        foreach (var entry in pkg.Entries.Take(pkg.Header.sc_entry_count - 2))
+        foreach (Entry entry in scEntries.Take(scEntries.Count - 1))
         {
             long size = entry.Id == EntryId.METAS ? pkg.Header.sc_entry_count * 0x20 : entry.meta.DataSize;
             new SubStream(s, entry.meta.DataOffset, size).CopyTo(ms);

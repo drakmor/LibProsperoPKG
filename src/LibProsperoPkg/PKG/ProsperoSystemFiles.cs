@@ -10,6 +10,7 @@
 using System;
 using System.Buffers.Binary;
 using System.Linq;
+using System.Security.Cryptography;
 using System.Text;
 
 namespace LibProsperoPkg.PKG;
@@ -78,6 +79,13 @@ public static class ProsperoSystemFiles
             p += 4 + len;
         }
         if (string.IsNullOrEmpty(commId)) { error = "npbind.dat is missing the communication id record."; return false; }
+        Span<byte> expectedAuthentication = stackalloc byte[20];
+        SHA1.HashData(data[..NpbindTlvEnd], expectedAuthentication);
+        if (!expectedAuthentication.SequenceEqual(data[NpbindTlvEnd..]))
+        {
+            error = "npbind.dat has an invalid trailing SHA-1 authentication code.";
+            return false;
+        }
         error = null;
         return true;
     }

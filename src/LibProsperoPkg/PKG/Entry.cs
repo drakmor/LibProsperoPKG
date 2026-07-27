@@ -8,6 +8,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Security.Cryptography;
 using System.Text;
 
 namespace LibProsperoPkg.PKG;
@@ -37,7 +38,8 @@ public abstract class Entry
         byte[] keySeed = Crypto.ComputeKeys(contentId, passcode, meta.KeyIndex, useSha3: publisherProfile);
         byte[] keyMaterial = meta.GetBytes().Concat(keySeed).ToArray();
         byte[] iv_key = publisherProfile ? Crypto.Sha3_256(keyMaterial) : Crypto.Sha256(keyMaterial);
-        var tmp = new byte[Length];
+        int encryptedLength = checked((int)((Length + 15u) & ~15u));
+        var tmp = new byte[encryptedLength];
         using (var ms = new MemoryStream(tmp))
         {
             Write(ms);
@@ -52,7 +54,26 @@ public abstract class Entry
         byte[] iv_key = publisherProfile ? Crypto.Sha3_256(keyMaterial) : Crypto.Sha256(keyMaterial);
         var tmp = new byte[entryBytes.Length];
         Crypto.AesCbcCfb128Decrypt(tmp, entryBytes, tmp.Length, iv_key.Skip(16).Take(16).ToArray(), iv_key.Take(16).ToArray());
-        return tmp;
+        int logicalLength = checked((int)meta.DataSize);
+        if (tmp.Length < logicalLength)
+            throw new InvalidDataException("Protected CNT entry is shorter than its logical size.");
+        if ((logicalLength & 15) != 0 && tmp.Length < ((logicalLength + 15) & ~15))
+        {
+            // Older callers may supply only DataSize bytes and omit the encrypted
+            // alignment padding. That truncated CBC tail has no generic inverse.
+            // npbind.dat remains recoverable from its trailing SHA-1.
+            uint id = (uint)meta.id;
+            bool npbind = id is (uint)EntryId.NPBIND_DAT or 0x2020 or 0x2021;
+            if (!npbind || logicalLength != 0x214 ||
+                tmp[0] != 0xD2 || tmp[1] != 0x94 || tmp[2] != 0xA0 || tmp[3] != 0x18)
+            {
+                throw new CryptographicException(
+                    $"Protected CNT entry 0x{id:X4} has a {logicalLength & 15}-byte " +
+                    "truncated CBC tail which cannot be generically decrypted.");
+            }
+            SHA1.HashData(tmp.AsSpan(0, 0x200)).CopyTo(tmp.AsSpan(0x200, 20));
+        }
+        return tmp.AsSpan(0, logicalLength).ToArray();
     }
 
     /// <summary>

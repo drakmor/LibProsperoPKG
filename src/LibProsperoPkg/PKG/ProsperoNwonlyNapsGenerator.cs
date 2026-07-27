@@ -151,13 +151,17 @@ public static class ProsperoNwonlyNapsGenerator
         // Terminator marks the mount end.
         tail.Add(new NapsCblockPlanEntry { StartRun = true, OnDiskOffset = metaCursor, LogicalOffset = mountSize, Terminator = true });
 
-        // ---- fidx: AFID starts + metadata base + mount ----------------------------------------------
+        // ---- fidx: AFID starts + data end + metadata base + mount -----------------------------------
         // A sparse AFID slot is expressed only by FIDX type 0x40. It consumes one logical 256-KiB
         // extent, but does not emit a CblockInfo record of its own: the reader resolves it through
-        // the shared zero mapping. The publisher also does not insert a separate dataEnd FIDX
-        // boundary; the metadata-base entry closes the final AFID/padding span.
+        // the shared zero mapping. Publishing Tools emits a separate dataEnd boundary whenever the
+        // final AFID start does not already equal dataEnd. This closes the last real file before the
+        // sparse padding span; omitting it produces a FIDX/afid_to_ino count mismatch and is rejected
+        // by img_verify for some otherwise valid file-count/layout combinations.
         var fidx = new List<long>(result.AfidLogicalOffsets);
         fidx.AddRange(result.EmptyFileLogicalOffsets);
+        if (fidx.Count == 0 || fidx[^1] != dataEnd)
+            fidx.Add(dataEnd);
         fidx.Add(metaBase);
         fidx.Add(mountSize);
         var fidxTypes = Enumerable.Repeat((byte)0, fidx.Count).ToArray();
@@ -217,7 +221,11 @@ public static class ProsperoNwonlyNapsGenerator
         int subLiteralMask = firstHalf ? 0x01 : 0x10;
         if (boundaryFlags == 0)
             return (byte)(4 | (firstHalf ? 1 : 0));
-        int mode = (boundaryFlags & newLzMask) != 0 ? 4 : 0;
+        // An odd half with no newLZ bit is present as a stored/raw half (mode 1), not absent
+        // (mode 0). This matters for 128-KiB-plus-tail blocks where chunk 0 compresses and the
+        // short second half is stored verbatim: the publisher emits 7/1, while 7/0 makes the
+        // native reader ignore the tail and reject the mounted image.
+        int mode = (boundaryFlags & newLzMask) != 0 ? 4 : (firstHalf ? 0 : 1);
         if ((boundaryFlags & subLiteralMask) != 0)
             mode |= 2;
         if (firstHalf)

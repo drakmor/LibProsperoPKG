@@ -328,7 +328,10 @@ public static class ProsperoPackageArchive
                     : $"entry-{entry.RawId:x8}.bin";
             string target = SafeTarget(outputDirectory, name);
             Directory.CreateDirectory(Path.GetDirectoryName(target)!);
-            byte[] data = ReadRange(input, checked(cntBase + entry.DataOffset), checked((int)entry.DataSize));
+            int storedSize = entry.Encrypted
+                ? checked((int)((entry.DataSize + 15u) & ~15u))
+                : checked((int)entry.DataSize);
+            byte[] data = ReadRange(input, checked(cntBase + entry.DataOffset), storedSize);
             if (entry.Encrypted && passcode is not null)
             {
                 var meta = new MetaEntry
@@ -341,6 +344,10 @@ public static class ProsperoPackageArchive
                     DataSize = entry.DataSize,
                 };
                 data = Entry.Decrypt(data, header.ContentId, passcode, meta, publisherProfile);
+            }
+            else if (data.Length != entry.DataSize)
+            {
+                Array.Resize(ref data, checked((int)entry.DataSize));
             }
             File.WriteAllBytes(target, data);
             written.Add(name);

@@ -345,7 +345,10 @@ public static class ProsperoNapsLayoutBuilder
         int subLiteralMask = firstHalf ? 0x01 : 0x10;
         if (boundaryFlags == 0)
             return (byte)(4 | (firstHalf ? 1 : 0));
-        int mode = (boundaryFlags & newLzMask) != 0 ? 4 : 0;
+        // For the second half, a clear newLZ bit means a present stored/raw half (mode 1).
+        // Mode 0 is reserved for an actually absent odd half and is selected by the caller when
+        // the block is not multi-chunk.
+        int mode = (boundaryFlags & newLzMask) != 0 ? 4 : (firstHalf ? 0 : 1);
         if ((boundaryFlags & subLiteralMask) != 0)
             mode |= 2;
         if (firstHalf)
@@ -400,8 +403,32 @@ public static class ProsperoNapsLayoutBuilder
         var stdLogical = new List<(int, long)>(blocks.Count);
         long cursor = 0;
 
-        foreach (NapsCblockPlanEntry blk in blocks)
+        for (int blockIndex = 0; blockIndex < blocks.Count; blockIndex++)
         {
+            NapsCblockPlanEntry blk = blocks[blockIndex];
+            bool nextStartsRun =
+                blockIndex + 1 < blocks.Count && blocks[blockIndex + 1].StartRun;
+
+            // A semantic RUN may not occupy the final slot of a 16-entry CBI window. When the
+            // current normal entry would be slot 14 and the next block opens a RUN, Publishing
+            // Tools inserts a cursor-preserving RUN now: current moves to slot 15 and the next
+            // semantic RUN starts the following window at slot 0. Without this look-ahead,
+            // img_verify rejects data-dependent layouts whose section/terminator RUN lands at
+            // index 15 (observed with 1, 8 and 16 short-file boundary corpora).
+            if (!blk.StartRun && nextStartsRun && entries.Count % 16 == 14)
+            {
+                uint coffEnd = (uint)(cursor & Mod256K);
+                entries.Add(new NapsCblockInfoEntry
+                {
+                    Raw = new byte[ProsperoNapsLayout.CblockInfoStride],
+                    IsRunBase = true,
+                    CoffsetEndMod256K = coffEnd,
+                    TweakIdxStart = (uint)(cursor >> 16),
+                    KeyTableIdx = 0,
+                    CoffsetStart256K = (uint)(cursor / UBlock),
+                });
+            }
+
             // Every 16-entry CblockInfo window begins with a RUN base. A physical discontinuity may
             // open a RUN earlier; if it lands exactly on the window boundary only one RUN is emitted.
             if (blk.StartRun || entries.Count % 16 == 0)

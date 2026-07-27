@@ -712,17 +712,20 @@ public static class ProsperoOuterPfsBuilder
     /// <summary>
     /// File-backed counterpart of <see cref="BuildForPackage"/>. Payloads and the finished image are
     /// processed one 64-KiB block at a time; memory use is proportional to the digest table rather
-    /// than to the image size.
+    /// than to the image size. Set <paramref name="encryptOutput"/> to <see langword="false"/> and
+    /// pass a null <paramref name="ekpfs"/> to retain the assembled plaintext diagnostic image.
     /// </summary>
     public static ProsperoOuterPackageFileResult BuildForPackageToFile(
         IReadOnlyList<ProsperoOuterFileSource> files,
         ProsperoOuterPfsBuildParameters parameters,
-        byte[] ekpfs,
-        string outputPath)
+        byte[]? ekpfs,
+        string outputPath,
+        bool encryptOutput = true)
     {
         ArgumentNullException.ThrowIfNull(files);
         ArgumentNullException.ThrowIfNull(parameters);
-        ArgumentNullException.ThrowIfNull(ekpfs);
+        if (encryptOutput)
+            ArgumentNullException.ThrowIfNull(ekpfs);
         ArgumentException.ThrowIfNullOrWhiteSpace(outputPath);
         if (files.Count == 0)
             throw new ArgumentException("At least one outer file is required.", nameof(files));
@@ -917,20 +920,29 @@ public static class ProsperoOuterPfsBuilder
                 image.Flush(flushToDisk: true);
             }
 
-            var (tweak, data) = ProsperoPfsKeys.DeriveImageEncryptionKeys(ekpfs, seed);
-            using (var plaintext = new FileStream(
-                       plaintextPath, FileMode.Open, FileAccess.Read, FileShare.Read,
-                       bufferSize: 1 << 20, FileOptions.SequentialScan))
-            using (var ciphertext = new FileStream(
-                       ciphertextPath, FileMode.CreateNew, FileAccess.Write, FileShare.None,
-                       bufferSize: 1 << 20, FileOptions.SequentialScan))
+            if (encryptOutput)
             {
-                ProsperoOuterPfsImage.Transform(
-                    plaintext, ciphertext, totalLength,
-                    tweak, data, BlockSize, kinds, encrypt: true);
-                ciphertext.Flush(flushToDisk: true);
+                var (tweak, data) = ProsperoPfsKeys.DeriveImageEncryptionKeys(ekpfs!, seed);
+                using (var plaintext = new FileStream(
+                           plaintextPath, FileMode.Open, FileAccess.Read, FileShare.Read,
+                           bufferSize: 1 << 20, FileOptions.SequentialScan))
+                using (var ciphertext = new FileStream(
+                           ciphertextPath, FileMode.CreateNew, FileAccess.Write, FileShare.None,
+                           bufferSize: 1 << 20, FileOptions.SequentialScan))
+                {
+                    ProsperoOuterPfsImage.Transform(
+                        plaintext, ciphertext, totalLength,
+                        tweak, data, BlockSize, kinds, encrypt: true);
+                    ciphertext.Flush(flushToDisk: true);
+                }
+                File.Move(ciphertextPath, outputFullPath, overwrite: true);
             }
-            File.Move(ciphertextPath, outputFullPath, overwrite: true);
+            else
+            {
+                // Diagnostic/plaintext NAPS carrier. PFS hashes and ICV remain present;
+                // only the final AES-XTS transform is omitted.
+                File.Move(plaintextPath, outputFullPath, overwrite: true);
+            }
 
             ProsperoPfsImageTreeInfo tree = BuildTreeInfo(
                 totalBlocks, inodeTableIndex, superRootDirentIndex, fltIndex, urootDirentIndex,

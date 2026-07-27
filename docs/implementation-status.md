@@ -73,7 +73,7 @@ This document describes the current LibProsperoPkg package-building and reading 
 - Computes `package-digest` as `SHA3-256(CNT[0:0xFE0])` and writes it at `CNT+0xFE0`.
 - Computes the CNT-header rollup as `SHA3-256(CNT[off:off+size])`, where `off = BE64(CNT+0x20)` and `size = BE32(CNT+0x1c)`.
 - Computes `body-digest` as `SHA3-256(CNT body)` and `fixed-info-digest` as `SHA3-256(FIH block)`.
-- Builds the per-entry digest table (entry `0x0001`) as `SHA3-256(entry payload)` for each entry, with the digest table's own slot left all-zero. This covers all 13 entries in the tested samples.
+- Builds the per-entry digest table (entry `0x0001`) as `SHA3-256(entry payload)` for each entry, with the digest table's own slot left all-zero. For an encrypted entry whose logical `DataSize` is not 16-byte aligned, the digest covers the complete zero-padded CBC ciphertext through `align16(DataSize)`, including the ciphertext bytes stored in the following alignment gap. The digest table's own slot remains all-zero.
 - Computes the CNT GeneralDigests block (entry `0x0080`, `set_digests = 0x10DE`, length `0x1E0`):
     - `content-digest = SHA3-256(CNT[0x40:0x78] || game-digest || major-param(32 zeros))`.
     - `header-digest = SHA3-256(CNT[0:0x40] || CNT[0x400:0x480])`, with `CNT+0x410` forced to the FIH-relative `0x10000` value.
@@ -88,7 +88,7 @@ This document describes the current LibProsperoPkg package-building and reading 
 
 - Injects `about/right.sprx` into the inner PFS. A `right.sprx` supplied in the source tree is packed verbatim; an embedded debug module is injected only when the source provides none. `ProsperoPkgBuilder.EnsureAboutRightSprx`.
 - Reads and produces UCP archives (`trophy2/trophyNN.ucp`, `uds/udsNN.ucp`) through `Content.ProsperoUcp`. The codec parses and rebuilds both reference samples byte-for-byte, including the SHA-1 integrity digest. Public API covers reading, building from entries, building from a directory, structural validation, digest verification, and digest repair. During a build, `ProsperoPkgBuilder.EnsureUcpArchives` repairs a stale digest on a supplied `.ucp` file but never synthesizes archive contents.
-- Validates backend-signed system files before packing them, through `PKG.ProsperoSystemFiles`. `npbind.dat` (532 bytes, magic `0xD294A018`) is checked and its communication id extracted from the TLV chain; `nptitle.dat` (160 bytes, magic `NPTD`) is checked and its title id extracted; `license.dat` / `license.info` require a non-empty payload. Invalid inputs stop the build with a descriptive error.
+- Validates backend-signed system files before packing them, through `PKG.ProsperoSystemFiles`. `npbind.dat` (532 bytes, magic `0xD294A018`) is checked, its communication id is extracted from the TLV chain, and its trailing 20 bytes must equal `SHA-1(data[0:0x200])`; `nptitle.dat` (160 bytes, magic `NPTD`) is checked and its title id extracted; `license.dat` / `license.info` require a non-empty payload. Invalid inputs stop the build with a descriptive error.
 - Emits `playgo-chunk.dat` (CNT entry `0x1001`), `playgo-hash-table.dat` (`0x2010`), and `playgo-ficm.dat` (`0x2011`) as outer-CNT body entries.
 - Builds `playgo-hash-table.dat` as a content-independent constant structure with size `0x38 + n * 8`, where `n = ficmCount / 2`. Implemented, byte-exact.
 - Generates `icon0.dds`, `pic0.dds`, `pic1.dds`, and `pic2.dds` next to source icon/picture images as BC7 DX10 DDS textures. When Publishing Tools `p2d.exe` is available, the `--high --st` profile reproduces publisher output byte-for-byte. `ProsperoDdsEncoder.PublisherP2dPath` and `LIBPROSPERO_P2D_PATH` select an explicit converter. A deterministic BCnEncoder.NET BestQuality implementation is used as the portable fallback.
@@ -129,8 +129,8 @@ This document describes the current LibProsperoPkg package-building and reading 
   singleton-Huffman representation used for constant blocks. CBI mode bit 2 selects newLZ and bit 1
   selects sub/delta literals independently for each half: publisher modes `5/4` are raw-literal
   newLZ and `7/6` are sub-literal newLZ; mode `1` is a directly stored half.
-- Implements `ProsperoNapsImage.Pack`, the inverse baseline writer: arbitrary fidx boundaries, 256-KiB span splitting, automatic raw-vs-sub literal selection for each newLZ half, independent stored-vs-newLZ selection for both halves, monotonic run construction, U2C generation, terminal records, 64-KiB physical padding, optional publisher outer-block CMAC tags, and mandatory decode/compare verification. Its stream overload keeps one 256-KiB logical block plus mapping metadata in memory and writes the packed image directly to a seekable stream. The in-memory and streaming writers can emit every CBI pair observed in the large publisher corpus: `5/4`, `7/6`, `7/4`, `5/6`, `1/1`, `1/4`, `1/6`, `5/1`, `7/1`, and the tail forms `5/0`, `7/0`, `1/0`; all have deterministic serialization and decoder round-trip coverage.
-- Implements `ProsperoPublisherPprBuilder.Build` and `BuildFileBacked`: source folder to direct-offset PPR-PFS, relocation below the publisher 4-MiB logical prefix, NAPS packing, data-first outer PFS generation, AES-XTS encryption, and reverse validation of every layer. The file-backed form does not materialize the logical PPR stream, packed NAPS image, or encrypted outer PFS in managed arrays.
+- Implements `ProsperoNapsImage.Pack`, the inverse baseline writer: arbitrary fidx boundaries, 256-KiB span splitting, automatic raw-vs-sub literal selection for each newLZ half, independent stored-vs-newLZ selection for both halves, monotonic run construction, U2C generation, terminal records, 64-KiB physical padding, optional publisher outer-block CMAC tags, and mandatory decode/compare verification. Its stream overload keeps one 256-KiB logical block plus mapping metadata in memory and writes the packed image directly to a seekable stream. The in-memory and streaming writers can emit every CBI pair observed in the large publisher corpus: `5/4`, `7/6`, `7/4`, `5/6`, `1/1`, `1/4`, `1/6`, `5/1`, `7/1`, and the true absent-half tail forms `5/0`, `7/0`, `1/0`; all have deterministic serialization and decoder round-trip coverage. A non-empty stored odd half is mode `1`, so a compressed 128-KiB even half plus a 1..131071-byte raw tail is `5/1` or `7/1`, never `5/0`/`7/0`.
+- Implements `ProsperoPublisherPprBuilder.Build` and `BuildFileBacked`: source folder to direct-offset PPR-PFS, relocation below the publisher 4-MiB logical prefix, NAPS packing, data-first outer PFS generation, optional AES-XTS encryption, and reverse validation of every layer. `EncryptOuterPfs=false` emits the signed/hashed plaintext outer carrier for diagnostics; `OuterPfsEncrypted` records which representation was returned. The file-backed form does not materialize the logical PPR stream, packed NAPS image, or outer PFS in managed arrays.
 - The publisher artifact pipeline is wired into the normal `ProsperoPackageBuilder.Build` path and is enabled by default through `UsePublisherPprNaps`. It writes the encrypted data-first outer image into CNT, threads the NAPS-layout digest to FIH 0xB0, writes the exact unpadded NAPS layout size at FIH 0xA8, and carries the packed-image size into SI/NAPS metadata. Set the option to false only for the legacy superblock-first/PFSC profile.
 - `imagedigs.dat` for the publisher profile is generated as `reverse(SHA3-256(plaintext 64-KiB outer block))` for every block. This matched all 9/9 records in `dlc_baseline.pkg`; the integrated generated test matched all 16/16 records and extracted all five source files through `FIH -> outer XTS -> NAPS -> direct-offset PPR-PFS`.
 - Implements the high-level `ProsperoPackageArchive` read path for finalized debug images: decrypt and verify the outer PFS, extract `naps_pkg_layout.dat` and `pfs_image.dat`, reconstruct the logical inner image, and extract its files.
@@ -173,7 +173,7 @@ This document describes the current LibProsperoPkg package-building and reading 
   ambiguous normalized paths before creating a partial sidecar. A separate synthetic NAPS vector
   verifies compact zero-based shuffle-table serialization and deshuffling of a stored structured span.
 - High-level outer/inner extraction is file-backed. Outer AES-XTS is transformed one 64-KiB block at a time, the packed `pfs_image.dat` inode is exposed as a seekable stream to the NAPS decoder, and only individual extracted files are buffered by `PfsReader`. `DecryptOuterPfs(package, output, passcode)` and `DecodeInnerPfs(package, output, passcode)` provide large-image file overloads; the byte-array overloads remain for convenience.
-- Publisher artifact creation is also file-backed: `BuildFileBacked` streams NAPS in 256-KiB units, writes and hashes the outer PFS in 64-KiB units, and applies AES-XTS through temporary files with atomic final replacement. The normal `build-pkg` path uses the same file-backed outer writer and copies the result into CNT instead of retaining a second complete outer-image array.
+- Publisher artifact creation is also file-backed: `BuildFileBacked` streams NAPS in 256-KiB units, writes and hashes the outer PFS in 64-KiB units, and optionally applies AES-XTS through temporary files with atomic final replacement. `build-publisher-artifacts ... - plaintext` exposes the unencrypted diagnostic form. The normal `build-pkg` path always requests encryption, uses the same file-backed outer writer and copies the result into CNT instead of retaining a second complete outer-image array.
 - The specialized publisher `ProsperoPs5InnerImageAssembler` now has `BuildToFile` and `BuildFromFsTreeToFile`. The normal package path writes each Kraken/stored payload to its final physical offset immediately, releases the compressed buffer, then appends block-info and metadata. NAPS CMAC, `obdg`, outer-PFS input, and optional integrity providers consume that file. The in-memory compatibility methods remain byte-identical. Per-file plaintext arrays are still retained because `ihsh/rhsh` construction consumes them.
 - Inner extraction removes the PFS implementation-only `uroot/` component so paths round-trip to the source tree. `PfsReader.File.Save` creates/truncates destinations instead of leaving stale tails from an older longer file.
 - The July 2026 `origin/main` validation/robustness audit was selectively ported without merging its incompatible API refactor. AES-XTS objects now reuse their AES transforms and are deterministically disposed; PFS inode-table offsets account for records that cross a block boundary; zero-length PFSC reads stop before block lookup; NAPS U2C padding points at the terminal CblockInfo; duplicate media entry ids are ignored; malformed `ENTRY_KEYS` sizes and unrepresentable FSELF layouts are rejected.
@@ -274,7 +274,7 @@ This document describes the current LibProsperoPkg package-building and reading 
   `game`/`sblock`, `header`, `system`, `param`, `package`, `body`, and `fixed-info`. These are SHA3-256
   products, not separate keyed console secrets. Only direct use of the low-level `BuildPfsImageXml`
   API without completed CNT/FIH inputs can leave an all-zero placeholder, which is reported as a warning.
-- Byte-identical reproduction of a specific `nwonly` package remains limited by exact Kraken encoder choices at compression level 7. The generated package is valid and internally consistent for the accepted differential corpora below, but downstream NAPS layout values and digests that depend on exact compressed bytes can differ. A 35-thousand-file Minecraft update corpus is still rejected early by Publishing Tools 2.79 despite matching file/directory trees and inner-PFS geometry; that large mixed-compression case is therefore not yet claimed compatible.
+- Byte-identical reproduction of a specific `nwonly` package remains limited by exact Kraken encoder choices at compression level 7. The generated package is valid and internally self-consistent, but downstream NAPS layout values and digests that depend on exact compressed bytes can differ. The former early rejection of the 35-thousand-file Minecraft update was traced to CNT rather than NAPS: `CPkgFile::load` invokes `sc2 --print-package-info`, which reported `entry digest mismatch`. Two independent bugs were fixed: SC hash fields now concatenate `ENTRY_KEYS -> IMAGE_KEY -> GENERAL_DIGESTS -> METAS -> DIGESTS` in semantic order, and protected non-aligned entries preserve/hash their complete padded CBC ciphertext. Both the focused `uds/npbind.dat` + `trophy2/npbind.dat` differential and the complete 1,059,735,714-byte managed Minecraft package now pass direct `sc2` and `prospero-pub-cmd img_info`; the focused test also proves byte-exact inner extraction.
 - External cross-testing is explicit. A fresh C# matrix consisting of empty, small and multi-block
   AC, a complete SDK APP (ELF-to-SELF, two PRX, NP title, licenses and all required media), and PSAL
   was checked by Publishing Tools 2.79. APP and all AC cases pass
@@ -297,6 +297,12 @@ This document describes the current LibProsperoPkg package-building and reading 
   extracts to 20,024 byte-identical files and the same six directories. Every generated package
   is accepted by `prospero-pub-cmd img_info`; the one-record RUN difference in the 400-file case
   is a valid compressor flush-schedule choice.
+- The same differential harness optionally injects real protected `uds/npbind.dat` and
+  `trophy2/npbind.dat` inputs. Their logical size is `0x214`, so the case exercises the four-byte
+  residual boundary. Publishing Tools writes a complete `0x220`-byte CBC ciphertext into the
+  aligned CNT slot while keeping `DataSize=0x214`; the digest-table slot hashes all `0x220` bytes.
+  The managed package reproduces that rule, passes direct `sc2 --print-package-info` and
+  `prospero-pub-cmd img_info`, and extracts the two files byte-exactly.
 - A separate large-outer APP uses four 289,426,675-byte hard-linked executable extents. Publishing
   Tools produces outer PFS `0x451A0000`; the managed build produces `0x451C0000`. Both are accepted
   by `img_info`, proving the signed indirect hierarchy, `imagedigs.dat`, CNT/FIH offsets and PlayGo
@@ -311,10 +317,17 @@ This document describes the current LibProsperoPkg package-building and reading 
 - Dense AFID/FIDX generation follows the publisher representation. Ordinal dirent traversal fixes
   AFID order; sparse slots use FIDX type `0x40` and no private zero CblockInfo; zero-length files
   retain inode/dirent metadata, add an unreferenced end boundary, and point their inode at the common
-  terminal FIDX. Ordinary stored files cross 64-KiB physical boundaries without padding; only
+  terminal FIDX. A distinct final `dataEnd` FIDX boundary is emitted before `metaBase` unless an
+  existing empty-file boundary already has that exact offset. Ordinary stored files cross 64-KiB
+  physical boundaries without padding; only
   keystone/SELF bootstrap payloads force block alignment. These rules remove the former U2C
   overflow and make the stock reader accept dense generated images. Empty files are likewise
   omitted from the data-bearing `naps_meta_18` `file` table.
+- CblockInfo window framing now matches the native writer's look-ahead rule: a semantic RUN may
+  not occupy slot 15 of a 16-record group. If the next section/terminator RUN would land there,
+  a cursor-preserving RUN is inserted before the previous normal record, moving the semantic RUN
+  to slot 0 of the next group. This closed the previously data-dependent `img_verify` failures at
+  exactly 1, 8 and 16 short files.
 - `BuildFromFsTree` and `BuildFromFsTreeToFile` preserve explicit `FSDir` nodes even when they have
   no files. The flat-file API has an overload accepting `ProsperoPs5InnerDirectory`. Directory
   entries are padded so no dirent crosses a 64-KiB metadata block. `PprPfsKrakenTool list-dirs`
@@ -323,9 +336,16 @@ This document describes the current LibProsperoPkg package-building and reading 
 - FIH inner-image accounting no longer assumes that `naps_pkg_layout.dat` occupies one 64-KiB
   block. `FIH+0x90` is derived as
   `outerSuperblockBlock - ceil(napsLayoutSize / 0x10000)`, which is required for large APP layouts;
-  `+0x94` is `NumFiles-1`, `+0x98` is `NumFiles`, `+0xF4` is the sparse-AFID count, and `+0xFC`
+  `+0x94` is `NumFiles-1`; `+0x98` mirrors it and additionally counts explicit empty-file
+  boundaries (`+0x98 = +0x94 + emptyFileCount`). `+0xF4` is the sparse-AFID count and `+0xFC`
   is the zero-length-file count. `+0x9C` stores the complete content version as publisher BCD
   (`01.044.000` → `0x01044000`), rather than only its leading byte.
+- The differential harness now requires both native and managed packages to reach directory-tree
+  traversal and both CRC ranges in `img_verify`, validates all managed CNT entry digests, verifies
+  that the default NAPS profile has zero non-zero `OuterBlockDigest` tags, and compares both
+  extracted trees. Covered boundary values include file sizes around 8/16/64-KiB/128-KiB/256-KiB,
+  short-file counts 0/1/7/8/9/16/32/100/400, non-aligned protected `npbind.dat`, and a 1-GiB
+  mixed stored/newLZ corpus (440 files); all current cases pass.
 
 ## Summary table
 
@@ -354,7 +374,7 @@ This document describes the current LibProsperoPkg package-building and reading 
 | Supplied `sce_sys` system files (license, np, self, delta-info, keymap_rp, changeinfo, pronunciation, trophy) | Implemented; AC/AL licenses come from sidecars or `IProsperoLicenseProvider`, are GP5-aware, structurally/content-id/entitlement-key validated, then encrypted with volume-specific entry policy |
 | `playgo-chunk.dat`, `playgo-hash-table.dat`, `playgo-ficm.dat` | Implemented |
 | UCP archives (`trophy2/*.ucp`, `uds/*.ucp`) | Implemented, byte-exact round-trip and digest for tested reference samples |
-| `npbind.dat` / `nptitle.dat` structural validation | Implemented; validated and identifiers extracted, packed verbatim |
+| `npbind.dat` / `nptitle.dat` structural validation | Implemented; identifiers extracted, `npbind` trailing SHA-1 validated, protected `0x214` CBC/padding digest boundary reproduced |
 | `playgo-chunk.crc` | Implemented, byte-exact for tested debug samples |
 | Debug install-metadata ZIP container | Implemented for the verified profile: XML digests, NAPS metadata and PlayGo CRC are generated locally; publisher-authored blobs can be preserved as overrides |
 | `pfsimage.xml` structural descriptor | Implemented, including all digest rows and `<chunkinfo>`/`<pfs-image>`/`<nested-image>` trees; the high-level builder is self-consistent, while incomplete direct low-level calls report any omitted digest inputs |

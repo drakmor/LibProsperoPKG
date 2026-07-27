@@ -374,7 +374,7 @@ public static class ProsperoFihBuilder
             // Small layouts occupy one block, but dense APP layouts span many blocks.
             //   0x90 inner-image block count = sbBlockIndex - ceil(napsLayoutSize/blockSize)
             //   0x94 nonterminal NAPS FIDX count              = NumFiles-1 (nwonly), threaded in
-            //   0x98 total NAPS FIDX count                    = NumFiles
+            //   0x98 nonterminal count + empty-file boundaries
             //   0x9C content-version echo                     = full 8-digit BCD contentVersion
             //   0xA0 block-aligned inner-image size           = 0x90 * blockSize
             //   0xA8 naps_pkg_layout.dat (map[0xD]) length    = nestedImageSize (the 0xB0 digest preimage length)
@@ -396,14 +396,18 @@ public static class ProsperoFihBuilder
                     throw new InvalidDataException(
                         "The NAPS layout extent crosses the outer-PFS superblock.");
                 uint innerBlocks = checked((uint)(sbBlockIndex - napsLayoutBlocks));
-                // 0x94 is the number of nonterminal NAPS FIDX/file extents (NumFiles-1);
-                // 0x98 includes the terminal mount-boundary record (NumFiles).  The legacy
-                // non-nwonly path keeps its outer metadata-block count in both fields.
+                // 0x94 is the number of nonterminal NAPS FIDX/file extents (NumFiles-1).
+                // 0x98 mirrors it for ordinary files and additionally counts each zero-length
+                // file boundary. It is not NumFiles: zero-empty fixtures have +0x94 == +0x98,
+                // while one empty file produces +0x98 == +0x94 + 1. The legacy non-nwonly path
+                // keeps its outer metadata-block count in both fields.
                 uint metaOrNapsFiles = nwonly ? (uint)nwonlyNapsFileCount : (uint)(totalBlocks - innerBlocks);
-                uint totalNapsFiles = nwonly ? checked(metaOrNapsFiles + 1u) : metaOrNapsFiles;
+                uint mirroredNapsFiles = nwonly
+                    ? checked(metaOrNapsFiles + (uint)nwonlyEmptyFileCount)
+                    : metaOrNapsFiles;
                 BinaryPrimitives.WriteUInt32LittleEndian(h.AsSpan(ProsperoPkgLayout.FihInnerImageBlockCountField), innerBlocks);
                 BinaryPrimitives.WriteUInt32LittleEndian(h.AsSpan(ProsperoPkgLayout.FihMetaBlockCountField), metaOrNapsFiles);
-                BinaryPrimitives.WriteUInt32LittleEndian(h.AsSpan(ProsperoPkgLayout.FihMetaBlockCountMirrorField), totalNapsFiles);
+                BinaryPrimitives.WriteUInt32LittleEndian(h.AsSpan(ProsperoPkgLayout.FihMetaBlockCountMirrorField), mirroredNapsFiles);
                 BinaryPrimitives.WriteUInt64LittleEndian(h.AsSpan(ProsperoPkgLayout.FihInnerImageSizeField), (ulong)innerBlocks * (ulong)blockSize);
 
                 // 0x9C: content-version echo (high 32 bits of the param/content_ver u64; major BCD in the top byte).
