@@ -144,6 +144,38 @@ foreach (var warning in result.Warnings)
     Console.WriteLine($"Warning: {warning}");
 ```
 
+### Publisher image creation modes
+
+The publisher pipeline exposes the layers independently:
+
+| Command/profile | NAPS outer-block tags | Outer PFS | Final package |
+|---|---|---|---|
+| `build-pkg ... <passcode> -` | zero | AES-XTS encrypted | debug FIH/PKG |
+| `build-pkg ... <passcode> <32-hex-key>` | keyed AES-CMAC | AES-XTS encrypted | profile-specific debug FIH/PKG |
+| `build-publisher-artifacts ... - encrypted` | zero | AES-XTS encrypted | no |
+| `build-publisher-artifacts ... - plaintext` | zero | plaintext | no; analysis/custom runtime only |
+| `build ... --layout ppr --compression none` | not applicable | not built | inner PPR-PFS only |
+
+For the verified Publishing Tools 2.79 debug APP/AC profile, zero
+`OuterBlockDigest` entries are normal and do **not** mean that outer-PFS encryption is disabled.
+The high-level package builder can automatically load `naps_cmac_key.bin` from the executable
+directory, so remove that sidecar when a guaranteed zero-tag build is required.
+
+Create a fully plaintext standalone publisher artifact set:
+
+```powershell
+dotnet run --project .\src\PprPfsKrakenTool\PprPfsKrakenTool.csproj -c Release -- `
+  build-publisher-artifacts C:\project\app C:\project\out `
+  UP9000-PPSA00000_00-PROSPERO00000000 `
+  00000000000000000000000000000000 - plaintext
+```
+
+This writes `inner.ppr-pfs`, `logical.ppr-pfs`, `pfs_image.dat`,
+`naps_pkg_layout.dat`, and plaintext `outer.pfs`. Kraken remains compression rather than
+encryption; SHA3 inode/block hashes and the superblock ICV are still generated. The normal
+`build-pkg` path deliberately has no plaintext-outer option because the standard FIH profile
+expects an encrypted outer PFS.
+
 ### Inspecting an existing package
 
 ```csharp

@@ -257,6 +257,11 @@ This document describes the current LibProsperoPkg package-building and reading 
   `previous outer blocks = referenced outer blocks = 0`; that counter is not evidence of base/update
   cross-image reuse.
 - Publishing Tools 2.79 debug/AC does not enable keyed NAPS `OuterBlockDigest` generation: the config flag at `+0x70` remains zero, `PackageNAPSMetadataInsertCMAC` is skipped, and all stored eight-byte tags are zero. The separate 16-byte input at `+0x74` is used only when another caller explicitly enables that mode; it is not derived from EKPFS, the outer XTS pair, or the PFS sign key. Callers can still provide it through `OuterBlockCmacKey`.
+- Zero `OuterBlockDigest` entries do not mean plaintext NAPS: the normal profile still AES-XTS
+  encrypts the outer PFS and retains the ordinary SHA3 inode/block hashes, superblock ICV, CNT
+  digests and FIH metadata. Native and managed packages with zero tags pass Publishing Tools 2.79
+  `img_verify`; actual console installation was not exercised by this test and remains subject to
+  the package profile, debug/test hardware permissions, licenses, finalization material and firmware.
 - The NAPS decoder resolves the compact zero-based `ShuffleIdx` through the serialized 8-byte
   shuffle-pattern table and reverses all 12 known non-identity field-width transforms after either a stored
   or Kraken span. The value equal to the table count is the identity sentinel. Invalid indexes

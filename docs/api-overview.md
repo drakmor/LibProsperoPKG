@@ -54,6 +54,22 @@ The primary entry point.
   / `ProsperoPkgBuildProperties.InnerCompression`; takes precedence over the legacy
   `CompressInnerImage` bool when non-`None`.
 
+### Publisher image output modes
+
+| API / CLI | Outer-block CMAC | Outer PFS | Intended use |
+|---|---|---|---|
+| `ProsperoPackageBuilder.Build` / `build-pkg ... -` | zero in the verified debug/AC profile | AES-XTS | finalized debug package |
+| `build-pkg ... <cmac-key-hex>` | explicitly keyed | AES-XTS | a profile that requires keyed tags |
+| `BuildFileBacked` with `EncryptOuterPfs=true` / `build-publisher-artifacts ... - encrypted` | zero or caller-keyed | AES-XTS | intermediate publisher artifacts |
+| `BuildFileBacked` with `EncryptOuterPfs=false` / `build-publisher-artifacts ... - plaintext` | zero or caller-keyed | plaintext | analysis or a custom runtime |
+| `ProsperoPfsLayout.BuildFromFolder` / `build ... --layout ppr` | not applicable | not created | inner PPR-PFS only |
+
+The plaintext artifact set contains `inner.ppr-pfs`, `logical.ppr-pfs`, `pfs_image.dat`,
+`naps_pkg_layout.dat`, and `outer.pfs`. No outer AES-XTS transform is applied. NAPS/Kraken
+compression, SHA3 inode/block hashes, and the superblock ICV remain present because they are not
+encryption. This path does not create `naps_meta_18.dat`; its separate XTS policy is therefore not
+part of the standalone set. Normal `build-pkg` intentionally always encrypts the outer PFS.
+
 ---
 
 ## `LibProsperoPkg.PKG` — container, signing, finalization

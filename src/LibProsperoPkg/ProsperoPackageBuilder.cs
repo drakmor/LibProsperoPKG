@@ -173,8 +173,9 @@ public sealed class ProsperoBuildOptions
     public bool UsePublisherPprNaps { get; set; } = true;
 
     /// <summary>
-    /// Optional 16-byte publishing CMAC key for the NAPS outer-block digest slots. The structural
-    /// package remains readable without it, but strict publisher integrity verification requires it.
+    /// Optional 16-byte publishing CMAC key for NAPS outer-block digest slots. Keyed profiles
+    /// require the matching key, while the verified Publishing Tools 2.79 debug/AC profile
+    /// deliberately stores zero tags and passes the official host-side integrity verifier.
     /// </summary>
     public byte[]? NapsOuterBlockCmacKey { get; set; }
 
