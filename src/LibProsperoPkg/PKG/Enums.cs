@@ -28,7 +28,7 @@ public enum IROTag : int
 [Flags]
 public enum PKGFlags : uint
 {
-    Unknown = 0x01,
+    BASE_PACKAGE_PROFILE = 0x00000001,
     VER_1 = 0x01000000,
     VER_2 = 0x02000000,
     INTERNAL = 0x40000000,
@@ -44,7 +44,7 @@ public enum ContentFlags : uint
     PS_CLOUD = 0x00800000,
     GD_AC = 0x02000000,
     NON_GAME = 0x04000000,
-    Unk_x8000000 = 0x08000000, /* has data? */
+    UPGRADABLE_APPLICATION = 0x08000000,
     SUBSEQUENT_PATCH = 0x40000000,
     DELTA_PATCH = 0x41000000,
     CUMULATIVE_PATCH = 0x60000000,
@@ -58,8 +58,8 @@ public enum EntryId : uint
     // Found in DP PKG
     UNKNOWN_21 = 0x00000021,
     GENERAL_DIGESTS = 0x00000080,
-    // Found in DP PKG
-    UNKNOWN_C0 = 0x000000C0,
+    // SHA3-authenticated index of trailing RLC records in delta-patch packages.
+    RLC_RECORDS = 0x000000C0,
     METAS = 0x00000100,
     ENTRY_NAMES = 0x00000200,
 
@@ -72,6 +72,9 @@ public enum EntryId : uint
     TARGET_DELTAINFO_DAT = 0x00000407,
     ORIGIN_DELTAINFO_DAT = 0x00000408,
     PSRESERVED_DAT = 0x00000409,
+    IMAGEDIGS_DAT = 0x0000040A,
+    // Header-only copy of the first RLC record in delta-patch packages.
+    RLC_HEADER = 0x0000040C,
     PARAM_SFO = 0x00001000,
     PLAYGO_CHUNK_DAT = 0x00001001,
     PLAYGO_CHUNK_SHA = 0x00001002,

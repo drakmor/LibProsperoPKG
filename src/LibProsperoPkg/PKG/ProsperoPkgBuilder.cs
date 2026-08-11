@@ -260,8 +260,8 @@ public static class ProsperoPkgBuilder
     private const uint ContentTypeGd = 0x20;       // CNT header @0x74 (game data).
     private const uint ContentTypeAc = 0x21;       // additional content, with data.
     private const uint ContentTypeAl = 0x22;       // additional content, no data.
-    private const uint Unk0CPs5 = 0xC;             // CNT header @0x0C.
-    private const uint FlagsPs5 = 0x00020001;      // Publisher VER_2 | Unknown.
+    private const uint HeaderProfileCodePs5 = 0xC; // CNT header @0x0C.
+    private const uint FlagsPs5 = 0x00020001;      // Publisher VER_2 | base-package profile.
     private const ulong LegacyPfsFlags = 0x80000000000003CC;
     private const ulong PublisherPfsFlags = 0xA00000000000030C;
 
@@ -293,9 +293,9 @@ public static class ProsperoPkgBuilder
     private static ContentFlags ContentFlagsFor(ProsperoVolumeType type) => type switch
     {
         // PSAL carries no PFS image, but its direct metadata CNT uses this profile bit.
-        ProsperoVolumeType.AdditionalContentNoData => ContentFlags.Unk_x8000000,
+        ProsperoVolumeType.AdditionalContentNoData => ContentFlags.UPGRADABLE_APPLICATION,
         ProsperoVolumeType.AdditionalContentData =>
-            ContentFlags.Unk_x8000000 | ContentFlags.GD_AC,
+            ContentFlags.UPGRADABLE_APPLICATION | ContentFlags.GD_AC,
         _ => ContentFlags.GD_AC,
     };
 
@@ -1360,8 +1360,8 @@ public static class ProsperoPkgBuilder
             {
                 CNTMagic = "\u007fCNT",
                 flags = (PKGFlags)FlagsPs5,
-                unk_0x08 = 0x80000000,
-                unk_0x0C = Unk0CPs5,
+                ps5_profile_marker = 0x80000000,
+                header_profile_code = HeaderProfileCodePs5,
                 entry_count = 0,
                 sc_entry_count = (ushort)(noData ? 5 : 6),
                 entry_count_2 = 0,
@@ -1391,7 +1391,7 @@ public static class ProsperoPkgBuilder
                 sc_entries2_hash = new byte[32],
                 digest_table_hash = new byte[32],
                 body_digest = new byte[32],
-                unk_0x400 = noData ? 0u : 1u,
+                pfs_descriptor_presence = noData ? 0u : 1u,
                 pfs_image_count = noData ? 0u : 1u,
                 pfs_flags = noData ? 0 : props.UsePublisherPprNaps ? PublisherPfsFlags : LegacyPfsFlags,
                 pfs_image_offset = noData ? 0 : PfsImageOffset,

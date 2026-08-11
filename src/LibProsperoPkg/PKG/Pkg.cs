@@ -121,8 +121,10 @@ public struct Header
 {
     public string CNTMagic;
     public PKGFlags flags;
-    public uint unk_0x08;
-    public uint unk_0x0C; /* 0xF */
+    /// <summary>PS5 CNT profile marker at +0x08 (0x80000000 in publisher packages).</summary>
+    public uint ps5_profile_marker;
+    /// <summary>CNT header profile code at +0x0C (0x0C in the PS5 publisher profile).</summary>
+    public uint header_profile_code;
     public uint entry_count;
     public ushort sc_entry_count;
     public ushort entry_count_2; /* same as entry_count */
@@ -138,10 +140,11 @@ public struct Header
     public uint promote_size;
     public uint version_date;
     public uint version_hash;
-    public uint unk_0x88; /* for delta patches only? */
-    public uint unk_0x8C; /* for delta patches only? */
-    public uint unk_0x90; /* for delta patches only? */
-    public uint unk_0x94; /* for delta patches only? */
+    /// <summary>Four profile-specific metadata words populated by delta-patch packages.</summary>
+    public uint delta_patch_metadata_0;
+    public uint delta_patch_metadata_1;
+    public uint delta_patch_metadata_2;
+    public uint delta_patch_metadata_3;
     public IROTag iro_tag;
     public uint ekc_version; /* drm type version */
     public byte[] sc_entries1_hash;
@@ -149,8 +152,8 @@ public struct Header
     public byte[] digest_table_hash;
     public byte[] body_digest;
 
-    // TODO: i think these fields are actually members of element of container array
-    public uint unk_0x400;
+    /// <summary>Nonzero when the PFS image descriptor beginning at +0x404 is present.</summary>
+    public uint pfs_descriptor_presence;
     public uint pfs_image_count;
     public ulong pfs_flags;
     public ulong pfs_image_offset;

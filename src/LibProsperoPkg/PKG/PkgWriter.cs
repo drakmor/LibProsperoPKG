@@ -36,9 +36,9 @@ public class PkgWriter : Util.WriterBase
         s.Position = 0x04;
         Write((uint)hdr.flags);
         s.Position = 0x08;
-        Write(hdr.unk_0x08);
+        Write(hdr.ps5_profile_marker);
         s.Position = 0x0C;
-        Write(hdr.unk_0x0C); /* 0xF */
+        Write(hdr.header_profile_code);
         s.Position = 0x10;
         Write(hdr.entry_count);
         s.Position = 0x14;
@@ -70,13 +70,13 @@ public class PkgWriter : Util.WriterBase
         s.Position = 0x84;
         Write(hdr.version_hash);
         s.Position = 0x88;
-        Write(hdr.unk_0x88); /* for delta patches only? */
+        Write(hdr.delta_patch_metadata_0);
         s.Position = 0x8C;
-        Write(hdr.unk_0x8C); /* for delta patches only? */
+        Write(hdr.delta_patch_metadata_1);
         s.Position = 0x90;
-        Write(hdr.unk_0x90); /* for delta patches only? */
+        Write(hdr.delta_patch_metadata_2);
         s.Position = 0x94;
-        Write(hdr.unk_0x94); /* for delta patches only? */
+        Write(hdr.delta_patch_metadata_3);
         s.Position = 0x98;
         Write((uint)hdr.iro_tag);
         s.Position = 0x9C;
@@ -93,9 +93,9 @@ public class PkgWriter : Util.WriterBase
         s.Position = 0x200;
         Write(Encoding.ASCII.GetBytes(hdr.content_id));
 
-        // TODO: i think these fields are actually members of element of container array
+        // This word gates the PFS descriptor that follows at +0x404.
         s.Position = 0x400;
-        Write(hdr.unk_0x400);
+        Write(hdr.pfs_descriptor_presence);
         s.Position = 0x404;
         Write(hdr.pfs_image_count);
         s.Position = 0x408;
